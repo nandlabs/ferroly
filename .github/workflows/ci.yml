@@ -59,7 +59,7 @@ jobs:
       RUSTUP_TOOLCHAIN: "1.75.0"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.75.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       # `--locked` fails loudly if Cargo.lock drifts to a version that raises the
       # MSRV (e.g. a transitive dep jumping to edition 2024) instead of silently
