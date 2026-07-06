@@ -1,0 +1,49 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+#
+# Enforces Ferroly's licensing, security-advisory, and dependency policy in CI.
+# Targets cargo-deny 0.16+ (schema version 2). Run: `cargo deny check`.
+
+[graph]
+all-features = true
+
+# ------------------------------------------------------------------------------
+# Licenses — only permissive licenses are allowed. This list is exactly the set
+# present in Ferroly's resolved dependency tree; every entry is compatible with
+# redistributing Ferroly under `Apache-2.0 OR MIT`. There is no copyleft.
+# ------------------------------------------------------------------------------
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    # Permissive DATA license for the Mozilla root certificates (webpki-roots).
+    "CDLA-Permissive-2.0",
+]
+# Note: `ring` declares "Apache-2.0 AND ISC" (both allowed above), so it needs
+# no special-casing here even though its LICENSE file also bundles
+# OpenSSL/BoringSSL-derived code.
+
+# ------------------------------------------------------------------------------
+# Security advisories (RustSec).
+# ------------------------------------------------------------------------------
+[advisories]
+version = 2
+yanked = "deny"
+
+# ------------------------------------------------------------------------------
+# Bans — duplicate versions and wildcard requirements are flagged.
+# ------------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+# ------------------------------------------------------------------------------
+# Sources — crates must come from crates.io; no unknown registries or git deps.
+# ------------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

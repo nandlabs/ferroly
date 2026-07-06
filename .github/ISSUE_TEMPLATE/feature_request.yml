@@ -1,0 +1,126 @@
+name: "✨ Feature Request"
+description: Suggest a new feature or enhancement for Ferroly
+title: "[FEATURE]: "
+labels: ["enhancement", "triage"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please provide as much detail as possible to help us understand your request.
+
+        > **Note:** Ferroly deliberately keeps a near-zero runtime dependency footprint (only `tokio`, plus `rustls`/`tokio-rustls` for TLS). Proposals that would add third-party runtime dependencies are unlikely to be accepted — see [CONTRIBUTING.md](../../CONTRIBUTING.md).
+
+  - type: checkboxes
+    id: existing-issues
+    attributes:
+      label: Is there an existing issue for this?
+      description: Please search existing issues before creating a new one.
+      options:
+        - label: I have searched the existing issues and none match my feature request.
+          required: true
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: Target Module / Feature
+      description: Which part of Ferroly would this affect?
+      options:
+        - "codec (JSON/XML/YAML, Encode/Decode)"
+        - "codec::schema (JSON-Schema validator)"
+        - "config"
+        - "errutils"
+        - "fsutils"
+        - "lifecycle (component manager / health)"
+        - "genai (LLM providers)"
+        - "vectorstore"
+        - "http (client/server)"
+        - "turbo (router / middleware)"
+        - "rest (REST client/server)"
+        - "ws (WebSocket)"
+        - "clients (auth / retry / circuit breaker)"
+        - "messaging (local bus)"
+        - "vfs (virtual filesystem)"
+        - "log (structured logging)"
+        - "metrics (Prometheus)"
+        - "auth (HS256 JWT)"
+        - "ferroly-derive (proc-macros)"
+        - "New module / extension crate"
+        - "Other / not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: Is your feature request related to a problem? Describe the problem you're trying to solve.
+      placeholder: "I'm always frustrated when [...]"
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: A clear and concise description of what you want to happen. Include API design ideas if applicable.
+      placeholder: Describe the solution you'd like...
+    validations:
+      required: true
+
+  - type: textarea
+    id: api-design
+    attributes:
+      label: API Design (if applicable)
+      description: Provide example code showing how the feature would be used.
+      render: rust
+      placeholder: |
+        // Example usage of the proposed feature
+        let result = ferroly::new_thing().build();
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: A clear and concise description of any alternative solutions or features you've considered.
+      placeholder: Describe the alternatives...
+
+  - type: dropdown
+    id: dependencies
+    attributes:
+      label: Does this require new dependencies?
+      description: Ferroly hand-rolls functionality rather than pulling in crates. Please be honest here — it informs feasibility.
+      options:
+        - "No — implementable with std + existing internals"
+        - "Only optional / dev-dependencies"
+        - "Yes — would need a new runtime dependency"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      description: How important is this feature to you?
+      options:
+        - "Nice to have"
+        - "Important - workaround exists"
+        - "Critical - blocking my work"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Willingness to Contribute
+      description: Would you be willing to submit a PR for this feature?
+      options:
+        - label: I would be willing to submit a PR to implement this feature.
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Add any other context, screenshots, or references about the feature request here.

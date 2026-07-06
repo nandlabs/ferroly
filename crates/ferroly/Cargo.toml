@@ -1,0 +1,82 @@
+[package]
+name = "ferroly"
+description = "A self-contained Rust toolkit of enterprise utilities (a port of nandlabs/golly)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["toolkit", "genai", "http", "codec", "ferroly"]
+categories = ["development-tools", "web-programming"]
+
+[dependencies]
+ferroly-derive = { workspace = true }
+tokio = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+[features]
+default = ["codec", "errutils"]
+errutils = []
+codec = []
+config = ["codec"]
+fsutils = []
+lifecycle = ["dep:tokio"]
+http = [
+    "dep:tokio",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-pki-types",
+    "dep:webpki-roots",
+]
+clients = ["http", "dep:tokio"]
+genai = ["codec", "clients", "http", "dep:tokio"]
+openai = ["genai"]
+claude = ["genai"]
+ollama = ["genai"]
+all-providers = ["openai", "claude", "ollama"]
+turbo = ["http", "codec"]
+rest = ["turbo", "clients", "codec", "lifecycle", "http"]
+ws = ["http", "lifecycle", "dep:tokio"]
+vectorstore = ["codec"]
+auth = ["codec"]
+log = ["codec"]
+metrics = []
+messaging = ["codec", "lifecycle", "dep:tokio"]
+vfs = ["dep:tokio"]
+full = [
+    "errutils",
+    "codec",
+    "log",
+    "config",
+    "fsutils",
+    "lifecycle",
+    "http",
+    "clients",
+    "genai",
+    "all-providers",
+    "turbo",
+    "rest",
+    "ws",
+    "vectorstore",
+    "auth",
+    "messaging",
+    "vfs",
+    "metrics",
+]
+
+[dev-dependencies]
+# `test-util` (not part of tokio's `full`) enables the paused test clock used to
+# make timing-dependent tests deterministic. Dev-only — no runtime impact.
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
+
+# Build docs on docs.rs with every feature enabled, so all modules are visible
+# (the default build would show only the default features).
+[package.metadata.docs.rs]
+all-features = true

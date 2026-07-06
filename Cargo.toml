@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/nandlabs/ferroly"
+authors = ["nandlabs"]
+
+[workspace.dependencies]
+# Runtime dependency budget: tokio + (for TLS) tokio-rustls/rustls only.
+tokio = { version = "1", features = ["full"] }
+
+# TLS engine (single crypto exception, isolated behind an internal transport trait)
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+
+# build-time only — for our own derive macros
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+# internal proc-macro crate — the only companion crate to `ferroly`
+ferroly-derive    = { path = "crates/ferroly-derive",    version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Centralized lints applied to every workspace crate. The whole codebase is
+# `unsafe`-free by design — forbid it so that stays true.
+[workspace.lints.rust]
+unsafe_code = "forbid"

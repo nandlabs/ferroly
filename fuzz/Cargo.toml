@@ -1,0 +1,43 @@
+# A detached workspace: the fuzz harness (libfuzzer-sys) is nightly-only tooling
+# and is intentionally NOT part of the main workspace, so it never enters the
+# runtime dependency budget or the `cargo-deny` check.
+[package]
+name = "ferroly-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ferroly]
+path = "../crates/ferroly"
+default-features = false
+features = ["codec"]
+
+[[bin]]
+name = "json_parse"
+path = "fuzz_targets/json_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xml_parse"
+path = "fuzz_targets/xml_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yaml_parse"
+path = "fuzz_targets/yaml_parse.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace.
+[workspace]

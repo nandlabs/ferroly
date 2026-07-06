@@ -1,0 +1,4 @@
+# Formatting is intentionally close to rustfmt defaults; only stable options are
+# set so `cargo fmt` behaves identically on stable toolchains.
+edition = "2021"
+newline_style = "Unix"

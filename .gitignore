@@ -1,0 +1,67 @@
+# ---- Rust / Cargo ----------------------------------------------------------
+# Build artifacts
+/target/
+**/target/
+# rustc/rustfmt backups
+**/*.rs.bk
+# MSVC debug info
+*.pdb
+
+# NOTE: Cargo.lock IS committed on purpose. Ferroly ships libraries + a facade,
+# and committing the lock gives reproducible CI builds. Do not add it here.
+
+# ---- Coverage / profiling --------------------------------------------------
+*.profraw
+*.profdata
+/coverage/
+lcov.info
+cobertura.xml
+tarpaulin-report.*
+flamegraph.svg
+perf.data
+perf.data.old
+
+# ---- Benchmarks ------------------------------------------------------------
+/criterion/
+**/criterion/
+
+# ---- Generated license / notice files --------------------------------------
+THIRD-PARTY-NOTICES.*
+about.html
+
+# ---- Scratch / temp --------------------------------------------------------
+.tmp/
+*.tmp
+*.orig
+*.bak
+*.log
+
+# ---- Environment / local secrets -------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---- Editors & IDEs --------------------------------------------------------
+/.idea/
+*.iml
+/.vscode/
+*.code-workspace
+# rust-analyzer
+rust-project.json
+# Vim
+*.swp
+*.swo
+*~
+# Emacs
+\#*\#
+.\#*
+
+# ---- OS junk ---------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini

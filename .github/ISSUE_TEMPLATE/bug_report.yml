@@ -1,0 +1,152 @@
+name: "🐛 Bug Report"
+description: Report a bug or unexpected behavior in Ferroly
+title: "[BUG]: "
+labels: ["bug", "triage"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out as much detail as possible to help us investigate.
+
+  - type: checkboxes
+    id: existing-issues
+    attributes:
+      label: Is there an existing issue for this?
+      description: Please search existing issues before creating a new one.
+      options:
+        - label: I have searched the existing issues and none match my bug report.
+          required: true
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: Affected Module / Feature
+      description: Which part of Ferroly is affected? (Maps to a Cargo feature flag.)
+      options:
+        - "codec (JSON/XML/YAML, Encode/Decode)"
+        - "codec::schema (JSON-Schema validator)"
+        - "config"
+        - "errutils"
+        - "fsutils"
+        - "lifecycle (component manager / health)"
+        - "genai (LLM providers)"
+        - "vectorstore"
+        - "http (client/server)"
+        - "turbo (router / middleware)"
+        - "rest (REST client/server)"
+        - "ws (WebSocket)"
+        - "clients (auth / retry / circuit breaker)"
+        - "messaging (local bus)"
+        - "vfs (virtual filesystem)"
+        - "log (structured logging)"
+        - "metrics (Prometheus)"
+        - "auth (HS256 JWT)"
+        - "ferroly-derive (proc-macros)"
+        - "Build / packaging / features"
+        - "Other / not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the bug...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Provide a minimal code snippet or a step-by-step list to reproduce the issue.
+      placeholder: |
+        1. Enable feature '...'
+        2. Call `ferroly::...`
+        3. Pass argument '...'
+        4. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected Behavior
+      description: A clear and concise description of what you expected to happen.
+      placeholder: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual Behavior
+      description: What actually happened instead?
+      placeholder: What actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: code-snippet
+    attributes:
+      label: Code Snippet
+      description: If applicable, provide a minimal reproducible code snippet.
+      render: rust
+      placeholder: |
+        fn main() {
+            // your code here
+        }
+
+  - type: textarea
+    id: error-output
+    attributes:
+      label: Error Output / Logs
+      description: If applicable, paste any relevant error messages, panic output, or logs.
+      render: shell
+
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust Toolchain
+      description: "Output of `rustc --version` (and `cargo --version` if relevant)"
+      placeholder: "e.g., rustc 1.82.0 (stable)"
+    validations:
+      required: true
+
+  - type: input
+    id: crate-version
+    attributes:
+      label: Ferroly Version
+      description: "Version / git ref of `ferroly` (and enabled features) you are using"
+      placeholder: 'e.g., 0.1.0 with features = ["genai", "turbo"]'
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      description: What OS are you running on?
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS Version
+      description: "Specific OS version"
+      placeholder: "e.g., Ubuntu 22.04, macOS 14.2, Windows 11"
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Add any other context, screenshots, or information about the problem here.

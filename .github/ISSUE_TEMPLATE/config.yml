@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "🔒 Security Vulnerability"
+    url: https://github.com/nandlabs/ferroly/blob/main/SECURITY.md
+    about: "For reporting security vulnerabilities, please refer to our Security Policy. Do NOT create a public issue."
+  - name: "📖 Contributing Guide"
+    url: https://github.com/nandlabs/ferroly/blob/main/CONTRIBUTING.md
+    about: "Read our contributing guide (including the dependency-minimization policy) before submitting issues or pull requests."
