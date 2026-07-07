@@ -20,6 +20,7 @@
 
 mod client;
 mod core;
+mod download;
 mod error;
 pub(crate) mod io;
 mod message;
@@ -30,6 +31,7 @@ pub(crate) mod transport;
 
 pub use client::Client;
 pub use core::{split_target, HeaderMap, Method, StatusCode, Uri};
+pub use download::download_to_file;
 pub use error::HttpError;
 pub use message::{Request, RequestBuilder, Response};
 pub use server::{

@@ -69,7 +69,7 @@ Enable only what you need — unused modules and their dependencies are never co
 | `fsutils` | `ferroly::fsutils` | Content-type detection (extension table + magic-byte sniffing) + read-only memory-mapped files (`Mmap`) |
 | `lifecycle` | `ferroly::lifecycle` | Component start/stop orchestration with dependency ordering |
 | `rt` | `ferroly::rt` | Async runtime surface (tokio spawn/channels/sync/time/TCP re-exported) |
-| `http` | `ferroly::http` | In-house HTTP/1.1 client + server (streaming, chunked, SSE, TLS) |
+| `http` | `ferroly::http` | In-house HTTP/1.1 client + server (streaming, chunked, SSE, range/resumable downloads, TLS) |
 | `clients` | `ferroly::clients` | Retry, circuit breaker, and auth providers |
 | `genai` | `ferroly::genai` | Provider-agnostic LLM interface + prompt templates |
 | `openai` / `claude` / `ollama` | — | GenAI provider implementations |

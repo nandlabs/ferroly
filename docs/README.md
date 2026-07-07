@@ -43,7 +43,7 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 ### Web & networking
 | Module | Feature | What it does |
 |---|---|---|
-| [`http`](http.md) | `http` | Hand-rolled HTTP/1.1 client + server (chunked, **SSE streaming**, TLS) |
+| [`http`](http.md) | `http` | Hand-rolled HTTP/1.1 client + server (chunked, **SSE streaming**, **range/resumable downloads**, TLS) |
 | [`turbo`](turbo.md) | `turbo` | First-class router: route groups, onion middleware, rate-limit, JWT auth, access log, trace-context, content negotiation |
 | [`rest`](rest.md) | `rest` | REST client + server framework (codec-aware, lifecycle-integrated, health endpoints) |
 | [`ws`](ws.md) | `ws` | Hand-rolled RFC 6455 WebSocket client + server |

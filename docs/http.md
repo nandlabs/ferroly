@@ -257,6 +257,39 @@ Chunk sizes are an implementation detail: for a `Content-Length` or `EOF`-framed
 at 16 KiB reads; for a chunked-encoded body each `chunk()` returns exactly one decoded
 transfer chunk (the `chunked` framing and trailers are stripped for you).
 
+### Range requests and resumable downloads
+
+`RequestBuilder::range(start, end)` sets a `Range: bytes=start-end` header (`end`
+inclusive, or `None` for open-ended `start-`):
+
+```rust
+use ferroly::http::{Method, Request};
+# fn ex() -> Result<(), ferroly::http::HttpError> {
+let req = Request::builder(Method::Get, "https://example.com/big.bin")?
+    .range(1_048_576, None)      // resume from 1 MiB
+    .build();
+# let _ = req; Ok(())
+# }
+```
+
+For the common case, `download_to_file` streams a body straight to disk and
+**resumes** automatically — if the destination already holds a partial file it
+issues a `Range` from that offset and appends:
+
+```rust
+use ferroly::http::{Client, download_to_file};
+# async fn ex() -> Result<(), ferroly::http::HttpError> {
+let client = Client::new();
+let total = download_to_file(&client, "https://example.com/big.iso", "big.iso").await?;
+# let _ = total; Ok(())
+# }
+```
+
+It handles the server's answer for you: **206** appends, **416** means the file
+is already complete (no-op), any other **2xx** rewrites from the start, and a
+non-2xx status is an error. Because it streams, you can verify integrity as it
+downloads by hashing each chunk with [`ferroly::hash`](hash.md).
+
 ### Body framing is decided for you
 
 The client picks a decoding strategy from the response status and headers:
