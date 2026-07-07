@@ -13,15 +13,32 @@ common "run a batch, report *all* the failures at once" pattern — validating e
 field of a form, fanning out to many endpoints, or shutting down a set of resources —
 instead of surfacing only the first error and hiding the rest.
 
+For the complementary *single typed error* case, the
+[`#[derive(FerrolyError)]`](derive.md) macro is re-exported at the crate root as
+`ferroly::FerrolyError` — available with only `errutils` (no `codec` needed). It
+generates `Display` from `#[error("…")]` format strings, `source()` chaining, and
+`From` conversions for `#[from]` fields, so the derived type works with `?`
+directly:
+
+```rust
+#[derive(Debug, ferroly::FerrolyError)]
+pub enum StoreError {
+    #[error("object {key} not found")]
+    NotFound { key: String },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+```
+
 ## Enabling
 
 `errutils` is on by default:
 
 ```toml
 [dependencies]
-ferroly = "0.1"                       # errutils + codec are the defaults
+ferroly = "0.2"                       # errutils + codec are the defaults
 # or, explicitly / minimally:
-ferroly = { version = "0.1", default-features = false, features = ["errutils"] }
+ferroly = { version = "0.2", default-features = false, features = ["errutils"] }
 ```
 
 ## Quick start

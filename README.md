@@ -4,10 +4,10 @@
 
 <p align="center">
   <a href="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml"><img src="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.1.0-B22222" alt="version 0.1.0">
+  <img src="https://img.shields.io/badge/version-0.2.0-B22222" alt="version 0.2.0">
   <img src="https://img.shields.io/badge/rust-1.75%2B-B7410E" alt="MSRV 1.75+">
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="license: Apache-2.0 OR MIT"></a>
-  <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="unsafe forbidden">
+  <img src="https://img.shields.io/badge/unsafe-1%20audited%20block-9cbf3b" alt="unsafe: 1 audited block">
 </p>
 
 **A self-contained, dependency-minimal Rust toolkit of enterprise utilities.**
@@ -37,7 +37,7 @@ hand-rolls the whole stack rather than pulling in an ecosystem of crates.
 - **`ferroly-derive`** — Ferroly's own derive macros (`proc-macro2` / `syn` / `quote`,
   build-time only).
 
-Everything else is implemented from scratch: JSON/XML/YAML encoding and a `#[derive]`-based
+Everything else is implemented from scratch: JSON/XML/YAML/TOML encoding and a `#[derive]`-based
 `Encode`/`Decode`, layered configuration, a prompt-template engine, MIME detection,
 error/derive macros, an HTTP/1.1 client and server, a router, and a WebSocket implementation
 (RFC 6455 framing with a from-scratch SHA-1 handshake).
@@ -52,7 +52,7 @@ companion `ferroly-derive` proc-macro crate. Cloud integrations live in separate
 
 ```toml
 [dependencies]
-ferroly = { version = "0.1", features = ["genai", "openai", "codec"] }
+ferroly = { version = "0.2", features = ["genai", "openai", "codec"] }
 ```
 
 Enable only what you need — unused modules and their dependencies are never compiled.
@@ -61,18 +61,22 @@ Enable only what you need — unused modules and their dependencies are never co
 
 | Feature | Module | Purpose |
 |---|---|---|
-| `errutils` | `ferroly::errutils` | `MultiError` aggregation |
-| `codec` | `ferroly::codec` | `Value` model, `Encode`/`Decode` (+ derives), JSON/XML/YAML, content-type registry |
+| `errutils` | `ferroly::errutils` | `MultiError` aggregation + the `#[derive(FerrolyError)]` typed-error macro |
+| `codec` | `ferroly::codec` | `Value` model, `Encode`/`Decode` (+ derives), JSON/XML/YAML/TOML, content-type registry |
+| `hash` | `ferroly::hash` | Streaming SHA-256/SHA-1/HMAC-SHA256 + hex `Digest` |
+| `cli` | `ferroly::cli` | Command-line parser (subcommands, typed flags, env fallback, `--help`) |
 | `config` | `ferroly::config` | Layered environment + file configuration |
-| `fsutils` | `ferroly::fsutils` | Path checks + content-type detection (extension table + magic-byte sniffing) |
+| `fsutils` | `ferroly::fsutils` | Content-type detection (extension table + magic-byte sniffing) + read-only memory-mapped files (`Mmap`) |
 | `lifecycle` | `ferroly::lifecycle` | Component start/stop orchestration with dependency ordering |
-| `http` | `ferroly::http` | In-house HTTP/1.1 client + server (streaming, chunked, TLS) |
+| `rt` | `ferroly::rt` | Async runtime surface (tokio spawn/channels/sync/time/TCP re-exported) |
+| `http` | `ferroly::http` | In-house HTTP/1.1 client + server (streaming, chunked, SSE, range/resumable downloads, TLS) |
 | `clients` | `ferroly::clients` | Retry, circuit breaker, and auth providers |
 | `genai` | `ferroly::genai` | Provider-agnostic LLM interface + prompt templates |
 | `openai` / `claude` / `ollama` | — | GenAI provider implementations |
 | `turbo` | `ferroly::turbo` | First-class HTTP router + serving |
 | `rest` | `ferroly::rest` | HTTP client + server framework (codec-aware, lifecycle-integrated) |
 | `ws` | `ferroly::ws` | WebSocket client + server (RFC 6455, hand-rolled) |
+| `obs` | `ferroly::obs` | Distributed span/event tracing + exporters (JSON, OTLP/HTTP) |
 | `full` | — | Everything |
 
 Default features: `codec`, `errutils`.
@@ -80,8 +84,8 @@ Default features: `codec`, `errutils`.
 ## Documentation
 
 - **Per-module guides** live in [`docs/`](docs/README.md) — one detailed page per module
-  (codec, genai, http, turbo, rest, ws, config, lifecycle, clients, errutils, fsutils,
-  derive), with architecture notes and cross-links.
+  (codec, hash, genai, http, turbo, rest, ws, obs, config, lifecycle, clients, cli,
+  errutils, fsutils, rt, derive), with architecture notes and cross-links.
 - **API reference**: `cargo doc -p ferroly --features full --open`.
 
 ## Examples
@@ -163,9 +167,11 @@ Ferroly targets a recent stable Rust toolchain (MSRV `1.75`).
 
 ## Status
 
-The foundation, GenAI, and the full HTTP/WebSocket stack are implemented and tested. Further
-utilities (`scheduler`, `secrets`, `cli`, `collections`, `pool`, `uuid`, `semver`, and more) and
-the cloud extension crates are tracked in the roadmap and not yet built.
+The foundation, GenAI, and the full HTTP/WebSocket stack are implemented and tested, along
+with hashing, an async-runtime surface, a CLI parser, memory-mapped files, and distributed
+tracing. Further utilities (`scheduler`, `secrets`, `collections`, `pool`, `uuid`, `semver`,
+and more), signature verification, HTTP/2 + gRPC, and the cloud extension crates are tracked
+in the roadmap/issues and not yet built.
 
 ## Contributing
 

@@ -101,12 +101,36 @@ impl HttpResponse {
 
     /// A Server-Sent Events response: `text/event-stream`, with each `String`
     /// from `events` framed as `data: <event>\n\n` and flushed as it arrives.
+    ///
+    /// For multi-field events (`id`/`event`/`retry`) use [`sse`](Self::sse).
     pub fn event_stream(mut events: mpsc::Receiver<String>) -> Self {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 let frame = format!("data: {event}\n\n").into_bytes();
                 if tx.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self::stream(StatusCode::OK, rx)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+    }
+
+    /// A Server-Sent Events response streaming structured
+    /// [`Event`](crate::http::sse::Event)s.
+    ///
+    /// Each event is serialized with
+    /// [`Event::to_frame`](crate::http::sse::Event::to_frame) — correct
+    /// multi-line `data:` framing plus optional `id`/`event`/`retry` — and
+    /// flushed as it arrives. The response is `text/event-stream` with
+    /// `cache-control: no-cache`.
+    pub fn sse(mut events: mpsc::Receiver<crate::http::sse::Event>) -> Self {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if tx.send(event.to_frame().into_bytes()).await.is_err() {
                     break;
                 }
             }

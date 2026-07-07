@@ -57,6 +57,17 @@ impl RequestBuilder {
         self
     }
 
+    /// Sets a `Range: bytes=start-end` header requesting a byte range. `end` is
+    /// inclusive; pass `None` for an open-ended range (`start-`), e.g. to resume
+    /// a download from `start`.
+    pub fn range(self, start: u64, end: Option<u64>) -> Self {
+        let value = match end {
+            Some(end) => format!("bytes={start}-{end}"),
+            None => format!("bytes={start}-"),
+        };
+        self.header("range", value)
+    }
+
     /// Finalizes the request.
     pub fn build(self) -> Request {
         self.req

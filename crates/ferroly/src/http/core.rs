@@ -72,6 +72,8 @@ impl StatusCode {
     pub const CREATED: StatusCode = StatusCode(201);
     /// 204 No Content.
     pub const NO_CONTENT: StatusCode = StatusCode(204);
+    /// 206 Partial Content (a satisfied `Range` request).
+    pub const PARTIAL_CONTENT: StatusCode = StatusCode(206);
     /// 400 Bad Request.
     pub const BAD_REQUEST: StatusCode = StatusCode(400);
     /// 401 Unauthorized.
@@ -86,6 +88,8 @@ impl StatusCode {
     pub const NOT_ACCEPTABLE: StatusCode = StatusCode(406);
     /// 413 Payload Too Large.
     pub const PAYLOAD_TOO_LARGE: StatusCode = StatusCode(413);
+    /// 416 Range Not Satisfiable.
+    pub const RANGE_NOT_SATISFIABLE: StatusCode = StatusCode(416);
     /// 429 Too Many Requests.
     pub const TOO_MANY_REQUESTS: StatusCode = StatusCode(429);
     /// 500 Internal Server Error.

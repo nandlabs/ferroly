@@ -20,8 +20,19 @@
 // Let derive-generated `::ferroly::codec::…` paths resolve inside this crate.
 extern crate self as ferroly;
 
+/// Derives a typed error enum/struct: `Display` from `#[error("…")]` format
+/// strings (with field interpolation), `std::error::Error::source()` chaining,
+/// and `From` conversions for `#[from]` fields — so it works with `?` directly.
+/// Use `#[error(transparent)]` to forward to a wrapped error.
+///
+/// Re-exported at the crate root so it is available with only `errutils`
+/// (i.e. without enabling `codec`).
+pub use ferroly_derive::FerrolyError;
+
 #[cfg(feature = "auth")]
 pub mod auth;
+#[cfg(feature = "cli")]
+pub mod cli;
 #[cfg(feature = "clients")]
 pub mod clients;
 #[cfg(feature = "codec")]
@@ -34,6 +45,8 @@ pub mod errutils;
 pub mod fsutils;
 #[cfg(feature = "genai")]
 pub mod genai;
+#[cfg(feature = "hash")]
+pub mod hash;
 #[cfg(feature = "http")]
 pub mod http;
 #[cfg(feature = "lifecycle")]
@@ -44,8 +57,12 @@ pub mod log;
 pub mod messaging;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+#[cfg(feature = "obs")]
+pub mod obs;
 #[cfg(feature = "rest")]
 pub mod rest;
+#[cfg(feature = "rt")]
+pub mod rt;
 #[cfg(feature = "turbo")]
 pub mod turbo;
 #[cfg(feature = "vectorstore")]

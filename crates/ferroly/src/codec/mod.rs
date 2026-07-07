@@ -21,8 +21,9 @@
 //! assert_eq!(back, Point { x: 1, y: 2 });
 //! ```
 //!
-//! JSON is full-fidelity; the [`xml`] and [`yaml`] codecs cover the common
-//! struct/config subset (see their module docs for what is and isn't modeled).
+//! JSON is full-fidelity; the [`xml`], [`yaml`], and [`toml`] codecs cover the
+//! common struct/config subset (see their module docs for what is and isn't
+//! modeled).
 
 #![deny(missing_docs)]
 
@@ -33,6 +34,7 @@ mod fmt;
 pub mod json;
 mod registry;
 pub mod schema;
+pub mod toml;
 mod traits;
 mod value;
 pub mod xml;

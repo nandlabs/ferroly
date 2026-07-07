@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0 OR MIT"
@@ -26,13 +26,16 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 
 # internal proc-macro crate — the only companion crate to `ferroly`
-ferroly-derive    = { path = "crates/ferroly-derive",    version = "0.1.0" }
+ferroly-derive    = { path = "crates/ferroly-derive",    version = "0.2.0" }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 
-# Centralized lints applied to every workspace crate. The whole codebase is
-# `unsafe`-free by design — forbid it so that stays true.
+# Centralized lints applied to every workspace crate. The codebase is
+# `unsafe`-free except for a single audited region: the read-only memory-mapped
+# file support in `fsutils` (a `#[allow(unsafe_code)]` module wrapping the
+# `mmap`/`munmap` FFI). `deny` keeps every other `unsafe` a hard error while
+# permitting that one reviewed exception.
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"

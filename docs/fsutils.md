@@ -25,7 +25,7 @@ virtual/abstract filesystem (local, in-memory, remote backends), see the separat
 
 ```toml
 [dependencies]
-ferroly = { version = "0.1", features = ["fsutils"] }
+ferroly = { version = "0.2", features = ["fsutils"] }
 ```
 
 ## Quick start
@@ -132,6 +132,36 @@ assert_eq!(sniff(b"not a known header"),    None);
 
 Use extension lookup when you control (and trust) the filename, and content sniffing
 when handling uploads or opaque blobs.
+
+## Memory-mapped files: `Mmap`
+
+For large-file, zero-copy, lazy-load workloads, `Mmap` maps a file read-only and
+dereferences to `&[u8]`:
+
+```rust
+use ferroly::fsutils::Mmap;
+# use std::io::Write;
+# let path = std::env::temp_dir().join("ferroly-doc-mmap.bin");
+# std::fs::write(&path, b"hello mmap").unwrap();
+let map = Mmap::open(&path)?;
+assert_eq!(&map[..5], b"hello");     // Deref<Target = [u8]>
+assert_eq!(map.len(), 10);
+# std::fs::remove_file(&path).ok();
+# Ok::<(), ferroly::fsutils::FsError>(())
+```
+
+| Method | Returns | Notes |
+|---|---|---|
+| `Mmap::open(path)` | `Result<Mmap, FsError>` | maps read-only; empty file → empty slice |
+| deref / `as_bytes()` | `&[u8]` | the whole file |
+| `len()` / `is_empty()` | `usize` / `bool` | mapping size |
+
+The mapping is `Send + Sync` (the bytes are immutable) and is released on drop.
+
+> **Platform note.** On Unix (`mmap`/`munmap`) this is a true OS mapping with pages
+> faulted in lazily — this is the crate's single audited `unsafe` region. On
+> non-Unix targets it transparently falls back to reading the whole file into
+> memory behind the same API.
 
 ## Error handling
 

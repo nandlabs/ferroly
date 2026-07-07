@@ -9,7 +9,7 @@ filesystem, component lifecycle, structured logging, auth, and more — into a
 
 Its defining constraint: **near-zero external dependencies.** The entire runtime
 dependency tree is just **`tokio`** (async runtime) and the **`rustls`** TLS
-stack. Everything else — JSON/XML/YAML codecs, HTTP/1.1, WebSocket framing,
+stack. Everything else — JSON/XML/YAML/TOML codecs, HTTP/1.1, WebSocket framing,
 SHA-1/SHA-256/HMAC, base64, the derive macros — is implemented in-house. If a
 module doesn't need async or TLS, it compiles with **no external crates at all**.
 
@@ -24,12 +24,14 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 ### Foundation (mostly std-only)
 | Module | Feature | What it does |
 |---|---|---|
-| [`codec`](codec.md) | `codec` *(default)* | `Value` model + `Encode`/`Decode` traits & derives; JSON/XML/YAML; content-type dispatch; a streaming JSON fast-path near serde_json speed |
+| [`codec`](codec.md) | `codec` *(default)* | `Value` model + `Encode`/`Decode` traits & derives; JSON/XML/YAML/TOML; content-type dispatch; a streaming JSON fast-path near serde_json speed |
 | [`codec::schema`](schema.md) | `codec` | JSON-Schema **subset** validator over `Value` |
 | [derive macros](derive.md) | (with `codec`) | `#[derive(Encode, Decode)]` and `#[derive(FerrolyError)]` |
+| [`cli`](cli.md) | `cli` | Command-line parser: subcommands, typed flags/options, env fallback, generated `--help` |
 | [`config`](config.md) | `config` | Layered configuration: env + file (JSON/YAML/XML/**.properties**) + **CLI args**, bound to a struct via `Decode` |
-| [`errutils`](errutils.md) | `errutils` *(default)* | `MultiError` — aggregate multiple errors into one |
-| [`fsutils`](fsutils.md) | `fsutils` | MIME detection (extension table + magic-byte sniffing) |
+| [`errutils`](errutils.md) | `errutils` *(default)* | `MultiError` — aggregate multiple errors into one; the `#[derive(FerrolyError)]` typed-error macro |
+| [`hash`](hash.md) | `hash` | Streaming SHA-256 / SHA-1 / HMAC-SHA256 + a hex `Digest` type |
+| [`fsutils`](fsutils.md) | `fsutils` | MIME detection (extension table + magic-byte sniffing); read-only memory-mapped files (`Mmap`) |
 | [`lifecycle`](lifecycle.md) | `lifecycle` | `Component` + `ComponentManager` (dependency-ordered start/stop) + **health probes** |
 
 ### Data & AI
@@ -41,11 +43,12 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 ### Web & networking
 | Module | Feature | What it does |
 |---|---|---|
-| [`http`](http.md) | `http` | Hand-rolled HTTP/1.1 client + server (chunked, **SSE streaming**, TLS) |
+| [`http`](http.md) | `http` | Hand-rolled HTTP/1.1 client + server (chunked, **SSE streaming**, **range/resumable downloads**, TLS) |
 | [`turbo`](turbo.md) | `turbo` | First-class router: route groups, onion middleware, rate-limit, JWT auth, access log, trace-context, content negotiation |
 | [`rest`](rest.md) | `rest` | REST client + server framework (codec-aware, lifecycle-integrated, health endpoints) |
 | [`ws`](ws.md) | `ws` | Hand-rolled RFC 6455 WebSocket client + server |
 | [`clients`](clients.md) | `clients` | Resilience primitives: auth providers, retry/backoff, circuit breaker |
+| [`rt`](rt.md) | `rt` | Async runtime surface — the `tokio` primitives (spawn, channels, sync, time, TCP) re-exported |
 
 ### Infrastructure & ops
 | Module | Feature | What it does |
@@ -54,6 +57,7 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 | [`vfs`](vfs.md) | `vfs` | Virtual filesystem trait + local backend on async `tokio::fs` |
 | [`log`](log.md) | `log` | Enterprise structured logger (timestamps, typed fields, async appender, trace-ID correlation) |
 | [`metrics`](metrics.md) | `metrics` | Dependency-free counters/gauges/histograms + Prometheus `/metrics` exposition; RED middleware for `turbo` |
+| [`obs`](obs.md) | `obs` | Distributed span/event tracing with pluggable exporters (JSON, OTLP/HTTP) |
 | [`auth`](auth.md) | `auth` | HS256 JWT mint/verify on from-scratch SHA-256/HMAC |
 
 ---
@@ -66,6 +70,9 @@ Enable only what you use — unused modules and their dependencies never compile
 |---|:--:|---|:--:|:--:|
 | `errutils` | ✅ | — | — | — |
 | `codec` | ✅ | — | — | — |
+| `hash` | | — | — | — |
+| `cli` | | — | — | — |
+| `rt` | | tokio | ✅ | — |
 | `config` | | `codec` | — | — |
 | `fsutils` | | — | — | — |
 | `lifecycle` | | tokio | ✅ | — |
@@ -73,14 +80,15 @@ Enable only what you use — unused modules and their dependencies never compile
 | `clients` | | `http` | ✅ | ✅ |
 | `turbo` | | `http`, `codec` | ✅ | ✅ |
 | `rest` | | `turbo`, `clients`, `lifecycle`, `codec` | ✅ | ✅ |
-| `ws` | | `http` | ✅ | ✅ |
+| `ws` | | `http`, `hash` | ✅ | ✅ |
 | `genai` | | `codec`, `clients`, `http` | ✅ | ✅ |
 | `openai` / `claude` / `ollama` | | `genai` | ✅ | ✅ |
 | `all-providers` | | all three | ✅ | ✅ |
 | `vectorstore` | | `codec` | — | — |
-| `auth` | | `codec` | — | — |
+| `auth` | | `codec`, `hash` | — | — |
 | `log` | | `codec` | — | — |
 | `metrics` | | — | — | — |
+| `obs` | | `codec` (+ `http` for OTLP) | for OTLP | — |
 | `messaging` | | `codec`, `lifecycle` | ✅ | — |
 | `vfs` | | tokio | ✅ | — |
 | `full` | | everything above | ✅ | ✅ |
@@ -88,9 +96,9 @@ Enable only what you use — unused modules and their dependencies never compile
 ```toml
 [dependencies]
 # just what you need
-ferroly = { version = "0.1", default-features = false, features = ["genai", "openai", "vectorstore"] }
+ferroly = { version = "0.2", default-features = false, features = ["genai", "openai", "vectorstore"] }
 # or everything
-ferroly = { version = "0.1", features = ["full"] }
+ferroly = { version = "0.2", features = ["full"] }
 ```
 
 ---

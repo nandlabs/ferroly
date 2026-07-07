@@ -503,6 +503,14 @@ async fn content_negotiated_respond() {
     let resp = get_accept(&base, "application/xml").await;
     assert!(resp.headers().get("content-type").unwrap().contains("xml"));
 
+    let resp = get_accept(&base, "application/toml").await;
+    assert!(resp.headers().get("content-type").unwrap().contains("toml"));
+    assert_eq!(resp.text().await.unwrap(), "name = \"widget\"\n");
+
+    // `yml` is accepted as an alias and served as YAML.
+    let resp = get_accept(&base, "application/yml").await;
+    assert!(resp.headers().get("content-type").unwrap().contains("yaml"));
+
     let resp = get_accept(&base, "text/html").await;
     assert_eq!(resp.status().as_u16(), 406);
 }

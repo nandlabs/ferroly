@@ -257,6 +257,39 @@ Chunk sizes are an implementation detail: for a `Content-Length` or `EOF`-framed
 at 16 KiB reads; for a chunked-encoded body each `chunk()` returns exactly one decoded
 transfer chunk (the `chunked` framing and trailers are stripped for you).
 
+### Range requests and resumable downloads
+
+`RequestBuilder::range(start, end)` sets a `Range: bytes=start-end` header (`end`
+inclusive, or `None` for open-ended `start-`):
+
+```rust
+use ferroly::http::{Method, Request};
+# fn ex() -> Result<(), ferroly::http::HttpError> {
+let req = Request::builder(Method::Get, "https://example.com/big.bin")?
+    .range(1_048_576, None)      // resume from 1 MiB
+    .build();
+# let _ = req; Ok(())
+# }
+```
+
+For the common case, `download_to_file` streams a body straight to disk and
+**resumes** automatically — if the destination already holds a partial file it
+issues a `Range` from that offset and appends:
+
+```rust
+use ferroly::http::{Client, download_to_file};
+# async fn ex() -> Result<(), ferroly::http::HttpError> {
+let client = Client::new();
+let total = download_to_file(&client, "https://example.com/big.iso", "big.iso").await?;
+# let _ = total; Ok(())
+# }
+```
+
+It handles the server's answer for you: **206** appends, **416** means the file
+is already complete (no-op), any other **2xx** rewrites from the start, and a
+non-2xx status is an error. Because it streams, you can verify integrity as it
+downloads by hashing each chunk with [`ferroly::hash`](hash.md).
+
 ### Body framing is decided for you
 
 The client picks a decoding strategy from the response status and headers:
@@ -442,7 +475,8 @@ The owned outgoing response a handler returns. The body is **either** the fixed 
 | `header` | `fn header(self, name: impl Into<String>, value: impl Into<String>) -> HttpResponse` | Sets a header (builder-style). |
 | `body` | `fn body(self, body: impl Into<Vec<u8>>) -> HttpResponse` | Sets the fixed body. |
 | `stream` | `fn stream(status: StatusCode, chunks: mpsc::Receiver<Vec<u8>>) -> HttpResponse` | Chunked streaming body. |
-| `event_stream` | `fn event_stream(events: mpsc::Receiver<String>) -> HttpResponse` | Server-Sent Events body. |
+| `event_stream` | `fn event_stream(events: mpsc::Receiver<String>) -> HttpResponse` | Server-Sent Events body (raw `data:` strings). |
+| `sse` | `fn sse(events: mpsc::Receiver<sse::Event>) -> HttpResponse` | Server-Sent Events body with structured [`Event`](#structured-server-sent-events-sse--httpsse)s. |
 
 ```rust
 use ferroly::http::{HttpResponse, StatusCode};
@@ -506,6 +540,49 @@ let resp = HttpResponse::event_stream(rx);
 Internally `event_stream` spawns a task that adapts the `String` channel to the `Vec<u8>`
 channel `stream` consumes, so you don't manage the SSE framing yourself. This pairs naturally
 with an LLM token stream from [`ferroly::genai`](genai.md).
+
+### Structured Server-Sent Events: `sse` + `http::sse`
+
+When you need more than a bare `data:` line — an `event:` type, an `id:` for
+resumption, a `retry:` hint, or multi-line data — use the structured `Event`
+type from `ferroly::http::sse` and `HttpResponse::sse`:
+
+```rust
+use ferroly::http::{HttpResponse, sse::Event};
+use tokio::sync::mpsc;
+
+let (tx, rx) = mpsc::channel::<Event>(16);
+tokio::spawn(async move {
+    let _ = tx.send(Event::new("first line\nsecond line").event("update").id("1")).await;
+    let _ = tx.send(Event::keep_alive("ping")).await;   // `: ping` comment
+});
+let resp = HttpResponse::sse(rx);
+# let _ = resp;
+```
+
+`Event::to_frame()` produces spec-correct framing: one `data:` line per newline
+in the payload, plus optional `event:` / `id:` / `retry:` fields and comment
+lines, terminated by the dispatching blank line.
+
+On the **client** side, decode an incoming `text/event-stream` body incrementally
+with `http::sse::SseDecoder`, feeding it the chunks from
+[`Response::chunk`](#response-streaming-body). It buffers across chunk boundaries
+and returns each `Event` once its blank line arrives:
+
+```rust
+use ferroly::http::sse::SseDecoder;
+
+let mut dec = SseDecoder::new();
+let events = dec.push(b"event: update\ndata: hello\n\n");
+assert_eq!(events[0].data, "hello");
+assert_eq!(events[0].event.as_deref(), Some("update"));
+```
+
+| Item | Kind |
+|---|---|
+| `Event { data, event, id, retry, comment }` | builder (`new`, `keep_alive`, `.event`, `.id`, `.retry`, `.comment`) + `to_frame()` |
+| `SseDecoder` | incremental client parser (`new`, `push(&[u8]) -> Vec<Event>`) |
+| `HttpResponse::sse(Receiver<Event>)` | server response streaming structured events |
 
 ---
 

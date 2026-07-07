@@ -3,7 +3,7 @@
 //! The format set is a closed [`Format`] enum dispatched by `match`, so these
 //! are free functions — there is no state to carry.
 
-use ferroly::codec::{json, xml, yaml, CodecError, Decode, Encode};
+use ferroly::codec::{json, toml, xml, yaml, CodecError, Decode, Encode};
 
 /// A encoding format supported by the content-type dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -14,11 +14,14 @@ pub enum Format {
     Xml,
     /// YAML Ain't Markup Language (block-style subset).
     Yaml,
+    /// Tom's Obvious Minimal Language (config subset).
+    Toml,
 }
 
 impl Format {
     /// Resolves a MIME content type (ignoring `;charset=...` and case) to a
-    /// format, recognizing `+json`/`+xml`/`+yaml` structured-syntax suffixes.
+    /// format, recognizing `+json`/`+xml`/`+yaml`/`+toml` structured-syntax
+    /// suffixes.
     pub fn from_content_type(content_type: &str) -> Option<Format> {
         let ct = content_type
             .split(';')
@@ -30,9 +33,9 @@ impl Format {
         match ct.as_str() {
             "application/json" | "text/json" => return Some(Format::Json),
             "application/xml" | "text/xml" => return Some(Format::Xml),
-            "application/yaml" | "text/yaml" | "application/x-yaml" | "text/x-yaml" => {
-                return Some(Format::Yaml)
-            }
+            "application/yaml" | "text/yaml" | "application/x-yaml" | "text/x-yaml"
+            | "application/yml" | "text/yml" => return Some(Format::Yaml),
+            "application/toml" | "text/toml" | "application/x-toml" => return Some(Format::Toml),
             _ => {}
         }
 
@@ -42,6 +45,8 @@ impl Format {
             Some(Format::Xml)
         } else if ct.ends_with("+yaml") {
             Some(Format::Yaml)
+        } else if ct.ends_with("+toml") {
+            Some(Format::Toml)
         } else {
             None
         }
@@ -60,6 +65,7 @@ pub fn encode<T: Encode>(content_type: &str, value: &T) -> Result<Vec<u8>, Codec
         Format::Json => Ok(json::encode_to_vec(value)),
         Format::Xml => Ok(xml::encode_to_vec(value)),
         Format::Yaml => Ok(yaml::encode_to_vec(value)),
+        Format::Toml => Ok(toml::encode_to_vec(value)),
     }
 }
 
@@ -69,6 +75,7 @@ pub fn decode<T: Decode>(content_type: &str, bytes: &[u8]) -> Result<T, CodecErr
         Format::Json => json::decode_from_slice(bytes),
         Format::Xml => xml::decode_from_slice(bytes),
         Format::Yaml => yaml::decode_from_slice(bytes),
+        Format::Toml => toml::decode_from_slice(bytes),
     }
 }
 
@@ -144,6 +151,21 @@ mod tests {
         };
         let bytes = encode("application/yaml", &cfg).unwrap();
         let back: Config = decode("application/yaml", &bytes).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn toml_round_trip() {
+        assert_eq!(
+            Format::from_content_type("application/toml"),
+            Some(Format::Toml)
+        );
+        let cfg = Config {
+            name: "svc".into(),
+            port: 8080,
+        };
+        let bytes = encode("application/toml", &cfg).unwrap();
+        let back: Config = decode("application/toml", &bytes).unwrap();
         assert_eq!(cfg, back);
     }
 }

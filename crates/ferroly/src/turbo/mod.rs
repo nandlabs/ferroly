@@ -138,8 +138,8 @@ impl Ctx {
     }
 
     /// Encodes `value` as the response body, picking the codec from the request's
-    /// `Accept` header (JSON / XML / YAML; JSON when `Accept` is absent or `*/*`).
-    /// Returns `406 Not Acceptable` if no supported type matches.
+    /// `Accept` header (JSON / XML / YAML / TOML; JSON when `Accept` is absent or
+    /// `*/*`). Returns `406 Not Acceptable` if no supported type matches.
     pub fn respond<T: Encode>(&self, status: StatusCode, value: &T) -> HttpResponse {
         let accept = self.header("accept").unwrap_or("");
         match negotiate_content_type(accept) {
@@ -851,8 +851,10 @@ fn negotiate_content_type(accept: &str) -> Option<&'static str> {
                 return Some("application/json")
             }
             "application/xml" | "text/xml" => return Some("application/xml"),
-            "application/yaml" | "text/yaml" | "application/x-yaml" => {
-                return Some("application/yaml")
+            "application/yaml" | "text/yaml" | "application/x-yaml" | "text/x-yaml"
+            | "application/yml" | "text/yml" => return Some("application/yaml"),
+            "application/toml" | "text/toml" | "application/x-toml" => {
+                return Some("application/toml")
             }
             _ => {}
         }
