@@ -761,6 +761,8 @@ match provider.complete(request).await {
 
 ## See also
 
+- [model-router](model-router.md) — capability/cost-based selection over these
+  providers with automatic fallback (`genai::router`).
 - [codec](codec.md) — the `Encode`/`Decode` traits and `Value` JSON DOM every
   provider builds on.
 - [clients](clients.md) — the `AuthProvider` / `BearerAuth` / `ApiKeyAuth` traits

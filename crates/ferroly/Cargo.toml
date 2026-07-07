@@ -81,6 +81,11 @@ full = [
 # make timing-dependent tests deterministic. Dev-only — no runtime impact.
 tokio = { workspace = true, features = ["test-util"] }
 
+# The model-router example needs a concrete provider (which pulls `genai`).
+[[example]]
+name = "model_router"
+required-features = ["openai"]
+
 [lints]
 workspace = true
 

@@ -71,7 +71,7 @@ Enable only what you need — unused modules and their dependencies are never co
 | `rt` | `ferroly::rt` | Async runtime surface (tokio spawn/channels/sync/time/TCP re-exported) |
 | `http` | `ferroly::http` | In-house HTTP/1.1 client + server (streaming, chunked, SSE, range/resumable downloads, TLS) |
 | `clients` | `ferroly::clients` | Retry, circuit breaker, and auth providers |
-| `genai` | `ferroly::genai` | Provider-agnostic LLM interface + prompt templates |
+| `genai` | `ferroly::genai` | Provider-agnostic LLM interface + prompt templates + a **model router** (capability/cost routing with fallback) |
 | `openai` / `claude` / `ollama` | — | GenAI provider implementations |
 | `turbo` | `ferroly::turbo` | First-class HTTP router + serving |
 | `rest` | `ferroly::rest` | HTTP client + server framework (codec-aware, lifecycle-integrated) |

@@ -12,8 +12,8 @@ use super::ProviderOptions;
 use ferroly::genai::provider::{BoxFuture, ChunkStream, GenAiProvider};
 use ferroly::genai::{
     Capability, CompletionChunk, CompletionRequest, CompletionResponse, EmbedRequest,
-    EmbedResponse, Embedder, GenAiError, Message, MessagePart, ResponseFormat, Role, ToolChoice,
-    Usage,
+    EmbedResponse, Embedder, GenAiError, Message, MessagePart, ModelInfo, ResponseFormat, Role,
+    ToolChoice, Usage,
 };
 
 const DEFAULT_BASE: &str = "https://api.openai.com";
@@ -67,6 +67,27 @@ impl GenAiProvider for OpenAiProvider {
             capability,
             Capability::Streaming | Capability::ToolUse | Capability::Vision | Capability::JsonMode
         )
+    }
+
+    fn model_catalog(&self) -> Vec<ModelInfo> {
+        use Capability::{Chat, Embeddings, JsonMode, Streaming, Text, ToolUse, Vision};
+        vec![
+            ModelInfo::new("openai", "gpt-4o")
+                .display_name("GPT-4o")
+                .capabilities([Text, Chat, Streaming, Vision, ToolUse, JsonMode])
+                .limits(128_000, 16_384)
+                .cost(2.5, 10.0),
+            ModelInfo::new("openai", "gpt-4o-mini")
+                .display_name("GPT-4o mini")
+                .capabilities([Text, Chat, Streaming, Vision, ToolUse, JsonMode])
+                .limits(128_000, 16_384)
+                .cost(0.15, 0.60),
+            ModelInfo::new("openai", "text-embedding-3-small")
+                .display_name("text-embedding-3-small")
+                .capabilities([Embeddings])
+                .limits(8_191, 0)
+                .cost(0.02, 0.0),
+        ]
     }
 
     fn complete(
