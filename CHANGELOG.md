@@ -7,7 +7,7 @@ crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-07-07
+## [0.2.0] 
 
 ### Added
 - **`codec::toml`** — a hand-rolled, dependency-free TOML codec (streaming parse
