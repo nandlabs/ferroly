@@ -8,7 +8,7 @@ input in memory.
 Enable with the `hash` feature:
 
 ```toml
-ferroly = { version = "0.1", features = ["hash"] }
+ferroly = { version = "0.2", features = ["hash"] }
 ```
 
 All algorithms are implemented in-house — FIPS 180-4 SHA-256, FIPS 180-1 SHA-1,

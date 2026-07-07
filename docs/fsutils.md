@@ -25,7 +25,7 @@ virtual/abstract filesystem (local, in-memory, remote backends), see the separat
 
 ```toml
 [dependencies]
-ferroly = { version = "0.1", features = ["fsutils"] }
+ferroly = { version = "0.2", features = ["fsutils"] }
 ```
 
 ## Quick start

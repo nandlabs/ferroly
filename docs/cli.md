@@ -7,7 +7,7 @@ options, positional arguments, environment-variable fallback, and generated
 Enable with the `cli` feature:
 
 ```toml
-ferroly = { version = "0.1", features = ["cli"] }
+ferroly = { version = "0.2", features = ["cli"] }
 ```
 
 ```rust

@@ -8,7 +8,7 @@ single-dependency promise intact.
 Enable with the `rt` feature (it pulls in `tokio`):
 
 ```toml
-ferroly = { version = "0.1", features = ["rt"] }
+ferroly = { version = "0.2", features = ["rt"] }
 ```
 
 ```rust

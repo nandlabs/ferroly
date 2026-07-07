@@ -36,9 +36,9 @@ pub enum StoreError {
 
 ```toml
 [dependencies]
-ferroly = "0.1"                       # errutils + codec are the defaults
+ferroly = "0.2"                       # errutils + codec are the defaults
 # or, explicitly / minimally:
-ferroly = { version = "0.1", default-features = false, features = ["errutils"] }
+ferroly = { version = "0.2", default-features = false, features = ["errutils"] }
 ```
 
 ## Quick start

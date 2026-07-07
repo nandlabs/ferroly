@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml"><img src="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.1.0-B22222" alt="version 0.1.0">
+  <img src="https://img.shields.io/badge/version-0.2.0-B22222" alt="version 0.2.0">
   <img src="https://img.shields.io/badge/rust-1.75%2B-B7410E" alt="MSRV 1.75+">
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="license: Apache-2.0 OR MIT"></a>
   <img src="https://img.shields.io/badge/unsafe-1%20audited%20block-9cbf3b" alt="unsafe: 1 audited block">
@@ -52,7 +52,7 @@ companion `ferroly-derive` proc-macro crate. Cloud integrations live in separate
 
 ```toml
 [dependencies]
-ferroly = { version = "0.1", features = ["genai", "openai", "codec"] }
+ferroly = { version = "0.2", features = ["genai", "openai", "codec"] }
 ```
 
 Enable only what you need — unused modules and their dependencies are never compiled.
@@ -84,8 +84,8 @@ Default features: `codec`, `errutils`.
 ## Documentation
 
 - **Per-module guides** live in [`docs/`](docs/README.md) — one detailed page per module
-  (codec, genai, http, turbo, rest, ws, config, lifecycle, clients, errutils, fsutils,
-  derive), with architecture notes and cross-links.
+  (codec, hash, genai, http, turbo, rest, ws, obs, config, lifecycle, clients, cli,
+  errutils, fsutils, rt, derive), with architecture notes and cross-links.
 - **API reference**: `cargo doc -p ferroly --features full --open`.
 
 ## Examples
@@ -167,9 +167,11 @@ Ferroly targets a recent stable Rust toolchain (MSRV `1.75`).
 
 ## Status
 
-The foundation, GenAI, and the full HTTP/WebSocket stack are implemented and tested. Further
-utilities (`scheduler`, `secrets`, `cli`, `collections`, `pool`, `uuid`, `semver`, and more) and
-the cloud extension crates are tracked in the roadmap and not yet built.
+The foundation, GenAI, and the full HTTP/WebSocket stack are implemented and tested, along
+with hashing, an async-runtime surface, a CLI parser, memory-mapped files, and distributed
+tracing. Further utilities (`scheduler`, `secrets`, `collections`, `pool`, `uuid`, `semver`,
+and more), signature verification, HTTP/2 + gRPC, and the cloud extension crates are tracked
+in the roadmap/issues and not yet built.
 
 ## Contributing
 

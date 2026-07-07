@@ -7,7 +7,37 @@ crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-07
+
 ### Added
+- **`codec::toml`** — a hand-rolled, dependency-free TOML codec (streaming parse
+  + encode) covering the common config subset; `Format::Toml` content-type
+  dispatch, plus `application/yml` / `text/yml` YAML aliases (in the codec
+  registry and the `turbo` router's content negotiation, which now also offers
+  TOML).
+- **`hash` module** — public **streaming** `Sha256` / `Sha1` / `HmacSha256` with
+  a `Digest<N>` type (hex, constant-time `ct_eq`) and one-shot helpers. `auth`
+  and `ws` now delegate their SHA to it (single implementation).
+- **`rt` module** — a curated async-runtime surface re-exporting the `tokio`
+  primitives Ferroly uses (spawn, `select!`, channels, sync, time, net, io), so
+  consumers don't add `tokio` themselves.
+- **`http::sse`** — structured Server-Sent Events: an `Event`
+  (`id`/`event`/`data`/`retry`/`comment`) with spec-correct framing, an
+  incremental client-side `SseDecoder`, and `HttpResponse::sse`.
+- **`fsutils::Mmap`** — read-only memory-mapped files (`Deref<[u8]>`,
+  `Send + Sync`); a true OS mapping on Unix, with an in-memory fallback on
+  non-Unix behind the same API.
+- **HTTP range & resumable downloads** — `RequestBuilder::range` and
+  `http::download_to_file` (resumes a partial file via a `Range` request), plus
+  `StatusCode::PARTIAL_CONTENT` / `RANGE_NOT_SATISFIABLE`.
+- **`cli` module** — a builder-based command-line parser: subcommands, typed
+  flags/options, positional args, environment-variable fallback, and generated
+  `--help`.
+- **`obs` module** — distributed span/event tracing with a shared `trace_id`,
+  typed fields, a `Level` filter, a pluggable `Exporter` trait, a built-in
+  `JsonExporter`, and an `OtlpHttpExporter` (OTLP/HTTP+JSON, with `http`).
+- The `#[derive(FerrolyError)]` macro is re-exported at the **crate root**
+  (usable with only `errutils`, without `codec`).
 - **`metrics` module** — a dependency-free metrics registry (`Counter`, `Gauge`,
   `Histogram`) with Prometheus text exposition and a process-global registry.
   The `turbo` router gains `Router::metrics()` (RED middleware) and
@@ -34,6 +64,9 @@ crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
   enabled module's error.
 
 ### Changed
+- Workspace lint `unsafe_code` relaxed from `forbid` to `deny` to permit a
+  single audited `#[allow(unsafe_code)]` region — the `fsutils::Mmap` POSIX
+  `mmap`/`munmap` FFI. The crate is otherwise `unsafe`-free.
 - Parsers (JSON/XML/YAML) now enforce a recursion-depth cap (128) and reject
   malformed input without panicking.
 - The HTTP server rejects request-smuggling framings (conflicting `Content-Length`

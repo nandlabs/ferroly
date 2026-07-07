@@ -30,7 +30,7 @@ implementations coerce them to the target field types (e.g. `"9000"` → `u16`,
 
 ```toml
 [dependencies]
-ferroly = { version = "0.1", features = ["config"] }
+ferroly = { version = "0.2", features = ["config"] }
 ```
 
 Enabling `config` automatically pulls in `codec`.

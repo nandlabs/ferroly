@@ -96,9 +96,9 @@ Enable only what you use — unused modules and their dependencies never compile
 ```toml
 [dependencies]
 # just what you need
-ferroly = { version = "0.1", default-features = false, features = ["genai", "openai", "vectorstore"] }
+ferroly = { version = "0.2", default-features = false, features = ["genai", "openai", "vectorstore"] }
 # or everything
-ferroly = { version = "0.1", features = ["full"] }
+ferroly = { version = "0.2", features = ["full"] }
 ```
 
 ---
