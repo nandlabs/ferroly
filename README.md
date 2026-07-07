@@ -76,6 +76,7 @@ Enable only what you need — unused modules and their dependencies are never co
 | `turbo` | `ferroly::turbo` | First-class HTTP router + serving |
 | `rest` | `ferroly::rest` | HTTP client + server framework (codec-aware, lifecycle-integrated) |
 | `ws` | `ferroly::ws` | WebSocket client + server (RFC 6455, hand-rolled) |
+| `obs` | `ferroly::obs` | Distributed span/event tracing + exporters (JSON, OTLP/HTTP) |
 | `full` | — | Everything |
 
 Default features: `codec`, `errutils`.

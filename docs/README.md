@@ -57,6 +57,7 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 | [`vfs`](vfs.md) | `vfs` | Virtual filesystem trait + local backend on async `tokio::fs` |
 | [`log`](log.md) | `log` | Enterprise structured logger (timestamps, typed fields, async appender, trace-ID correlation) |
 | [`metrics`](metrics.md) | `metrics` | Dependency-free counters/gauges/histograms + Prometheus `/metrics` exposition; RED middleware for `turbo` |
+| [`obs`](obs.md) | `obs` | Distributed span/event tracing with pluggable exporters (JSON, OTLP/HTTP) |
 | [`auth`](auth.md) | `auth` | HS256 JWT mint/verify on from-scratch SHA-256/HMAC |
 
 ---
@@ -87,6 +88,7 @@ Enable only what you use — unused modules and their dependencies never compile
 | `auth` | | `codec`, `hash` | — | — |
 | `log` | | `codec` | — | — |
 | `metrics` | | — | — | — |
+| `obs` | | `codec` (+ `http` for OTLP) | for OTLP | — |
 | `messaging` | | `codec`, `lifecycle` | ✅ | — |
 | `vfs` | | tokio | ✅ | — |
 | `full` | | everything above | ✅ | ✅ |

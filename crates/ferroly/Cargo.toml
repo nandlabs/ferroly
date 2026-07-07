@@ -50,6 +50,7 @@ vfs = ["dep:tokio"]
 hash = []
 rt = ["dep:tokio"]
 cli = []
+obs = ["codec"]
 full = [
     "errutils",
     "codec",
@@ -72,6 +73,7 @@ full = [
     "messaging",
     "vfs",
     "metrics",
+    "obs",
 ]
 
 [dev-dependencies]

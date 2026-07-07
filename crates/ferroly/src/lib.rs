@@ -57,6 +57,8 @@ pub mod log;
 pub mod messaging;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+#[cfg(feature = "obs")]
+pub mod obs;
 #[cfg(feature = "rest")]
 pub mod rest;
 #[cfg(feature = "rt")]
