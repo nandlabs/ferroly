@@ -5,8 +5,9 @@
 The in-house, dependency-free encoding toolkit. It
 provides a format-agnostic data model ([`Value`](#the-value-model)), the
 [`Encode`](#the-encode-and-decode-traits) / [`Decode`](#the-encode-and-decode-traits)
-traits with derives, hand-written JSON / XML / YAML codecs, a content-type
-dispatch layer, and an optional [JSON-Schema subset validator](schema.md).
+traits with derives, hand-written JSON / XML / YAML / TOML codecs, a
+content-type dispatch layer, and an optional
+[JSON-Schema subset validator](schema.md).
 
 ## Overview
 
@@ -30,7 +31,7 @@ Key concepts:
   encoding fast, with decode at parity.
 - **Format dispatch** — [`codec::encode`](#content-type-dispatch) /
   [`codec::decode`](#content-type-dispatch) pick a codec from a MIME content
-  type, so an HTTP handler can serve JSON, XML, or YAML from one code path.
+  type, so an HTTP handler can serve JSON, XML, YAML, or TOML from one code path.
 
 > Design note: the content-type registry is a closed
 > [`Format`](#content-type-dispatch) enum matched at compile time, and the wire
@@ -187,8 +188,8 @@ pub fn emit_value<E: Encoder>(e: &mut E, value: &Value);
 
 ### Format submodules
 
-Each of [`json`](#json-codec), [`xml`](#xml-codec), and [`yaml`](#yaml-codec)
-exposes the same shape:
+Each of [`json`](#json-codec), [`xml`](#xml-codec), [`yaml`](#yaml-codec), and
+[`toml`](#toml-codec) exposes the same shape:
 
 ```rust
 pub fn encode<T: Encode>(value: &T) -> String;
@@ -200,12 +201,12 @@ pub fn from_str(input: &str) -> Result<Value, CodecError>;
 
 JSON additionally provides `to_string(&Value) -> String` and
 `from_slice(&[u8]) -> Result<Value, CodecError>`. For rendering a `Value` to
-XML/YAML, call `encode(&value)` (a `Value` is itself `Encode`).
+XML/YAML/TOML, call `encode(&value)` (a `Value` is itself `Encode`).
 
 ### Content-type dispatch
 
 ```rust
-pub enum Format { Json, Xml, Yaml }
+pub enum Format { Json, Xml, Yaml, Toml }
 impl Format { pub fn from_content_type(content_type: &str) -> Option<Format>; }
 
 pub fn resolve(content_type: &str) -> Result<Format, CodecError>;
@@ -510,6 +511,44 @@ let back: Server = yaml::decode(&out).unwrap();
 assert_eq!(back, s);
 ```
 
+## TOML codec
+
+`ferroly::codec::toml` covers the common TOML config subset. The encoder emits a
+nested struct as a `[section]` header and a `Vec`-of-structs as `[[section]]`
+arrays of tables; scalar keys are written before child tables, as TOML requires.
+
+Supported: bare / quoted / dotted keys, `key = value` pairs, table headers
+(`[a.b]`), arrays of tables (`[[a.b]]`), inline tables (`{ a = 1 }`), arrays
+(which may span lines and end with a trailing comma), basic (`"…"`) and literal
+(`'…'`) strings with the standard escapes, integers (decimal with `_` separators
+and `0x` / `0o` / `0b` prefixes), floats (including `inf` / `-inf` / `nan`),
+booleans, and `#` comments.
+
+Not supported (use JSON): multi-line strings (`"""` / `'''`) and native
+date-times — a date-time token decodes as its raw `Value::Str`. TOML has no null
+type, so `Value::Null` (a `None` field) is omitted on encode; a missing key
+decodes back to `None` for `Option` fields.
+
+```rust
+use ferroly::codec::{toml, Decode, Encode};
+
+#[derive(Encode, Decode, PartialEq, Debug)]
+struct Db { host: String, port: u16 }
+
+#[derive(Encode, Decode, PartialEq, Debug)]
+struct Config { name: String, db: Db }
+
+// Parse hand-written TOML with a [section] header.
+let text = "name = \"api\"\n\n[db]\nhost = \"localhost\"\nport = 5432\n";
+let cfg: Config = toml::decode(text).unwrap();
+assert_eq!(cfg.db.port, 5432);
+
+// Round-trip.
+let out = toml::encode(&cfg);
+let back: Config = toml::decode(&out).unwrap();
+assert_eq!(back, cfg);
+```
+
 ## Content-type dispatch
 
 When the format is decided at runtime (an HTTP `Content-Type` header, a config
@@ -523,7 +562,8 @@ recognizes structured-syntax suffixes:
 | --- | --- |
 | `application/json`, `text/json`, `*+json` | `Json` |
 | `application/xml`, `text/xml`, `*+xml` | `Xml` |
-| `application/yaml`, `text/yaml`, `application/x-yaml`, `text/x-yaml`, `*+yaml` | `Yaml` |
+| `application/yaml`, `text/yaml`, `application/x-yaml`, `text/x-yaml`, `application/yml`, `text/yml`, `*+yaml` | `Yaml` |
+| `application/toml`, `text/toml`, `application/x-toml`, `*+toml` | `Toml` |
 | anything else | `None` |
 
 ```rust
@@ -636,12 +676,15 @@ type ([`Violation`](schema.md)) rather than `CodecError`.
 
 ## Limitations
 
-- **JSON** is the only full-fidelity, streaming codec. XML and YAML target the
-  common struct/config subset and go through `Value`.
+- **JSON** is the only full-fidelity, streaming codec. XML, YAML, and TOML target
+  the common struct/config subset and go through `Value`.
 - **XML**: no attributes, namespaces, mixed content, or top-level arrays;
   decoded scalars are always strings.
 - **YAML**: block style only — no flow collections (beyond empty `{}`/`[]`),
   anchors/aliases, tags, block scalars, or multi-document streams.
+- **TOML**: no multi-line strings (`"""`/`'''`) or native date-times (a
+  date-time decodes as a `Str`); a top-level value must be a table (struct), and
+  `None`/`Null` fields are omitted rather than represented.
 - The `#[derive]` supports **named-field structs** and **unit-only enums** only;
   tuple structs, newtypes, and data-carrying enum variants are not derivable
   (implement the traits by hand, as in [Streaming fast-path](#streaming-fast-path)).

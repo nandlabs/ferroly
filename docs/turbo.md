@@ -24,7 +24,7 @@ directly with [`serve`](#into_handler--serve).
 |---|---|
 | Per-request context | [`Ctx`](#ctx-the-request-context) — path/query/header/body accessors, `read`/`respond` |
 | Typed extraction | [`param_as`](#path-parameters), [`query_int`/`query_float`/`query_bool`/`query_as`](#query-parameters) |
-| Content negotiation | [`Ctx::respond`](#content-negotiated-responses-respond) (JSON / XML / YAML → 406) |
+| Content negotiation | [`Ctx::respond`](#content-negotiated-responses-respond) (JSON / XML / YAML / TOML → 406) |
 | Route registration | [`get`/`post`/`put`/`delete`/`patch`/`head`/`options`/`add`](#registering-routes) |
 | Route groups | [`group`](#route-groups) + group-scoped filters |
 | Before-routing hooks | [`filter`](#filters), [`auth`](#authenticator) |
@@ -209,11 +209,12 @@ fn respond<T: Encode>(&self, status: StatusCode, value: &T) -> HttpResponse;
 ```
 
 Encodes `value` as the response body, **picking the codec from the request's `Accept`
-header** — JSON, XML, or YAML — and setting `Content-Type` to match. The negotiation:
+header** — JSON, XML, YAML, or TOML — and setting `Content-Type` to match. The negotiation:
 
 - `Accept` absent, empty, or `*/*` / `application/*` / `application/json` / `text/json` → **JSON**;
 - `application/xml` / `text/xml` → **XML**;
-- `application/yaml` / `text/yaml` / `application/x-yaml` → **YAML**;
+- `application/yaml` / `text/yaml` / `application/x-yaml` / `text/x-yaml` / `application/yml` / `text/yml` → **YAML**;
+- `application/toml` / `text/toml` / `application/x-toml` → **TOML**;
 - anything else supported by none of the above → **`406 Not Acceptable`**.
 
 The first matching `Accept` entry wins (it splits on `,` and ignores `;q=` params). If encoding
@@ -235,8 +236,8 @@ let _router = Router::new().get("/items/:id", |ctx| async move {
 });
 ```
 
-`read` + `respond` together give you a codec-agnostic handler: accept JSON/XML/YAML in, return
-whatever the caller asked for.
+`read` + `respond` together give you a codec-agnostic handler: accept JSON/XML/YAML/TOML in,
+return whatever the caller asked for.
 
 ---
 
@@ -760,7 +761,7 @@ turns an unmatched `Accept` into `406` (and an encode failure into `500`) for yo
 - **Single authenticator slot** — a second `auth`/`jwt_auth` replaces the first.
 - **Groups cover the common verbs** (`get`/`post`/`put`/`delete`/`patch` + `filter`); use the
   router directly for `head`/`options`/`add` on a prefixed path.
-- **`respond` negotiates JSON/XML/YAML only** — other `Accept` types yield `406`.
+- **`respond` negotiates JSON/XML/YAML/TOML only** — other `Accept` types yield `406`.
 - Inherits the [`http`](http.md#limitations) server characteristics: HTTP/1.1 with keep-alive
   (no pipelining or HTTP/2). Serve over TLS via [`http::serve_tls`](http.md#https-serve_tls--tlsconfig)
   with [`into_handler`](#into_handler--serve).
