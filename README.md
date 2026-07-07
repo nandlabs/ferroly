@@ -7,7 +7,7 @@
   <img src="https://img.shields.io/badge/version-0.1.0-B22222" alt="version 0.1.0">
   <img src="https://img.shields.io/badge/rust-1.75%2B-B7410E" alt="MSRV 1.75+">
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="license: Apache-2.0 OR MIT"></a>
-  <img src="https://img.shields.io/badge/unsafe-forbidden-success" alt="unsafe forbidden">
+  <img src="https://img.shields.io/badge/unsafe-1%20audited%20block-9cbf3b" alt="unsafe: 1 audited block">
 </p>
 
 **A self-contained, dependency-minimal Rust toolkit of enterprise utilities.**
@@ -37,7 +37,7 @@ hand-rolls the whole stack rather than pulling in an ecosystem of crates.
 - **`ferroly-derive`** — Ferroly's own derive macros (`proc-macro2` / `syn` / `quote`,
   build-time only).
 
-Everything else is implemented from scratch: JSON/XML/YAML encoding and a `#[derive]`-based
+Everything else is implemented from scratch: JSON/XML/YAML/TOML encoding and a `#[derive]`-based
 `Encode`/`Decode`, layered configuration, a prompt-template engine, MIME detection,
 error/derive macros, an HTTP/1.1 client and server, a router, and a WebSocket implementation
 (RFC 6455 framing with a from-scratch SHA-1 handshake).
@@ -61,12 +61,14 @@ Enable only what you need — unused modules and their dependencies are never co
 
 | Feature | Module | Purpose |
 |---|---|---|
-| `errutils` | `ferroly::errutils` | `MultiError` aggregation |
-| `codec` | `ferroly::codec` | `Value` model, `Encode`/`Decode` (+ derives), JSON/XML/YAML, content-type registry |
+| `errutils` | `ferroly::errutils` | `MultiError` aggregation + the `#[derive(FerrolyError)]` typed-error macro |
+| `codec` | `ferroly::codec` | `Value` model, `Encode`/`Decode` (+ derives), JSON/XML/YAML/TOML, content-type registry |
+| `hash` | `ferroly::hash` | Streaming SHA-256/SHA-1/HMAC-SHA256 + hex `Digest` |
 | `config` | `ferroly::config` | Layered environment + file configuration |
-| `fsutils` | `ferroly::fsutils` | Path checks + content-type detection (extension table + magic-byte sniffing) |
+| `fsutils` | `ferroly::fsutils` | Content-type detection (extension table + magic-byte sniffing) + read-only memory-mapped files (`Mmap`) |
 | `lifecycle` | `ferroly::lifecycle` | Component start/stop orchestration with dependency ordering |
-| `http` | `ferroly::http` | In-house HTTP/1.1 client + server (streaming, chunked, TLS) |
+| `rt` | `ferroly::rt` | Async runtime surface (tokio spawn/channels/sync/time/TCP re-exported) |
+| `http` | `ferroly::http` | In-house HTTP/1.1 client + server (streaming, chunked, SSE, TLS) |
 | `clients` | `ferroly::clients` | Retry, circuit breaker, and auth providers |
 | `genai` | `ferroly::genai` | Provider-agnostic LLM interface + prompt templates |
 | `openai` / `claude` / `ollama` | — | GenAI provider implementations |
