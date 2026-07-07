@@ -25,6 +25,7 @@ pub(crate) mod io;
 mod message;
 mod pool;
 mod server;
+pub mod sse;
 pub(crate) mod transport;
 
 pub use client::Client;
@@ -35,4 +36,5 @@ pub use server::{
     serve, serve_tls, serve_tls_with_config, serve_with_config, BoxFuture, HttpHandler,
     HttpResponse, ServerConfig,
 };
+pub use sse::{Event, SseDecoder};
 pub use transport::{Conn, Io, TlsConfig};

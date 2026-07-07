@@ -40,13 +40,15 @@ ollama = ["genai"]
 all-providers = ["openai", "claude", "ollama"]
 turbo = ["http", "codec"]
 rest = ["turbo", "clients", "codec", "lifecycle", "http"]
-ws = ["http", "lifecycle", "dep:tokio"]
+ws = ["http", "lifecycle", "hash", "dep:tokio"]
 vectorstore = ["codec"]
-auth = ["codec"]
+auth = ["codec", "hash"]
 log = ["codec"]
 metrics = []
 messaging = ["codec", "lifecycle", "dep:tokio"]
 vfs = ["dep:tokio"]
+hash = []
+rt = ["dep:tokio"]
 full = [
     "errutils",
     "codec",
@@ -54,10 +56,12 @@ full = [
     "config",
     "fsutils",
     "lifecycle",
+    "hash",
     "http",
     "clients",
     "genai",
     "all-providers",
+    "rt",
     "turbo",
     "rest",
     "ws",
