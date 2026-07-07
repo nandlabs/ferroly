@@ -32,7 +32,10 @@ ferroly-derive    = { path = "crates/ferroly-derive",    version = "0.1.0" }
 lto = "thin"
 codegen-units = 1
 
-# Centralized lints applied to every workspace crate. The whole codebase is
-# `unsafe`-free by design — forbid it so that stays true.
+# Centralized lints applied to every workspace crate. The codebase is
+# `unsafe`-free except for a single audited region: the read-only memory-mapped
+# file support in `fsutils` (a `#[allow(unsafe_code)]` module wrapping the
+# `mmap`/`munmap` FFI). `deny` keeps every other `unsafe` a hard error while
+# permitting that one reviewed exception.
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
