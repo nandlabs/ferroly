@@ -31,6 +31,8 @@ pub use ferroly_derive::FerrolyError;
 
 #[cfg(feature = "auth")]
 pub mod auth;
+#[cfg(feature = "cli")]
+pub mod cli;
 #[cfg(feature = "clients")]
 pub mod clients;
 #[cfg(feature = "codec")]

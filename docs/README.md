@@ -27,6 +27,7 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 | [`codec`](codec.md) | `codec` *(default)* | `Value` model + `Encode`/`Decode` traits & derives; JSON/XML/YAML/TOML; content-type dispatch; a streaming JSON fast-path near serde_json speed |
 | [`codec::schema`](schema.md) | `codec` | JSON-Schema **subset** validator over `Value` |
 | [derive macros](derive.md) | (with `codec`) | `#[derive(Encode, Decode)]` and `#[derive(FerrolyError)]` |
+| [`cli`](cli.md) | `cli` | Command-line parser: subcommands, typed flags/options, env fallback, generated `--help` |
 | [`config`](config.md) | `config` | Layered configuration: env + file (JSON/YAML/XML/**.properties**) + **CLI args**, bound to a struct via `Decode` |
 | [`errutils`](errutils.md) | `errutils` *(default)* | `MultiError` — aggregate multiple errors into one; the `#[derive(FerrolyError)]` typed-error macro |
 | [`hash`](hash.md) | `hash` | Streaming SHA-256 / SHA-1 / HMAC-SHA256 + a hex `Digest` type |
@@ -69,6 +70,7 @@ Enable only what you use — unused modules and their dependencies never compile
 | `errutils` | ✅ | — | — | — |
 | `codec` | ✅ | — | — | — |
 | `hash` | | — | — | — |
+| `cli` | | — | — | — |
 | `rt` | | tokio | ✅ | — |
 | `config` | | `codec` | — | — |
 | `fsutils` | | — | — | — |

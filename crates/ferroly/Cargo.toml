@@ -49,9 +49,11 @@ messaging = ["codec", "lifecycle", "dep:tokio"]
 vfs = ["dep:tokio"]
 hash = []
 rt = ["dep:tokio"]
+cli = []
 full = [
     "errutils",
     "codec",
+    "cli",
     "log",
     "config",
     "fsutils",

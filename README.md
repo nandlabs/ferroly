@@ -64,6 +64,7 @@ Enable only what you need — unused modules and their dependencies are never co
 | `errutils` | `ferroly::errutils` | `MultiError` aggregation + the `#[derive(FerrolyError)]` typed-error macro |
 | `codec` | `ferroly::codec` | `Value` model, `Encode`/`Decode` (+ derives), JSON/XML/YAML/TOML, content-type registry |
 | `hash` | `ferroly::hash` | Streaming SHA-256/SHA-1/HMAC-SHA256 + hex `Digest` |
+| `cli` | `ferroly::cli` | Command-line parser (subcommands, typed flags, env fallback, `--help`) |
 | `config` | `ferroly::config` | Layered environment + file configuration |
 | `fsutils` | `ferroly::fsutils` | Content-type detection (extension table + magic-byte sniffing) + read-only memory-mapped files (`Mmap`) |
 | `lifecycle` | `ferroly::lifecycle` | Component start/stop orchestration with dependency ordering |
