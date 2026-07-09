@@ -7,6 +7,17 @@ crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.1]
+
+### Changed
+- `CONTRIBUTING.md` now documents the **versioning & release contract** enforced by
+  the `version-guard` job: bump the version in `Cargo.toml`, keep the README badge
+  in sync, add a matching `## [<version>]` CHANGELOG entry, and never tag manually
+  (the `v<version>` tag is created automatically on merge to `main`).
+- `CONTRIBUTING.md` documents two doc-comment rules that clippy enforces at
+  `-D warnings`: indent rustdoc examples with **spaces, not tabs**, and rely on the
+  implicit doctest `main` rather than an explicit `# fn main() { … }`.
+
 ## [0.3.0]
 
 ### Added

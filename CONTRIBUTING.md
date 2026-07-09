@@ -41,6 +41,27 @@ cargo test -p ferroly --features full
 cargo deny check
 ```
 
+## Versioning & releases (please read)
+
+**Every pull request into `main` must carry a version bump** — CI enforces this via
+the `version-guard` job, and a red check there is almost always one of the steps below.
+
+1. **Bump the crate version** in the root `Cargo.toml` under `[workspace.package]`.
+   The crate is pre-1.0, so:
+   - **patch** (`0.3.0` → `0.3.1`) for documentation, fixes, and internal changes;
+   - **minor** (`0.3.0` → `0.4.0`) for new functionality or a breaking change.
+2. **Update the README version badge** to the *same* version. `version-guard` fails
+   if `Cargo.toml` and the badge disagree.
+3. **Add a matching `## [<version>]` section to `CHANGELOG.md`** describing your
+   change. `version-guard` fails if the version has no changelog entry
+   (`## [Unreleased]` does not count).
+4. **Do not create the git tag.** The `v<version>` tag is created automatically when
+   your PR merges to `main`. A version that has *already* been tagged is rejected —
+   that is the signal to bump again.
+
+After bumping, run `cargo build --features full --locked` so `Cargo.lock` picks up the
+new version, and commit the updated lockfile.
+
 ## Dependency policy (please read)
 
 Ferroly's defining goal is to be **self-contained**. This is enforced, not aspirational:
@@ -60,7 +81,12 @@ exception is genuinely warranted, open an issue to discuss it *before* writing c
 ## Code style & conventions
 
 - Format with `rustfmt` (the repo's `rustfmt.toml` settings) — CI checks this.
-- Keep `clippy` clean at `-D warnings`.
+- Keep `clippy` clean at `-D warnings`. Note `rustfmt` does **not** reformat code inside
+  doc comments, so run clippy before pushing.
+- **Indent doc-comment examples with spaces, never tabs** — clippy's
+  `tabs_in_doc_comments` is an error at `-D warnings`.
+- Rustdoc examples rely on the implicit doctest `main`; don't wrap them in an explicit
+  `# fn main() { … }` unless the example genuinely needs it.
 - Public items are documented (`#![deny(missing_docs)]` is set on the modules).
 - Errors use the in-house `#[derive(ferroly_derive::FerrolyError)]`, not `thiserror`.
 - Encoding uses `ferroly::codec`'s `Encode`/`Decode`, not `serde`.

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0 OR MIT"
@@ -26,7 +26,7 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 
 # internal proc-macro crate — the only companion crate to `ferroly`
-ferroly-derive    = { path = "crates/ferroly-derive",    version = "0.3.0" }
+ferroly-derive    = { path = "crates/ferroly-derive",    version = "0.3.1" }
 
 [profile.release]
 lto = "thin"

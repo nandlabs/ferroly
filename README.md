@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml"><img src="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.3.0-B22222" alt="version 0.3.0">
+  <img src="https://img.shields.io/badge/version-0.3.1-B22222" alt="version 0.3.1">
   <img src="https://img.shields.io/badge/rust-1.75%2B-B7410E" alt="MSRV 1.75+">
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="license: Apache-2.0 OR MIT"></a>
   <img src="https://img.shields.io/badge/unsafe-1%20audited%20block-9cbf3b" alt="unsafe: 1 audited block">
