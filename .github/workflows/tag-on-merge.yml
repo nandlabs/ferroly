@@ -1,0 +1,51 @@
+name: Tag on merge
+
+# When a change lands on `main`, create an annotated `v<version>` git tag from
+# the crate version (if it doesn't already exist). Paired with the version-guard
+# on PRs — which ensures every merge to `main` carries a fresh, untagged version
+# — this makes each merge that bumps the version produce its release tag.
+on:
+  push:
+    branches: [main]
+
+# Needed to push the tag with the default GITHUB_TOKEN.
+permissions:
+  contents: write
+
+# Never run two taggers at once.
+concurrency:
+  group: tag-on-merge
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Create version tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Tag the crate version if untagged
+        run: |
+          set -euo pipefail
+
+          VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not read the crate version from Cargo.toml"
+            exit 1
+          fi
+          TAG="v$VERSION"
+
+          git fetch --tags --force --quiet
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists — nothing to do."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+          echo "Created and pushed $TAG."
