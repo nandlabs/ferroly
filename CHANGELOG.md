@@ -7,6 +7,19 @@ crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+- **`genai` model router** (`ferroly::genai::router`) — a selection layer above
+  `GenAiProvider`: describe a `Task` (required capabilities, budget, priority)
+  and the router picks `(provider, model)` from a merged `ModelRegistry`, clamps
+  options, dispatches the provider's `complete`/`complete_stream`, and fails over
+  across models on transient errors (composing `clients::RetryPolicy` and
+  `CircuitBreaker`). Includes `CapabilityStrategy` / `RuleBasedStrategy` /
+  `CompositeStrategy`, a YAML policy overlay (`RoutingConfig`), a side-effect-free
+  `resolve` + `RouteDecision` trace, and a parallel `EmbeddingRouter`. Providers
+  advertise per-model `ModelInfo` via a new defaulted `GenAiProvider::model_catalog()`.
+- `Capability` gains `Text`, `Chat`, `Audio`, `Embeddings`, and `Reasoning`
+  variants and is now `#[non_exhaustive]`.
+
 ## [0.2.0] 
 
 ### Added

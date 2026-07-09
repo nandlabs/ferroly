@@ -52,15 +52,31 @@ pub struct CompletionChunk {
     pub usage: Option<Usage>,
 }
 
-/// A capability a provider may or may not support.
+/// A capability a provider or model may or may not support.
+///
+/// Used both for provider-level [`GenAiProvider::supports`](crate::genai::GenAiProvider::supports)
+/// and for per-model [`ModelInfo`](crate::genai::ModelInfo) metadata consumed by
+/// the model router. `#[non_exhaustive]` so new capabilities can be added without
+/// breaking downstream `match`es.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
+    /// Plain text completion.
+    Text,
+    /// Multi-turn chat.
+    Chat,
     /// Streaming completions.
     Streaming,
-    /// Tool / function calling.
-    ToolUse,
     /// Image / multimodal input.
     Vision,
+    /// Audio input/output.
+    Audio,
+    /// Tool / function calling.
+    ToolUse,
     /// Constrained JSON output.
     JsonMode,
+    /// Text embeddings.
+    Embeddings,
+    /// Extended reasoning / chain-of-thought models.
+    Reasoning,
 }

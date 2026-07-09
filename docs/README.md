@@ -38,6 +38,7 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 | Module | Feature | What it does |
 |---|---|---|
 | [`genai`](genai.md) | `genai` (+ `openai`/`claude`/`ollama`) | Provider-agnostic LLM interface: chat, streaming, **embeddings**, **function-calling tools**, **structured output**, prompt templates |
+| [`genai::router`](model-router.md) | `genai` | Model router: capability/cost-based selection over providers with automatic, error-classified fallback |
 | [`vectorstore`](vectorstore.md) | `vectorstore` | `VectorStore` trait + in-memory backend + cosine/dot/euclidean — pairs with genai embeddings |
 
 ### Web & networking

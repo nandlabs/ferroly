@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use ferroly::genai::{
-    Capability, CompletionChunk, CompletionRequest, CompletionResponse, GenAiError,
+    Capability, CompletionChunk, CompletionRequest, CompletionResponse, GenAiError, ModelInfo,
 };
 
 /// A boxed, `Send` future — the manual `async fn`-in-trait desugaring that keeps
@@ -45,4 +45,14 @@ pub trait GenAiProvider: Send + Sync {
 
     /// Reports whether the provider supports a capability.
     fn supports(&self, capability: Capability) -> bool;
+
+    /// Structured metadata for the models this provider serves, consumed by the
+    /// [model router](crate::genai::router).
+    ///
+    /// The default is empty — "capabilities unknown": such a provider is
+    /// invisible to capability-based routing but still reachable by an explicit
+    /// rule or pin. Providers override this to advertise their catalog.
+    fn model_catalog(&self) -> Vec<ModelInfo> {
+        Vec::new()
+    }
 }

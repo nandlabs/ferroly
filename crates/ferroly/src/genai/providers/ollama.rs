@@ -8,7 +8,8 @@ use super::ProviderOptions;
 use ferroly::genai::provider::{BoxFuture, ChunkStream, GenAiProvider};
 use ferroly::genai::{
     Capability, CompletionChunk, CompletionRequest, CompletionResponse, EmbedRequest,
-    EmbedResponse, Embedder, GenAiError, Message, MessagePart, ResponseFormat, Role, Usage,
+    EmbedResponse, Embedder, GenAiError, Message, MessagePart, ModelInfo, ResponseFormat, Role,
+    Usage,
 };
 
 const DEFAULT_BASE: &str = "http://localhost:11434";
@@ -55,6 +56,23 @@ impl GenAiProvider for OllamaProvider {
 
     fn supports(&self, capability: Capability) -> bool {
         matches!(capability, Capability::Streaming | Capability::JsonMode)
+    }
+
+    fn model_catalog(&self) -> Vec<ModelInfo> {
+        use Capability::{Chat, Embeddings, JsonMode, Streaming, Text};
+        // Local models: zero marginal cost. Limits are typical defaults.
+        vec![
+            ModelInfo::new("ollama", "llama3")
+                .display_name("Llama 3 (local)")
+                .capabilities([Text, Chat, Streaming, JsonMode])
+                .limits(8_192, 4_096)
+                .cost(0.0, 0.0),
+            ModelInfo::new("ollama", "nomic-embed-text")
+                .display_name("nomic-embed-text (local)")
+                .capabilities([Embeddings])
+                .limits(8_192, 0)
+                .cost(0.0, 0.0),
+        ]
     }
 
     fn complete(

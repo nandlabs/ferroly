@@ -38,6 +38,7 @@ mod prompt;
 mod provider;
 mod request;
 mod response;
+pub mod router;
 pub mod template;
 
 pub mod providers;
@@ -52,6 +53,7 @@ pub use request::{
     CompletionRequest, CompletionRequestBuilder, ResponseFormat, ToolChoice, ToolDefinition,
 };
 pub use response::{Capability, CompletionChunk, CompletionResponse, Usage};
+pub use router::{ModelInfo, ModelRouter, RouterError};
 
 // Re-export the auth traits GenAI providers build on, for convenience.
 pub use ferroly::clients::{ApiKeyAuth, AuthProvider, BasicAuth, BearerAuth};

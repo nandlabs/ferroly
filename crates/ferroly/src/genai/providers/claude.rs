@@ -12,7 +12,7 @@ use super::ProviderOptions;
 use ferroly::genai::provider::{BoxFuture, ChunkStream, GenAiProvider};
 use ferroly::genai::{
     Capability, CompletionChunk, CompletionRequest, CompletionResponse, GenAiError, Message,
-    MessagePart, Role, ToolChoice, Usage,
+    MessagePart, ModelInfo, Role, ToolChoice, Usage,
 };
 
 const DEFAULT_BASE: &str = "https://api.anthropic.com";
@@ -85,6 +85,22 @@ impl GenAiProvider for ClaudeProvider {
             capability,
             Capability::Streaming | Capability::ToolUse | Capability::Vision
         )
+    }
+
+    fn model_catalog(&self) -> Vec<ModelInfo> {
+        use Capability::{Chat, Reasoning, Streaming, Text, ToolUse, Vision};
+        vec![
+            ModelInfo::new("claude", "claude-sonnet-5")
+                .display_name("Claude Sonnet 5")
+                .capabilities([Text, Chat, Streaming, Vision, ToolUse, Reasoning])
+                .limits(200_000, 64_000)
+                .cost(3.0, 15.0),
+            ModelInfo::new("claude", "claude-3-5-haiku")
+                .display_name("Claude 3.5 Haiku")
+                .capabilities([Text, Chat, Streaming, ToolUse])
+                .limits(200_000, 8_192)
+                .cost(0.8, 4.0),
+        ]
     }
 
     fn complete(
