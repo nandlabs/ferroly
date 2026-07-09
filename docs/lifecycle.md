@@ -30,7 +30,7 @@ Key design choices in the Rust port:
 
 ```toml
 [dependencies]
-ferroly = { version = "0.2", features = ["lifecycle"] }
+ferroly = { version = "0.3", features = ["lifecycle"] }
 tokio = { version = "1", features = ["full"] }
 ```
 

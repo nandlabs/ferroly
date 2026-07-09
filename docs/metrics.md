@@ -25,9 +25,9 @@ operations — no lock per increment.
 
 ```toml
 [dependencies]
-ferroly = { version = "0.2", features = ["metrics"] }
+ferroly = { version = "0.3", features = ["metrics"] }
 # with the router integration:
-ferroly = { version = "0.2", features = ["turbo", "metrics"] }
+ferroly = { version = "0.3", features = ["turbo", "metrics"] }
 ```
 
 ## Quick start

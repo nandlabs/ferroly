@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "ferroly"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ferroly-derive",
  "rustls",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "ferroly-derive"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",

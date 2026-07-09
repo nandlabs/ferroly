@@ -5,6 +5,7 @@ name: Version guard
 #      must agree.
 #   2. That version must not already be published as a `v<version>` git tag —
 #      otherwise the version needs bumping before merge.
+#   3. CHANGELOG.md must have a `## [<version>]` entry for that version.
 on:
   pull_request:
     branches: [main]
@@ -54,4 +55,12 @@ jobs:
             exit 1
           fi
 
-          echo "OK: version $CARGO_VERSION is consistent and not yet tagged."
+          # 3) The CHANGELOG must document this version. Match "## [X.Y.Z]" with or
+          #    without a trailing date; "## [Unreleased]" does not count.
+          ESCAPED="$(printf '%s' "$CARGO_VERSION" | sed 's/\./\\./g')"
+          if ! grep -qE "^## \[${ESCAPED}\]([[:space:]]|$)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$CARGO_VERSION]' entry — add release notes for this version before merging."
+            exit 1
+          fi
+
+          echo "OK: version $CARGO_VERSION is consistent, not yet tagged, and documented in CHANGELOG.md."

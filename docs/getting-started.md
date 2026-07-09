@@ -13,7 +13,7 @@ Ferroly is one crate with many optional modules. **Nothing but `codec` and
 ```toml
 [dependencies]
 # Everything (simplest while exploring):
-ferroly = { version = "0.2", features = ["full"] }
+ferroly = { version = "0.3", features = ["full"] }
 ```
 
 Once you know what you need, trim it:
@@ -21,7 +21,7 @@ Once you know what you need, trim it:
 ```toml
 [dependencies]
 # A JSON API server that talks to OpenAI and does vector search:
-ferroly = { version = "0.2", default-features = false, features = ["rest", "openai", "vectorstore"] }
+ferroly = { version = "0.3", default-features = false, features = ["rest", "openai", "vectorstore"] }
 ```
 
 Most async modules also need a runtime; add `tokio` yourself when you write

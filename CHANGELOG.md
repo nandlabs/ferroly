@@ -7,6 +7,8 @@ crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.0]
+
 ### Added
 - **`genai` model router** (`ferroly::genai::router`) — a selection layer above
   `GenAiProvider`: describe a `Task` (required capabilities, budget, priority)
@@ -19,6 +21,11 @@ crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
   advertise per-model `ModelInfo` via a new defaulted `GenAiProvider::model_catalog()`.
 - `Capability` gains `Text`, `Chat`, `Audio`, `Embeddings`, and `Reasoning`
   variants and is now `#[non_exhaustive]`.
+
+### Changed
+- CI: a `v<version>` tag is created automatically on merge to `main`, and the
+  version-guard now also requires a matching `## [<version>]` entry in
+  `CHANGELOG.md` (closes #21).
 
 ## [0.2.0] 
 
