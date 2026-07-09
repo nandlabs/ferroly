@@ -16,7 +16,31 @@
 //! The parser scans the input by byte position and bulk-copies string runs
 //! that need no unescaping; the encoder appends scalars in place via the shared
 //! `fmt` writers.
-
+//!
+//!# Example
+//! ```rust
+//! use ferroly::codec::{toml, Encode, Decode};
+//! #[derive(Encode, Decode, PartialEq, Debug)]
+//!struct Config {
+//!     name: String,
+//!     port: u16,
+//! }
+//!
+//! # fn main() {
+//! 	let my_config = Config {
+//! 	    name: "api".into(),
+//!     	port: 8080,
+//! 	};
+//!
+//! // the part where i encode the struct to a toml string representation
+//! 	let toml_string = toml::encode(&my_config);
+//!
+//! // and then decode it back into the rust's data structure ;)
+//!		let decoded: Config = toml::decode(&toml_string).unwrap();
+//!
+//! 	assert_eq!(my_config, decoded);
+//! # }
+//! ```
 use std::fmt::Write as _;
 
 use ferroly::codec::{CodecError, Decode, Encode, Value};
