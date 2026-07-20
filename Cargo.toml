@@ -23,7 +23,7 @@ webpki-roots = "1"
 # build-time only — for our own derive macros
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full"] }
 
 # internal proc-macro crate — the only companion crate to `ferroly`
 ferroly-derive    = { path = "crates/ferroly-derive",    version = "0.3.1" }
