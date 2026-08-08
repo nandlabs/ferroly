@@ -30,6 +30,13 @@ crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
     `rustls-pki-types` 1.15.0 → 1.15.1, `webpki-roots` 1.0.8 → 1.0.9,
     `proc-macro2` 1.0.106 → 1.0.107, `quote` 1.0.46 → 1.0.47 (lockfile).
   - `github/codeql-action` `v4` → `v4.37.4` (CodeQL workflow).
+  - `zeroize`, `cc`, and `find-msvc-tools` held at their current versions
+    (`1.8.1` / `1.2.65` / `0.1.9`) — newer releases require `edition2024`,
+    which would break the MSRV 1.75 guarantee.
+
+### Fixed
+- `codec::toml` — `radix_int` rewritten to satisfy `clippy::question_mark`
+  (new in clippy 1.97).
 
 ## [0.3.1]
 
