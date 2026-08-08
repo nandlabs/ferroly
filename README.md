@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml"><img src="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.3.1-B22222" alt="version 0.3.1">
+  <img src="https://img.shields.io/badge/version-0.3.2-B22222" alt="version 0.3.2">
   <img src="https://img.shields.io/badge/rust-1.75%2B-B7410E" alt="MSRV 1.75+">
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="license: Apache-2.0 OR MIT"></a>
   <img src="https://img.shields.io/badge/unsafe-1%20audited%20block-9cbf3b" alt="unsafe: 1 audited block">
@@ -68,7 +68,7 @@ Enable only what you need — unused modules and their dependencies are never co
 | `config` | `ferroly::config` | Layered environment + file configuration |
 | `fsutils` | `ferroly::fsutils` | Content-type detection (extension table + magic-byte sniffing) + read-only memory-mapped files (`Mmap`) |
 | `lifecycle` | `ferroly::lifecycle` | Component start/stop orchestration with dependency ordering |
-| `rt` | `ferroly::rt` | Async runtime surface (tokio spawn/channels/sync/time/TCP re-exported) |
+| `rt` | `ferroly::rt` | Async runtime surface (tokio spawn/channels/sync/time/TCP + signals/runtime/test re-exported) |
 | `http` | `ferroly::http` | In-house HTTP/1.1 client + server (streaming, chunked, SSE, range/resumable downloads, TLS) |
 | `clients` | `ferroly::clients` | Retry, circuit breaker, and auth providers |
 | `genai` | `ferroly::genai` | Provider-agnostic LLM interface + prompt templates + a **model router** (capability/cost routing with fallback) |

@@ -7,6 +7,30 @@ crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.2]
+
+### Added
+- **`rt` signal handling** (`ferroly::rt::signal`) — `ctrl_c` on all platforms and,
+  on Unix, `signal::unix::{signal, Signal, SignalKind}` for graceful-shutdown
+  listeners (SIGINT/SIGTERM/…).
+- **`rt` runtime construction** (`ferroly::rt::runtime`) — `Builder` and `Runtime`,
+  so a binary that owns its reactor builds it through ferroly without a direct
+  `tokio` dependency.
+- **`rt` async test attribute** (`#[ferroly::rt::test]`) — re-exported
+  `#[tokio::test]`, so consumer test suites need no direct `tokio` dev-dependency.
+
+  Together these close the last reasons a consumer would declare `tokio` directly,
+  completing the `rt` module's "single async dependency" promise.
+
+### Changed
+- **Dependency updates** (supersedes the open Dependabot PRs #29, #30, #34, #35,
+  #36, #37, #38, #39):
+  - `syn` `2` → `3` (`Cargo.toml` workspace dependency; build-time only).
+  - `tokio` 1.52.3 → 1.53.1, `rustls` 0.23.41 → 0.23.43,
+    `rustls-pki-types` 1.15.0 → 1.15.1, `webpki-roots` 1.0.8 → 1.0.9,
+    `proc-macro2` 1.0.106 → 1.0.107, `quote` 1.0.46 → 1.0.47 (lockfile).
+  - `github/codeql-action` `v4` → `v4.37.4` (CodeQL workflow).
+
 ## [0.3.1]
 
 ### Changed

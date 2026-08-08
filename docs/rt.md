@@ -38,6 +38,9 @@ worker.await.ok();
 | Sync | `ferroly::rt::sync` | `mpsc`, `oneshot`, `broadcast`, `watch`, `Mutex`, `RwLock`, `Semaphore`, `Notify` |
 | Net | `ferroly::rt::net` | `TcpListener`, `TcpStream` |
 | I/O | `ferroly::rt::io` | `AsyncRead`/`AsyncWrite` + `…Ext` traits, `BufReader`, `BufWriter`, `copy` |
+| Signals | `ferroly::rt::signal` | `ctrl_c`; on Unix `signal::unix::{signal, Signal, SignalKind}` |
+| Runtime | `ferroly::rt::runtime` | `Builder`, `Runtime` |
+| Testing | `ferroly::rt` | `#[test]` (async test attribute) |
 
 ## Cancellation on drop
 
@@ -55,6 +58,51 @@ let task = rt::spawn(async {
 // … later …
 task.abort();           // cancel the background loop
 # }
+```
+
+## Graceful shutdown
+
+A server typically waits for a shutdown signal (Ctrl-C / SIGTERM) and then
+drains in-flight work. Use `signal::ctrl_c()` (cross-platform) or, on Unix,
+`signal::unix::signal(SignalKind::terminate())` in a `select!` against the
+server's run future:
+
+```rust
+use ferroly::rt::{self, signal};
+
+# async fn demo() {
+let shutdown = async {
+    rt::select! {
+        _ = signal::ctrl_c() => {}
+        #[cfg(unix)]
+        _ = async {
+            use ferroly::rt::signal::unix::{signal, SignalKind};
+            let mut s = signal(SignalKind::terminate()).expect("SIGTERM");
+            s.recv().await;
+        } => {}
+    }
+};
+// run_server(shutdown).await;
+# let _ = shutdown;
+# }
+```
+
+## Owning the runtime
+
+The re-exports above are for use *inside* an already-running reactor. A binary
+that *owns* its reactor — a `main` that builds a multi-thread runtime and
+`block_on`s a root future — uses `runtime::Builder`:
+
+```rust
+use ferroly::rt::runtime;
+
+fn main() {
+    runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async { /* serve */ });
+}
 ```
 
 ## Scope
