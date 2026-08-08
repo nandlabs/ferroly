@@ -2,9 +2,10 @@
 //! re-exported so consumers don't add their own `tokio` dependency.
 //!
 //! Ferroly depends on `tokio` internally; this module exposes a curated slice of
-//! it (task spawning, channels, synchronization, time, TCP) under one roof.
-//! Enabling the `rt` feature is enough to spawn tasks and use channels without
-//! declaring `tokio` yourself.
+//! it — task spawning, channels, synchronization, time, TCP, **signals, runtime
+//! construction, and the async test attribute** under one roof. Enabling the `rt`
+//! feature is enough to spawn tasks and use channels without declaring `tokio`
+//! yourself.
 //!
 //! ```no_run
 //! use ferroly::rt::{self, sync::mpsc, time::Duration};
@@ -20,6 +21,16 @@
 //! }
 //! worker.await.ok();
 //! # }
+//! ```
+//!
+//! A binary that owns its reactor builds it through [`runtime::Builder`]:
+//!
+//! ```no_run
+//! ferroly::rt::runtime::Builder::new_multi_thread()
+//!     .enable_all()
+//!     .build()
+//!     .expect("runtime")
+//!     .block_on(async { /* serve */ });
 //! ```
 //!
 //! Need something not re-exported here? Enable `tokio` directly — this module is
@@ -86,9 +97,53 @@ pub mod io {
     };
 }
 
+// ---- signals --------------------------------------------------------------
+
+/// Async signal handling for graceful shutdown.
+///
+/// On Unix, [`signal`](signal::unix::signal) registers a listener for a
+/// [`SignalKind`](signal::unix::SignalKind) (e.g. SIGINT/SIGTERM); on any
+/// platform, [`ctrl_c`](signal::ctrl_c) resolves on Ctrl-C. Typical use is a
+/// `select!` against a server's shutdown future.
+pub mod signal {
+    #[doc(no_inline)]
+    pub use tokio::signal::ctrl_c;
+
+    /// Unix-specific signal kinds and listeners (SIGINT, SIGTERM, …).
+    #[cfg(unix)]
+    pub mod unix {
+        #[doc(no_inline)]
+        pub use tokio::signal::unix::{signal, Signal, SignalKind};
+    }
+}
+
+// ---- runtime construction ---------------------------------------------------
+
+/// Build and drive an async runtime.
+///
+/// The rest of `ferroly::rt` re-exports primitives for use *inside* an
+/// already-running reactor; this module is for binaries that *own* the reactor —
+/// a `main` that builds a multi-thread runtime and `block_on`s a root future.
+pub mod runtime {
+    #[doc(no_inline)]
+    pub use tokio::runtime::{Builder, Runtime};
+}
+
+// ---- testing ----------------------------------------------------------------
+
+/// The `#[tokio::test]` async test attribute, re-exported so test suites need no
+/// direct `tokio` dev-dependency.
+///
+/// ```no_run
+/// #[ferroly::rt::test]
+/// async fn it_works() { /* … */ }
+/// ```
+#[doc(no_inline)]
+pub use tokio::test;
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{select, spawn, sync, time};
     use time::Duration;
 
     #[tokio::test]
@@ -117,5 +172,30 @@ mod tests {
             _ = time::sleep(Duration::from_millis(1)) => true,
         };
         assert!(hit_default);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_future_is_constructible() {
+        // We can't deliver Ctrl-C in a test, but the future must exist and be
+        // constructible through the re-exported path.
+        let _fut = super::signal::ctrl_c();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_signal_listener_registers() {
+        use super::signal::unix::{signal, SignalKind};
+        // Registration is the part that can fail at the API level; we assert the
+        // listener constructs without delivering a signal (dependency-free).
+        let _sig = signal(SignalKind::user_defined1()).expect("register SIGUSR1");
+    }
+
+    #[test]
+    fn runtime_builder_constructs() {
+        let rt = super::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        rt.block_on(async { 1 + 1 });
     }
 }

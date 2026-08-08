@@ -2,7 +2,6 @@ name: "✨ Feature Request"
 description: Suggest a new feature or enhancement for Ferroly
 title: "[FEATURE]: "
 labels: ["enhancement", "triage"]
-assignees: []
 
 body:
   - type: markdown

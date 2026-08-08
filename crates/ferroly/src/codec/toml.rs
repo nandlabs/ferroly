@@ -619,10 +619,9 @@ fn radix_int(tok: &str) -> Option<Value> {
         (r, 16)
     } else if let Some(r) = tok.strip_prefix("0o") {
         (r, 8)
-    } else if let Some(r) = tok.strip_prefix("0b") {
-        (r, 2)
     } else {
-        return None;
+        let r = tok.strip_prefix("0b")?;
+        (r, 2)
     };
     let digits = rest.replace('_', "");
     if let Ok(i) = i64::from_str_radix(&digits, radix) {
