@@ -18,6 +18,30 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Added
 
 <!-- ADDED -->
+- **codec**: `codec::Limits` — one parser budget (nesting depth, input size, entry
+  count) enforced by the JSON, XML, YAML and TOML parsers. Every entry point has a
+  `*_with(…, limits)` twin, plus `codec::decode_with`; the plain entry points use
+  the defaults (depth 128, 64 MiB, 10,000,000 entries). Exceeding a limit is
+  `CodecError::LimitExceeded`.
+- **codec**: parse errors in all four formats report the line and column.
+- **codec**: `json::encode_pretty` / `json::to_string_pretty`; `try_encode` for
+  JSON, XML and TOML and `codec::try_encode`, which fail with
+  `CodecError::Unrepresentable` instead of writing a fallback.
+- **codec**: `Encode`/`Decode` for tuples (up to 12), `[T; N]`,
+  `BTreeMap<String, V>`, `HashSet`, `BTreeSet`, `Rc`, `Arc`, `Cow`, `i128`/`u128`,
+  `Duration`, `PathBuf`, and the `std::net` address types; `Encode` for `[T]`,
+  `&T`, `Path`.
+- **codec**: `Value::pointer` / `pointer_mut` (JSON Pointer), `get_mut`,
+  `get_index_mut`, `as_object_mut`, `as_array_mut`, `merge` (deep merge) and
+  `take`; `codec::ValueDecoder` and `codec::from_value_strict` to decode a `Value`
+  without string-to-scalar coercion.
+- **codec**: TOML multi-line basic (`"""`) and literal (`'''`) strings. YAML flow
+  collections, block scalars (`|`, `>`), compact sequence items, sequences at the
+  indentation of their key, trailing comments, and the full set of quoted-string
+  escapes. XML CDATA sections; empty strings, padded strings, nested arrays, empty
+  maps and `vec![None]` now round-trip. Schema `type` may be an array of names.
+- **fuzz**: a `toml_parse` fuzz target and a committed seed corpus for every
+  target; a weekly CI fuzz run.
 - **http**: `Client::builder()` with connect, response-head, read-idle and total
   timeouts, a response-body size cap (64 MiB by default), connection-pool size and
   idle expiry, a default `User-Agent`, optional redirect following, forward
@@ -201,6 +225,36 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Changed
 
 <!-- CHANGED -->
+- **codec (breaking)**: JSON and TOML decode strictly — a string is no longer
+  accepted where a number or bool is expected (`"42"` is not an integer). XML,
+  YAML and `Decode::decode(&Value)` keep the lenient behaviour that text-only
+  sources need.
+- **codec (breaking)**: a float decodes into an integer type only when it is a
+  whole number that fits; `1.9` and `1e300` are now errors rather than `1` and
+  `u64::MAX`.
+- **codec**: JSON follows RFC 8259 — `01`, `1.`, `-.5`, numbers that overflow to
+  infinity, and raw control characters inside strings are rejected.
+- **codec (breaking)**: YAML is a strict subset of YAML 1.2 — anchors, aliases,
+  tags, directives, explicit keys, a second `---` document and any line the parser
+  cannot place are errors. Plain scalars follow the core schema (`inf`/`nan` are
+  strings; `.inf`/`.nan`, `True`, `0x1F`, `0o17` resolve). Output: floats keep a
+  `.0`, non-finite floats are `.inf`/`.nan`, empty top-level collections are
+  `{}`/`[]`, bytes are a flow sequence.
+- **codec**: XML output — `null` is `<a/>`; empty arrays, nested arrays, empty
+  objects and empty or padded strings carry a `type` or `xml:space` attribute; map
+  keys that are not XML names are escaped as `_xHHHH_`. XML input — content after
+  the root element, mixed content and `DOCTYPE` are errors; literal CR/CRLF is
+  normalized to LF.
+- **codec**: TOML input — bare words, malformed numbers, a table defined twice, a
+  lone carriage return and raw control characters are errors; CRLF inside a
+  multi-line string decodes to LF.
+- **codec**: schema `"integer"` accepts whole floats; `const`/`enum` compare
+  numbers by value and objects without regard to member order; a `type` keyword
+  that cannot be interpreted is a violation.
+- **codec**: `impl Encode for &str` is now the blanket
+  `impl<T: Encode + ?Sized> Encode for &T`. `CodecError` gained `LimitExceeded`
+  and `Unrepresentable`. Inputs over 64 MiB or 10,000,000 entries are rejected by
+  default.
 - **http** server: malformed requests are answered
   (`400`/`408`/`413`/`414`/`417`/`431`/`501`/`505`) and the connection closed.
   HTTP/1.1 requests need exactly one `Host` header; HTTP/1.0 connections close
@@ -308,6 +362,19 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Fixed
 
 <!-- FIXED -->
+- **codec**: TOML — a multibyte character after a short `\u`/`\U` escape caused a
+  panic; a dotted key or table header with very many segments overflowed the
+  stack (the depth limit now covers key paths).
+- **codec**: XML — an unterminated `<?` or `<!--` caused a panic; a `>` inside an
+  attribute value ended the tag; `[[1,2],[3]]` flattened; map keys could inject
+  markup.
+- **codec**: YAML — documents silently lost or mis-read data (a sequence at the
+  indentation of its key, keys after the first in `- k: v` items, trailing
+  comments, flow collections); `encode` output did not always decode (strings
+  containing `: `, top-level negative numbers, top-level empty collections).
+- **codec**: XML and TOML documents with many distinct keys took quadratic time.
+  Hex escapes and character references accepted a leading `+`. Schema ignored an
+  array-valued `type`, and `enum: [5]` rejected an unsigned `5`.
 - **http** server: request smuggling through a second `Transfer-Encoding` header
   or a coding other than a lone `chunked`; lenient header, `Content-Length`,
   line-ending and chunk parsing; unbounded chunk-size lines and trailers; a

@@ -469,18 +469,29 @@ derived struct is fast on JSON and still works with XML/YAML and the dynamic
 `use ferroly::codec::{Encode, Decode};` brings both the trait and the derive
 into scope with a single import.
 
-Supported shapes:
+Supported shapes (the [derive page](derive.md) has the full reference):
 
-- **Structs with named fields.**
-- **Enums with unit variants only** (they map to a string — see below).
+- **Structs**: named fields, tuple structs (an array), newtypes (transparent —
+  just the inner value) and unit structs (`null`).
+- **Enums**: unit variants map to a string; variants with data are externally
+  tagged by default (`{"Variant": …}`), or internally tagged with
+  `#[ferroly(tag = "...")]`, or `#[ferroly(untagged)]`.
+- **Generics**: type parameters, lifetimes, const parameters and where-clauses.
 
 Attributes:
 
 | Attribute | Level | Effect |
 | --- | --- | --- |
-| `#[ferroly(rename_all = "...")]` | container | rename every field/variant by a case rule |
+| `#[ferroly(rename_all = "...")]` | container / variant | rename every field/variant by a case rule |
 | `#[ferroly(rename = "...")]` | field / variant | override one wire key |
+| `#[ferroly(alias = "...")]` | field / variant | accept another key on decode (repeatable) |
 | `#[ferroly(skip_none)]` | field | omit the field entirely when it is `None` |
+| `#[ferroly(skip)]` | field | never encode; fill from `Default` on decode |
+| `#[ferroly(default)]` / `default = "path"` | field | value for a missing field |
+| `#[ferroly(flatten)]` | field | inline a nested struct or map |
+| `#[ferroly(deny_unknown_fields)]` | container | reject keys the type does not declare |
+| `#[ferroly(tag = "...")]` / `untagged` | enum | choose the enum representation |
+| `#[ferroly(bound = "...")]` | container | override the inferred generic bounds |
 
 `rename_all` rules: `lowercase`, `UPPERCASE`, `snake_case`,
 `SCREAMING_SNAKE_CASE`, `kebab-case`, `camelCase`, `PascalCase`.
@@ -1119,9 +1130,9 @@ type ([`Violation`](schema.md)) rather than `CodecError`.
   represented, and a `null` inside an array cannot be represented.
 - **Integers beyond 64 bits** in JSON or YAML input become `Float` and lose
   precision. `i128` / `u128` fields avoid this by travelling as decimal strings.
-- The `#[derive]` supports **named-field structs** and **unit-only enums** only;
-  tuple structs, newtypes, and data-carrying enum variants are not derivable
-  (implement the traits by hand, as in [Streaming fast-path](#streaming-fast-path)).
+- **Derive limits**: map keys must be strings; a `PhantomData` field must be
+  marked `#[ferroly(skip)]`; a flattened catch-all map also receives the keys of a
+  flattened struct beside it. See the [derive page](derive.md).
 - `Value::Object` is a `Vec`, so key lookup (`get`, `pointer`) is linear — ideal
   for the small objects typical of config and API payloads, not for huge maps.
   (Parsing and `merge` are indexed and stay near-linear.)

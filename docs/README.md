@@ -24,7 +24,7 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 ### Foundation (mostly std-only)
 | Module | Feature | What it does |
 |---|---|---|
-| [`codec`](codec.md) | `codec` *(default)* | `Value` model + `Encode`/`Decode` traits & derives; JSON/XML/YAML/TOML; content-type dispatch; a streaming JSON fast-path near serde_json speed |
+| [`codec`](codec.md) | `codec` *(default)* | `Value` model + `Encode`/`Decode` traits & derives; JSON/XML/YAML/TOML; content-type dispatch; shared parser limits; a streaming JSON fast path |
 | [`codec::schema`](schema.md) | `codec` | JSON-Schema **subset** validator over `Value` |
 | [derive macros](derive.md) | (with `codec`) | `#[derive(Encode, Decode)]` and `#[derive(FerrolyError)]` |
 | [`cli`](cli.md) | `cli` | Command-line parser: subcommands, typed flags/options, env fallback, generated `--help` |
