@@ -60,8 +60,8 @@ use source::{insert_nested, Setting};
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ConfigError {
-    /// A file's extension is not a recognized config format. The message
-    /// names the file and lists the supported extensions.
+    /// A file's extension is not a recognized config format. The payload is
+    /// the path; the message also lists the supported extensions.
     UnsupportedFormat(String),
 
     /// An I/O error reading a config or secret file. The message starts with
@@ -116,8 +116,14 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::UnsupportedFormat(m) => {
-                write!(f, "unsupported config file format for {m}")
+            ConfigError::UnsupportedFormat(path) => {
+                let known: Vec<String> =
+                    source::EXTENSIONS.iter().map(|e| format!(".{e}")).collect();
+                write!(
+                    f,
+                    "unsupported config file format for '{path}' (expected one of {})",
+                    known.join(", ")
+                )
             }
             ConfigError::Io(m) => write!(f, "io error: {m}"),
             ConfigError::MissingKey(k) => write!(f, "missing key: {k}"),
@@ -1041,7 +1047,7 @@ mod tests {
     #[test]
     fn unsupported_extension_errors() {
         let err = Config::from_file("config.ini").unwrap_err();
-        assert!(matches!(err, ConfigError::UnsupportedFormat(_)));
+        assert!(matches!(&err, ConfigError::UnsupportedFormat(p) if p == "config.ini"));
     }
 
     #[test]

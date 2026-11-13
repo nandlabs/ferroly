@@ -69,14 +69,8 @@ pub(super) fn with_extension(path: &Path, ext: &str) -> PathBuf {
 /// error either way.
 pub(super) fn load_file(path: &Path, optional: bool) -> Result<Option<Value>, ConfigError> {
     // Validate the extension before touching the filesystem.
-    let format = format_of(path).ok_or_else(|| {
-        let known: Vec<String> = EXTENSIONS.iter().map(|e| format!(".{e}")).collect();
-        ConfigError::UnsupportedFormat(format!(
-            "'{}' (expected one of {})",
-            path.display(),
-            known.join(", ")
-        ))
-    })?;
+    let format = format_of(path)
+        .ok_or_else(|| ConfigError::UnsupportedFormat(path.display().to_string()))?;
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
