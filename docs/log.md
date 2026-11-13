@@ -7,31 +7,39 @@
 ## Overview
 
 `log` is a dependency-free **structured logger** built for enterprise
-services: typed structured fields, RFC 3339 timestamps on every record,
-plain-text *or* JSON-lines output, level filtering at two layers, a
-process-global logger, request-context / trace-ID propagation, and an opt-in
-non-blocking background appender that sheds load instead of stalling the hot
-path.
+services:
+
+- typed structured fields and RFC 3339 timestamps on every record;
+- plain-text *or* JSON-lines output, both **safe against record forging**;
+- level filtering at three layers (global, per target, per logger);
+- **redaction** of sensitive fields, on by default;
+- **fan-out** to several sinks, each with its own format and minimum level;
+- a non-blocking background appender with a **drop-or-block** overflow policy;
+- a **rotating file** writer (size and daily rotation with retention);
+- opt-in **sampling**, **caller capture** and a **panic hook**;
+- a process-global logger, context providers, and trace correlation with
+  [`obs`](obs.md).
 
 Everything is built on [`ferroly::codec::Value`](codec.md) — field values keep
 their type (a number stays a number in JSON output, not a quoted string) — with
-no external logging framework, no `serde`, and no allocation-heavy formatting
-layer.
+no external logging framework and no `serde`.
 
-Deliberately **out of scope** (left to the sink or the surrounding app, to keep
-the module small and vendor-neutral):
+Deliberately **out of scope**:
 
-- **Log rotation** — point the sink at a file that your rotation tooling manages,
-  or a writer that rotates itself.
-- **Sampling** — apply it in a `Write` wrapper or upstream.
-- **OpenTelemetry / OTLP export** — emit JSON lines and let a collector ingest
-  them, or wrap a sink that forwards to OTel.
+- **A bridge from the `log` / `tracing` facade crates.** Capturing records that
+  third-party crates emit through those facades needs the facade crates as
+  dependencies, which this toolkit does not take. Diagnostics from `rustls` or
+  `tokio` are therefore not visible through `ferroly::log`.
+- **syslog / journald / network sinks.** A sink is any `std::io::Write`; wrap a
+  socket or write your own adapter.
+- **Reading the system time zone.** Timestamps are UTC unless you configure a
+  fixed offset.
 
 ## Enabling
 
-This is an **optional, non-default** feature. It is **std-only** — the async
-appender uses a `std::thread` + `std::sync::mpsc` bounded channel, so there is
-**no `tokio` dependency**.
+This is an **optional, non-default** feature. It is **std-only** — the
+non-blocking appender uses a `std::thread` + `std::sync::mpsc` bounded channel,
+so there is **no `tokio` dependency**.
 
 ```toml
 [dependencies]
@@ -64,21 +72,37 @@ Severity, ordered `Trace < Debug < Info < Warn < Error`:
 pub enum Level { Trace = 0, Debug = 1, Info = 2, Warn = 3, Error = 4 }
 ```
 
-Derives `Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord`, so you can compare
-levels directly (`Level::Warn >= Level::Info`). `Level::as_str(self)` returns the
-lowercase name (`"info"`, …).
-
-### Global level filter
+Derives `Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash`.
+`Level::as_str(self)` returns the lowercase name (`"info"`, …); `Display` prints
+the same. `Level` implements `FromStr` (case-insensitive; `"warning"` is accepted
+for `Warn`), so a level can come straight from configuration:
 
 ```rust
-pub fn set_max_level(level: Level)  // records below `level` are dropped everywhere
-pub fn enabled(level: Level) -> bool // whether `level` currently passes the global filter
+use ferroly::log::Level;
+let level: Level = "WARN".parse().unwrap();
+assert_eq!(level, Level::Warn);
 ```
 
-`set_max_level` sets a **process-wide** minimum; every logger honors it. The
-default global minimum is `Level::Info`. Note this is separate from a logger's
-own per-logger floor (see [`Logger::level`](#logger-builder)) — a record must
-pass **both** to be emitted.
+### Level filters
+
+```rust
+pub fn set_max_level(level: Level)            // global minimum
+pub fn max_level() -> Level                    // current global minimum (default Info)
+pub fn enabled(level: Level) -> bool           // does `level` pass the global filter?
+
+pub fn set_level_for(target: &str, level: Level) // per-target override
+pub fn clear_level_for(target: &str) -> bool
+pub fn clear_target_levels()
+pub fn level_for(target: &str) -> Level        // level in force for a target
+pub fn enabled_for(target: &str, level: Level) -> bool
+```
+
+A record is emitted when it clears, in order:
+
+1. the logger's own floor (`Logger::level`, default `Trace`);
+2. the **target override** if the logger has a [target](#targets-and-per-module-levels)
+   and an override matches it — otherwise the **global level**;
+3. the minimum level of at least one [sink](#sinks-and-fan-out).
 
 ### `Format`
 
@@ -86,18 +110,12 @@ pass **both** to be emitted.
 pub enum Format { Plain, Json }
 ```
 
-- **`Plain`** — `ts LEVEL  message key=value …`. String field values render raw;
-  everything else renders as compact JSON. Message newlines are replaced with
-  spaces so a record can't break line-oriented output.
-- **`Json`** — one JSON object per line, with `ts`, `level`, `msg`, then all
-  fields. Typed values are preserved (numbers stay numbers, bools stay bools).
-
-Derives `Debug, Clone, Copy, PartialEq, Eq`.
+See [Output formats](#output-formats) for the exact layouts.
 
 ### `Logger`
 
-A cheaply-cloneable structured logger. Clones share the underlying sink but each
-carries its own accumulated context fields and level floor.
+A cheaply-cloneable structured logger. Clones share the underlying sinks but each
+carries its own context fields, target and level floor.
 
 #### Constructors
 
@@ -111,14 +129,19 @@ carries its own accumulated context fields and level floor.
 
 | Method | Effect |
 |---|---|
-| `format(Format)` | Sets the output format. |
-| `level(Level)` | Sets a **per-logger floor**: records below it are dropped even if the global filter would pass them. |
-| `to_writer<W: Write + Send + 'static>(writer)` | Redirect output **synchronously** to any writer (file, buffer, socket …). |
-| `async_to<W: Write + Send + 'static>(writer, capacity)` | Redirect to a **background writer thread** over a bounded channel of `capacity` records — the non-blocking appender. |
-| `with(key: impl Into<String>, value: impl Into<Value>)` | Add a **context field** carried on every record from this logger. Chainable. |
-
-`flush(&self)` (not a builder) blocks until the async appender has drained all queued records —
-call it before process exit so buffered logs aren't lost. No-op for a synchronous logger.
+| `format(Format)` | Format for every sink that has no format of its own. |
+| `level(Level)` | **Per-logger floor**: records below it are dropped even if the other filters would pass them. |
+| `to_writer<W: Write + Send + 'static>(writer)` | Replace all sinks with one **synchronous** sink on `writer`. |
+| `async_to<W: Write + Send + 'static>(writer, capacity)` | Replace all sinks with one **non-blocking** sink (drop-on-full) on `writer`. |
+| `to_sink(Sink)` | Replace all sinks with `sink`. |
+| `add_sink(Sink)` | Add `sink` alongside the existing ones (fan-out). |
+| `with(key, value)` | Add a **context field** carried on every record. |
+| `with_target(target)` | Name the component (module path); printed as `target`, selects the per-target level. |
+| `redact(Redactor)` | Replace the redaction policy (`Redactor::none()` turns it off). |
+| `sample(max: u32, interval: Duration)` | Rate-limit repeated records. |
+| `with_caller(bool)` | Add a `caller` (`file:line`) key to every record. |
+| `time_precision(Precision)` | `Seconds`, `Millis` (default), `Micros` or `Nanos`. |
+| `utc_offset(seconds_east: i32)` | Print timestamps at a fixed offset (`+05:30`) instead of `Z`. |
 
 #### Emitting records
 
@@ -133,84 +156,373 @@ pub fn error(&self, msg: &str, fields: &[(&str, Value)])
 
 `fields` is a slice of **typed** `(&str, Value)` pairs — construct values with
 `.into()` (e.g. `("status", 200.into())`, `("ok", true.into())`,
-`("path", "/x".into())`). The per-level methods forward to `log`.
+`("path", "/x".into())`). All of these are `#[track_caller]`.
 
-#### Introspection
+#### Other methods
 
-- `dropped(&self) -> u64` — the number of records dropped because the async
-  buffer was full. Always `0` for a synchronous logger.
+| Method | Description |
+|---|---|
+| `flush(&self)` | Flush every sink — see [Flushing](#flushing-and-the-buffering-contract). |
+| `dropped(&self) -> u64` | Records dropped by non-blocking sinks (full buffer, or writer thread gone). |
+| `suppressed(&self) -> u64` | Records withheld by `sample`. |
+| `enabled(&self, level) -> bool` | Would a record at `level` be emitted right now? |
+| `target(&self) -> Option<&str>` | The logger's target. |
+
+### `Sink`, `Overflow`
+
+```rust
+Sink::writer(w)                 // synchronous
+Sink::stderr() / Sink::stdout() // synchronous
+Sink::non_blocking(w, capacity) // background thread, bounded queue
+
+sink.format(Format)             // this sink's format (default: the logger's)
+    .level(Level)               // this sink's minimum level (default Trace)
+    .overflow(Overflow)         // non-blocking sinks: Drop (default) or Block
+    .flush_level(Level)         // synchronous sinks: flush after records >= level (default Warn)
+
+pub enum Overflow { Drop, Block }
+```
+
+### `RotatingFile`, `Rotation`
+
+```rust
+RotatingFile::open(path, Rotation) -> io::Result<RotatingFile>   // implements Write
+file.rotate() -> io::Result<()>                                   // force a rotation
+file.path() -> &Path
+
+Rotation::new()            // 10 MiB, keep 5, no daily rotation
+    .max_bytes(u64)        // 0 disables size-based rotation
+    .keep(usize)           // rotated files to retain; 0 = truncate only
+    .daily(bool)           // also rotate when the UTC day changes
+```
+
+### `Redactor`
+
+```rust
+Redactor::default() / Redactor::new()   // masks DEFAULT_REDACTED with "***"
+Redactor::none()                         // masks nothing
+Redactor::with_patterns(&["ssn"])        // exactly these patterns
+redactor.pattern("ssn")                  // add one more
+        .mask("[redacted]")              // change the replacement text
+redactor.matches("user_password") -> bool
+```
+
+### `Sampler`
+
+The rate limiter behind `Logger::sample`, public so the same policy can be reused:
+`Sampler::new(max, interval)`, `check(key) -> Option<u64>`,
+`check_at(key, Instant) -> Option<u64>`, `suppressed() -> u64`.
 
 ### Process-global logger
 
 ```rust
 pub fn set_global(logger: Logger) // install/replace the process-global logger
+pub fn logger() -> Logger         // a clone of it, for deriving children
+pub fn flush()                    // flush it (best-effort, call at shutdown)
+pub fn flush_guard() -> FlushGuard // flushes it when dropped
 
 pub fn trace(msg: &str, fields: &[(&str, Value)])
 pub fn debug(msg: &str, fields: &[(&str, Value)])
 pub fn info (msg: &str, fields: &[(&str, Value)])
 pub fn warn (msg: &str, fields: &[(&str, Value)])
 pub fn error(msg: &str, fields: &[(&str, Value)])
+
+pub fn install_panic_hook()
+pub fn install_panic_hook_with(chain_previous: bool)
 ```
 
-The free functions (`ferroly::log::info`, …) log via the global logger. If none
-has been installed, they fall back to a default plain-text stderr logger.
-`set_global` may be called again to reconfigure at runtime.
+The free functions log via the global logger. If none has been installed, they
+fall back to a default plain-text stderr logger. `set_global` may be called again
+to reconfigure at runtime.
 
-### Context providers (trace-ID propagation)
+### Context providers
 
 ```rust
 pub fn add_context_provider<F>(f: F)
 where F: Fn() -> Vec<(String, Value)> + Send + Sync + 'static
+pub fn clear_context_providers()
+
+pub fn trace_context_fields() -> Vec<(String, Value)> // trace_id / span_id of the current obs span
+pub fn add_trace_context_provider()                   // register it (idempotent)
 ```
 
-Registers a function consulted on **every** log call that injects extra fields
-into the record — see [Request-context propagation](#request-context--trace-id-propagation).
+## Output formats
+
+### Plain
+
+```
+2026-07-05T12:34:56.789Z WARN  cache miss target=app::cache key=user:42 n=7 note="two words"
+```
+
+Layout: `timestamp`, the level padded to five columns, the message, then
+`key=value` pairs separated by single spaces — `target` and `caller` first (when
+present), then the fields.
+
+**Escaping rules** (these make one record exactly one line, whatever the input):
+
+- A **key or string value** is written bare when it is non-empty and contains no
+  whitespace, no control character and none of the delimiter characters `=`,
+  `"`, `\`. Otherwise it is written in double quotes with `\"`, `\\`, `\n`,
+  `\r`, `\t` and `\uXXXX` (for every other control character, DEL, the C1
+  controls, U+2028 and U+2029) escapes. An empty string is `""`.
+- **Non-string values** print as compact JSON (`7`, `true`, `null`,
+  `{"a":"x y"}`); JSON's own string escaping applies inside them.
+- The **message** is free text: every kind of line break (`\n`, `\r`, VT, FF,
+  NEL, U+2028, U+2029) becomes a space, other control characters become
+  `\uXXXX`, tabs are kept. The message is *not* quoted, so text such as
+  `user=admin` inside a message reads like a field — use the JSON format when
+  records are parsed by machines, or keep untrusted text in fields.
+
+### JSON
+
+```json
+{"ts":"2026-07-05T12:34:56.789Z","level":"info","msg":"hello","target":"app::api","svc":"api","status":200,"ok":true}
+```
+
+Key order: `ts`, `level`, `msg`, then `target` and `caller` (when present), then
+the fields. Types are preserved — `"status":200` is a JSON number. Every control
+character, DEL, the C1 controls and U+2028/U+2029 are `\u`-escaped, so a record
+is always a single line.
+
+### Field order, repeated keys and reserved keys
+
+Fields come from three sources, in this order: **context providers**, the
+logger's **`with` fields**, then the **per-call fields**. In both formats:
+
+- **A repeated key is printed once**, with the *last* value (a per-call field
+  overrides a `with` field, which overrides a provider field), at the position of
+  its first occurrence.
+- **A field cannot shadow the record's own keys.** A field named `ts`, `level`
+  or `msg` — or `target` / `caller` when the record prints those — is moved into
+  a nested **`fields`** object (JSON) or printed with a **`fields.`** prefix
+  (plain). The top-level `level` is always the real level:
+
+  ```json
+  {"ts":"…","level":"error","msg":"real","status":500,"fields":{"level":"debug","msg":"forged"}}
+  ```
+
+  ```
+  2026-07-05T12:34:56.789Z ERROR real status=500 fields.level=debug fields.msg=forged
+  ```
+
+- A user field that is itself called `fields` stays an ordinary top-level field
+  unless the nested object is needed for the record, in which case it moves
+  inside it (`fields.fields`), so `fields` is never duplicated either.
+
+JSON output therefore never contains duplicate keys.
+
+### Timestamps
+
+RFC 3339, UTC, millisecond precision by default (`2026-07-05T12:34:56.789Z`),
+computed dependency-free from the system clock. `time_precision` selects
+seconds, milliseconds, microseconds or nanoseconds; `utc_offset(seconds)` prints
+wall-clock fields at a fixed offset with a `+HH:MM` / `-HH:MM` suffix (rounded
+toward zero to whole minutes, limited to ±23:59).
 
 ## In depth
 
-### Two-layer level filtering
+### Targets and per-module levels
 
-A record is emitted only if it clears **both** the global filter
-(`set_max_level`) **and** the logger's own floor (`.level(...)`). The global
-filter is a fast atomic check shared by all loggers; the per-logger floor lets a
-noisy component be quieted independently.
+Give a logger a target — conventionally the module path — and tune that part of
+the code base independently:
 
 ```rust
-use ferroly::log::{set_max_level, Level, Logger};
+use ferroly::log::{set_level_for, set_max_level, Level, Logger};
 
-set_max_level(Level::Debug);              // global: Debug and up
+set_max_level(Level::Info);
+set_level_for("app::http", Level::Warn);     // quieter than the rest
+set_level_for("app::billing", Level::Trace); // louder than the rest
 
-let quiet = Logger::new().level(Level::Warn); // this logger: Warn and up
-quiet.info("suppressed", &[]);            // dropped by the per-logger floor
-quiet.error("kept", &[]);                 // emitted
+let http = Logger::new().with_target("app::http::client");
+http.info("suppressed", &[]);   // app::http is Warn and up
+http.warn("kept", &[]);
+
+let billing = Logger::new().with_target("app::billing");
+billing.debug("kept", &[]);     // the override replaces the global level
 ```
 
-### Plain output
+An override **replaces** the global level for matching records. Matching is by
+prefix at segment boundaries (`::`, `.` or `/`): `app::http` covers
+`app::http` and `app::http::client`, not `app::httpx`. The longest matching
+prefix wins. Records from a logger without a target use the global level.
+
+To derive targeted loggers from the global one:
+`ferroly::log::logger().with_target(module_path!())` (the child shares the
+global logger's sinks as they are at that moment).
+
+### Sinks and fan-out
+
+A logger writes each record to **every** sink whose minimum level admits it,
+rendering each format at most once:
 
 ```rust
+use ferroly::log::{Format, Level, Logger, Overflow, RotatingFile, Rotation, Sink};
+
+# fn main() -> std::io::Result<()> {
+let file = RotatingFile::open("app.log", Rotation::new().keep(7))?;
+let audit = std::fs::File::create("audit.log")?;
+
+let log = Logger::new()                                   // plain text on stderr …
+    .add_sink(Sink::non_blocking(file, 8192)              // … JSON to a rotating file …
+        .format(Format::Json))
+    .add_sink(Sink::non_blocking(audit, 1024)             // … and warnings to an audit
+        .level(Level::Warn)                               //     log that never drops
+        .overflow(Overflow::Block));
+log.info("started", &[]);
+log.flush();
+# Ok(())
+# }
+```
+
+`to_writer`, `async_to` and `to_sink` *replace* the sink list; `add_sink`
+appends to it.
+
+### Flushing and the buffering contract
+
+- A **synchronous sink** hands each record (with its newline) to the writer in
+  one `write_all` call before the logging call returns. The writer is **flushed
+  after every record at `Warn` or above** (configurable with
+  `Sink::flush_level`) and by `Logger::flush()`. If the writer buffers — a
+  `BufWriter<File>` — records below that level sit in its buffer until the next
+  flush.
+- A **non-blocking sink** queues records for a background thread, which writes
+  them and flushes the writer whenever the queue runs empty.
+  `Logger::flush()` queues a marker behind all pending records and blocks until
+  the thread has written and flushed up to it.
+- `Logger::flush()` flushes **all** sinks of the logger, synchronous ones
+  included.
+- `ferroly::log::flush()` flushes the global logger. Records still buffered when
+  `main` returns are otherwise lost — a `static` logger is never dropped — so
+  flush on the shutdown path:
+
+```rust
+use ferroly::log::{self, Logger};
+
+fn main() {
+    log::set_global(Logger::json());
+    log::install_panic_hook();            // panics are logged, then flushed
+    let _flush = log::flush_guard();      // flushes on every return path
+    // … run …
+}
+```
+
+### Non-blocking appender and overflow policy
+
+`async_to(writer, capacity)` (or `Sink::non_blocking`) moves all I/O to a
+background thread behind a bounded queue of `capacity` records.
+
+| `Overflow` | When the queue is full | Use for |
+|---|---|---|
+| `Drop` (default) | the record is discarded and counted in `dropped()`; the logging call never waits | request paths, where latency matters more than completeness |
+| `Block` | the logging call waits for space; nothing is lost | audit logs |
+
+```rust
+use ferroly::log::{Logger, Overflow, Sink};
+
+# fn run(file: std::fs::File) {
+let log = Logger::json().to_sink(Sink::non_blocking(file, 8192).overflow(Overflow::Block));
+log.info("tick", &[]);
+if log.dropped() > 0 {
+    eprintln!("log appender dropped {} records", log.dropped());
+}
+log.flush(); // before exit
+# }
+```
+
+`dropped()` also counts records that could not be queued because the writer
+thread has gone away. Expose it as a metric to observe shed load.
+
+### Rotating files
+
+`RotatingFile` is a `Write` that rotates itself:
+
+- **Size:** before a write that would take the file past `max_bytes`, the file
+  is rotated. A record is never split across files; a single record larger than
+  the limit is written whole into a file of its own.
+- **Daily:** with `daily(true)`, the file is also rotated when the UTC calendar
+  day changes (checked on each write; a file whose modification time is from an
+  earlier day is rotated on the first write after start-up).
+- **Retention:** `app.log` → `app.log.1` → `app.log.2` … — higher numbers are
+  older — and the file beyond `keep` is deleted. `keep(0)` keeps no history:
+  rotation just truncates.
+
+Writes are unbuffered (one system call per record), so nothing is lost if the
+process dies; put the file behind a non-blocking sink to keep that I/O off the
+calling thread. Rotation is per-process: do not point two processes at the same
+file. There is no compression of rotated files.
+
+### Redaction
+
+Every logger redacts by default. A field whose **name** matches a pattern has its
+value replaced with `***` — in context-provider fields, `with` fields and
+per-call fields, in both formats, and inside nested objects and arrays.
+
+Default patterns (`DEFAULT_REDACTED`): `password`, `passwd`, `pwd`, `secret`,
+`token`, `authorization`, `api_key`, `apikey`, `cookie`, `credential`,
+`credentials`, `private_key`.
+
+A pattern matches when its words appear as **consecutive whole words** of the
+field name, ignoring case. Names are split into words at `_`, `-`, `.`, any other
+non-alphanumeric character, and camelCase boundaries:
+
+| Field name | Redacted? |
+|---|---|
+| `password`, `user_password`, `db.password` | yes (`password`) |
+| `access_token`, `X-Auth-Token`, `authToken` | yes (`token`) |
+| `api_key`, `x-api-key`, `apiKey`, `APIKEY` | yes (`api_key` / `apikey`) |
+| `Authorization`, `Set-Cookie` | yes |
+| `max_tokens`, `tokens_used`, `secretary`, `key` | no — a different word |
+
+```rust
+use ferroly::log::{Logger, Redactor};
+
+let log = Logger::json().redact(Redactor::default().pattern("ssn").mask("[redacted]"));
+log.info("signup", &[("email", "a@b.c".into()), ("ssn", "123-45-6789".into())]);
+// {"ts":"…","level":"info","msg":"signup","email":"a@b.c","ssn":"[redacted]"}
+
+let raw = Logger::json().redact(Redactor::none()); // no redaction at all
+```
+
+Redaction is by field **name** only: it does not scan message text or the
+contents of string values. Do not interpolate secrets into messages.
+
+### Sampling
+
+`sample(max, interval)` caps repeats: at most `max` records per `interval` for
+each distinct **(level, target, message)** — field values are not part of the
+key. Excess records are withheld and counted (`suppressed()`); the first record
+of the next window carries a `suppressed` field with the number withheld. Clones
+of a sampled logger share one budget.
+
+```rust
+use std::time::Duration;
 use ferroly::log::Logger;
 
-Logger::new().warn("cache miss", &[("key", "user:42".into()), ("n", 7.into())]);
-// 2026-07-05T12:34:56.789Z WARN  cache miss key=user:42 n=7
+let log = Logger::new().sample(5, Duration::from_secs(1));
+for i in 0..10_000 {
+    log.warn("upstream timeout", &[("attempt", i.into())]); // 5 per second get through
+}
 ```
 
-The level is left-padded to five columns; string fields print raw; numeric/bool
-fields print as JSON. Newlines in the message become spaces.
+Sampling applies to every level, `Error` included; leave it off for loggers whose
+records must all be kept.
 
-### JSON output
+### Caller capture
 
-```rust
-use ferroly::log::Logger;
+`with_caller(true)` adds `caller` = `file:line` of the logging call to each
+record, using `#[track_caller]` (no backtrace, no macro, negligible cost). It
+works through the free functions too. The location is that of the direct caller
+of `info` / `log` / …; a helper that wraps the logger should itself be
+`#[track_caller]` to pass its caller through.
 
-Logger::json()
-    .with("svc", "api")
-    .info("hello", &[("status", 200.into()), ("ok", true.into())]);
-// {"ts":"2026-07-05T…Z","level":"info","msg":"hello","svc":"api","status":200,"ok":true}
-```
+### Panic hook
 
-Field ordering is: `ts`, `level`, `msg`, then context fields (from
-providers, then from `.with(...)`), then the per-call `fields`. Types are
-preserved — `"status":200` is a JSON number, not `"200"`.
+`install_panic_hook()` logs every panic through the global logger at `Error` —
+message `panic`, fields `panic.message`, `panic.location`
+(`file:line:column`), `panic.thread` — flushes the logger, and then runs the
+previously installed hook (by default the standard stderr report).
+`install_panic_hook_with(false)` does not chain, so the panic is reported through
+the logger only.
 
 ### Carried context fields with `with`
 
@@ -227,135 +539,94 @@ req_log.info("charge", &[("amount_cents", 4999.into())]);
 // includes service=billing and request_id=abc-123 on every line
 ```
 
-Because a `Logger` is cheap to clone and clones share the sink, deriving a
-child logger with extra context is inexpensive.
-
-### RFC 3339 timestamps
-
-Every record carries a UTC RFC 3339 timestamp with millisecond precision
-(`2026-07-05T12:34:56.789Z`), computed dependency-free from the system clock —
-no `chrono`/`time` crate. It appears as the leading token in plain output and the
-`ts` field in JSON.
-
-### Non-blocking async appender
-
-`async_to(writer, capacity)` moves all I/O to a background thread. The logging
-call encodes the record and pushes it onto a bounded channel of `capacity`
-slots; the background thread drains the channel and writes+flushes. The hot path
-**never blocks on I/O**. When the buffer is full, the record is **dropped and
-counted** rather than blocking the caller — check `dropped()` to observe shed
-load (e.g. surface it as a metric).
-
-```rust
-use std::fs::File;
-use ferroly::log::Logger;
-
-# fn run() -> std::io::Result<()> {
-let file = File::create("app.log")?;
-let log = Logger::json().async_to(file, 8192); // up to 8192 buffered records
-
-for i in 0..100_000 {
-    log.info("tick", &[("i", i.into())]);
-}
-
-// Records shed under back-pressure are counted, never silently lost.
-if log.dropped() > 0 {
-    eprintln!("log appender dropped {} records under load", log.dropped());
-}
-
-// Before exit, block until the background thread has written everything queued.
-log.flush();
-# Ok(())
-# }
-```
-
-`flush()` queues a marker behind all pending writes and blocks until the
-background thread has processed it, so every record enqueued before the call has
-reached the writer. **Call it before process exit** (or before you need the log
-durable) — otherwise records still sitting in the channel when `main` returns are
-lost, because the background thread is torn down with the process. `flush()` is a
-no-op on a synchronous logger, so it is always safe to call.
-
-Trade-off: size `capacity` to your burst tolerance, and prefer a synchronous sink
-when every last record must reach disk even on an abrupt crash (`flush` only helps
-on a clean shutdown path you control).
-
 ### Request-context / trace-ID propagation
 
 `add_context_provider` registers a hook that runs on **every** log call and
 returns fields to merge into the record. Providers should return an **empty vec**
-when there is no active context (i.e. outside a request), so background/global
-logs stay clean.
+when there is no active context, so background logs stay clean.
 
-This is exactly how request correlation is wired: [turbo](turbo.md)'s
-`trace_context()` registers a provider that reads a **task-local `trace_id`** for
-the in-flight request. As a result, *every* log line emitted while handling that
-request — from any logger, including the global free functions — automatically
-carries the same `trace_id`, with no threading of a context object through your
-call stack.
+[turbo](turbo.md)'s `trace_context()` registers a provider that reads a
+task-local `trace_id` for the in-flight request, so every line logged while
+handling that request carries it.
 
 ```rust
 use ferroly::log::{add_context_provider, info, Logger, set_global};
 use ferroly::codec::Value;
 
-// A provider that pulls a request id from wherever your framework stashes it.
 add_context_provider(|| {
     match current_request_id() {
-        Some(id) => vec![("trace_id".to_string(), Value::Str(id))],
+        Some(id) => vec![("request_id".to_string(), Value::Str(id))],
         None => Vec::new(), // no context -> no field
     }
 });
 
 set_global(Logger::json());
-info("handling", &[]); // JSON line includes "trace_id":"…" when in a request
+info("handling", &[]); // JSON line includes "request_id":"…" when in a request
 
 # fn current_request_id() -> Option<String> { None }
 ```
 
-Multiple providers may be registered; their fields are concatenated in
-registration order, ahead of the logger's own `.with(...)` fields.
+Provider rules:
 
-### Wiring the global logger
+- Providers are called **without any logger lock held** (the list is snapshotted
+  first), so a provider may log or register another provider.
+- A record logged **from inside a provider** is emitted without provider fields
+  — the providers are not consulted again — which bounds the recursion.
+- Provider fields go through the same escaping, redaction and reserved-key rules
+  as any other field.
+- Multiple providers contribute in registration order, ahead of the logger's own
+  `with` fields.
 
-Install the global logger once at startup, then use the free functions anywhere:
+### Linking logs to traces (`obs`)
+
+`add_trace_context_provider()` registers `trace_context_fields`, which returns
+the `trace_id` and `span_id` of the current [`obs`](obs.md) span. Every record
+logged inside a span then carries both ids:
 
 ```rust
-use ferroly::log::{self, set_global, set_max_level, Format, Level, Logger};
+use ferroly::log::{self, Logger};
 
-set_max_level(Level::Info);
-set_global(Logger::json().format(Format::Json).with("service", "api"));
+log::set_global(Logger::json());
+log::add_trace_context_provider();
 
-log::info("started", &[("port", 8080.into())]);
-log::error("db down", &[("retry_in_ms", 500.into())]);
+// Inside an obs span (with the `obs` feature enabled):
+//   {"ts":"…","level":"info","msg":"charged",
+//    "trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7"}
 ```
+
+Both functions exist whether or not the `obs` feature is enabled; without it
+`trace_context_fields` always returns an empty vec, so the call compiles and is
+simply inert. The ids follow the current span across `.await` points when the
+span was attached with the task-local scope described in [obs](obs.md).
 
 ## Error handling
 
-Logging never returns a `Result` — it is fire-and-forget. Write failures on the
-synchronous sink are ignored; on the async sink a full buffer increments the drop
-counter (surfaced via `dropped()`). There is no panic on I/O error, so a broken
-sink cannot take down the hot path.
+Logging never returns a `Result` and never panics on I/O errors. Write failures
+are ignored; a full non-blocking queue either drops and counts or blocks, per its
+`Overflow` policy. A poisoned sink lock (a writer that panicked earlier) keeps
+being used rather than silencing the logger. A sink writer that itself logs or
+flushes does not deadlock: the nested record is discarded.
 
 ## Limitations
 
-- **No rotation, sampling, or OTel export** — intentionally delegated to the sink
-  or surrounding app.
-- **Async appender may lose buffered records at process exit** unless you call
-  `flush()` on a clean shutdown path, and it drops under sustained back-pressure
-  (by design, counted via `dropped()`).
-- `set_max_level` and `add_context_provider` are **process-global** — convenient,
-  but shared state; set them up once at startup.
-- Field values are limited to codec [`Value`](codec.md) shapes; arbitrary types
-  must be converted to a `Value` first.
-- Plain output escapes only newlines/carriage returns in the message (to protect
-  line framing); it does not escape field values beyond JSON-encoding non-string
-  values.
+- **No bridge from the `log` / `tracing` crates** (see Overview).
+- **No syslog/journald/network sinks, no compression of rotated files.**
+- **Redaction is by field name**, not by scanning values or message text.
+- **Plain-format messages are free text** — `key=value` inside a message is
+  indistinguishable from a field. Use JSON for machine parsing.
+- **Timestamps cannot follow the system time zone**; only a fixed offset.
+- `set_max_level`, `set_level_for`, `add_context_provider` and the global logger
+  are **process-global** — set them up once at startup.
+- `Overflow::Drop` loses records under sustained back-pressure (by design,
+  counted); buffered records are lost at process exit unless you flush.
+- Field values are limited to codec [`Value`](codec.md) shapes.
 
 ## See also
 
 - [turbo](turbo.md) — its `trace_context()` registers a context provider so every
   request-scoped log line carries a `trace_id`.
+- [obs](obs.md) — spans; `add_trace_context_provider` links log lines to them.
 - [codec](codec.md) — the [`Value`](codec.md) type used for structured fields.
 
 ---
-**Related:** [turbo](turbo.md), [codec](codec.md).
+**Related:** [turbo](turbo.md), [obs](obs.md), [codec](codec.md).
