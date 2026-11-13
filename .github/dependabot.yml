@@ -10,6 +10,13 @@ updates:
     commit-message:
       prefix: "deps"
     open-pull-requests-limit: 10
+    ignore:
+      # Held back for the MSRV (1.75): newer releases of these transitive
+      # crates require edition 2024. Remove these entries when the MSRV is
+      # raised, and review them whenever one of the crates has an advisory.
+      - dependency-name: "zeroize"
+      - dependency-name: "cc"
+      - dependency-name: "find-msvc-tools"
 
   - package-ecosystem: github-actions
     directory: /

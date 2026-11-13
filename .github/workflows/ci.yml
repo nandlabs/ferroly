@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: every job here only reads the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -13,11 +17,11 @@ jobs:
     name: Format & Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy
@@ -31,13 +35,55 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build (default features)
         run: cargo build -p ferroly
       - name: Test (all features)
         run: cargo test -p ferroly --features full
+
+  features:
+    name: Feature isolation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # Every feature must lint cleanly on its own — `full` hides a feature that
+      # forgets a dependency edge or leaves dead code behind when built alone.
+      - name: Clippy each feature alone
+        run: |
+          set -euo pipefail
+          features="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; m=json.load(sys.stdin); p=[x for x in m["packages"] if x["name"]=="ferroly"][0]; print(" ".join(sorted(f for f in p["features"] if f not in ("default","full"))))')"
+          echo "::group::no features"
+          cargo clippy -p ferroly --no-default-features --lib -- -D warnings
+          echo "::endgroup::"
+          for f in $features; do
+            echo "::group::$f"
+            cargo clippy -p ferroly --no-default-features --features "$f" --lib -- -D warnings
+            echo "::endgroup::"
+          done
+      # Tests and examples must also build when only the defaults are enabled.
+      - name: Test (default features)
+        run: cargo test -p ferroly
+      - name: Test (derive crate)
+        run: cargo test -p ferroly-derive
+
+  dependency-budget:
+    name: Dependency budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@stable
+      # The project's defining rule: the only direct runtime dependencies are
+      # tokio, the rustls TLS family, and ferroly's own derive crate. A new direct
+      # dependency must be a deliberate decision, so it fails here first.
+      - name: Check direct runtime dependencies
+        run: ./.github/scripts/check-dependency-budget.sh
 
   docs:
     name: Doc build
@@ -45,9 +91,9 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo doc --no-deps -p ferroly --features full
 
   msrv:
@@ -58,9 +104,9 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.75.0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@1.75.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # `--locked` fails loudly if Cargo.lock drifts to a version that raises the
       # MSRV (e.g. a transitive dep jumping to edition 2024) instead of silently
       # re-resolving. Keep transitive deps pinned to 1.75-compatible versions.
@@ -70,11 +116,11 @@ jobs:
     name: Coverage (llvm-cov)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Measure coverage
         run: cargo llvm-cov -p ferroly --features full --summary-only
