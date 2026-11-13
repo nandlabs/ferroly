@@ -218,7 +218,10 @@ async fn main() -> Result<(), ferroly::http::HttpError> {
     };
     router
         .serve_with_config("0.0.0.0:8080", config, async {
-            ferroly::rt::shutdown_signal().await; // Ctrl-C or SIGTERM: drain, then stop
+            // Ctrl-C or SIGTERM: stop accepting, drain in-flight requests, return.
+            if let Err(e) = ferroly::rt::shutdown_signal().await {
+                eprintln!("cannot install signal handlers: {e}");
+            }
         })
         .await
 }
