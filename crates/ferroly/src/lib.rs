@@ -266,6 +266,9 @@ impl errutils::Classify for Error {
                     genai::RouterError::UnknownProvider { .. }
                     | genai::RouterError::Config { .. } => K::InvalidInput,
                     genai::RouterError::DeadlineExceeded { .. } => K::Timeout,
+                    genai::RouterError::InvalidRequest { .. } => K::InvalidInput,
+                    genai::RouterError::CircuitOpen { .. } => K::Unavailable,
+                    genai::RouterError::BudgetExceeded { .. } => K::RateLimited,
                     genai::RouterError::GenAi { .. }
                     | genai::RouterError::AllRoutesFailed { .. } => std::error::Error::source(e)
                         .and_then(|s| s.downcast_ref::<genai::GenAiError>())
@@ -375,6 +378,16 @@ mod classify {
                 _ => K::Unknown,
             },
             GenAiError::ResponseParse { .. } => K::Internal,
+            GenAiError::Timeout { .. } => K::Timeout,
+            GenAiError::RateLimited { .. } => K::RateLimited,
+            GenAiError::Auth { status, .. } => match *status {
+                403 => K::PermissionDenied,
+                _ => K::Unauthenticated,
+            },
+            GenAiError::ContentFilter { .. } | GenAiError::ContextLengthExceeded { .. } => {
+                K::InvalidInput
+            }
+            GenAiError::Overloaded { .. } => K::Unavailable,
             _ => K::Unknown,
         }
     }

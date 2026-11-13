@@ -52,8 +52,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      # Every feature must lint cleanly on its own — `full` hides a feature that
-      # forgets a dependency edge or leaves dead code behind when built alone.
+      # Every feature must lint cleanly on its own — library, tests and examples.
+      # `full` hides a feature that forgets a dependency edge, leaves dead code
+      # behind when built alone, or has a test/example missing its feature gate.
       - name: Clippy each feature alone
         run: |
           set -euo pipefail
@@ -64,7 +65,7 @@ jobs:
           echo "::endgroup::"
           for f in $features; do
             echo "::group::$f"
-            cargo clippy -p ferroly --no-default-features --features "$f" --lib -- -D warnings
+            cargo clippy -p ferroly --no-default-features --features "$f" --all-targets -- -D warnings
             echo "::endgroup::"
           done
       # Doc links that point at another feature's module only resolve under
@@ -81,7 +82,6 @@ jobs:
             cargo doc --no-deps -p ferroly --no-default-features --features "$f"
             echo "::endgroup::"
           done
-      # Tests and examples must also build when only the defaults are enabled.
       - name: Test (default features)
         run: cargo test -p ferroly
       - name: Test (derive crate)

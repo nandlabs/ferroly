@@ -16,7 +16,9 @@ libfuzzer-sys = "0.4"
 [dependencies.ferroly]
 path = "../crates/ferroly"
 default-features = false
-features = ["codec"]
+# `genai` is needed only by the `template_render` target (the prompt-template
+# renderer lives in that module).
+features = ["codec", "genai"]
 
 [[bin]]
 name = "json_parse"
@@ -42,6 +44,13 @@ bench = false
 [[bin]]
 name = "toml_parse"
 path = "fuzz_targets/toml_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "template_render"
+path = "fuzz_targets/template_render.rs"
 test = false
 doc = false
 bench = false

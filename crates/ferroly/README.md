@@ -5,7 +5,7 @@ A self-contained Rust toolkit of enterprise utilities — a port of
 crate as feature-gated modules; you compile only what you enable.
 
 ```toml
-ferroly = { version = "0.1", features = ["genai", "codec"] }
+ferroly = { version = "0.4", features = ["genai", "codec"] }
 ```
 
 ```rust

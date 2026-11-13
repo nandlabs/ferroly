@@ -26,6 +26,7 @@ cargo install cargo-fuzz
 | `xml_parse`  | `ferroly::codec::xml::from_str` | the parser reads back what `xml::encode` writes |
 | `yaml_parse` | `ferroly::codec::yaml::from_str` | a parsed value is unchanged by `yaml::encode` → `from_str` |
 | `toml_parse` | `ferroly::codec::toml::from_str` | the parser reads back what `toml::encode` writes |
+| `template_render` | `ferroly::genai::template::Template` | parsing and rendering arbitrary template text never panics and respects the output cap |
 
 Every target also relies on the shared `codec::Limits` budget (depth, input
 size, entry count) to bound memory and recursion on arbitrary input.
@@ -50,6 +51,7 @@ cargo +nightly fuzz run json_parse fuzz/corpus/json_parse fuzz/seeds/json_parse
 cargo +nightly fuzz run xml_parse  fuzz/corpus/xml_parse  fuzz/seeds/xml_parse
 cargo +nightly fuzz run yaml_parse fuzz/corpus/yaml_parse fuzz/seeds/yaml_parse
 cargo +nightly fuzz run toml_parse fuzz/corpus/toml_parse fuzz/seeds/toml_parse
+cargo +nightly fuzz run template_render
 ```
 
 For a short, bounded burst (for example in a scheduled job), cap the time:

@@ -29,7 +29,7 @@ in-memory, pluggable backends), see the separate [vfs](vfs.md) module.
 
 ```toml
 [dependencies]
-ferroly = { version = "0.3", features = ["fsutils"] }
+ferroly = { version = "0.4", features = ["fsutils"] }
 ```
 
 ## Quick start

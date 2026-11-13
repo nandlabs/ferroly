@@ -31,9 +31,9 @@ operations — no lock per update once you hold the handle.
 
 ```toml
 [dependencies]
-ferroly = { version = "0.3", features = ["metrics"] }
+ferroly = { version = "0.4", features = ["metrics"] }
 # with the router integration:
-ferroly = { version = "0.3", features = ["turbo", "metrics"] }
+ferroly = { version = "0.4", features = ["turbo", "metrics"] }
 ```
 
 ## Quick start

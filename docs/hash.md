@@ -8,7 +8,7 @@ buffering the whole input in memory.
 Enable with the `hash` feature (std-only, no other feature or crate required):
 
 ```toml
-ferroly = { version = "0.3", features = ["hash"] }
+ferroly = { version = "0.4", features = ["hash"] }
 ```
 
 > **Hand-rolled, not FIPS-validated.** Every algorithm here is implemented

@@ -20,8 +20,8 @@ Enable with the `obs` feature (`obs = ["codec"]`, std-only); the OTLP exporter
 also needs `http`:
 
 ```toml
-ferroly = { version = "0.3", features = ["obs"] }              # spans + JSON export
-ferroly = { version = "0.3", features = ["obs", "http"] }      # + OTLP/HTTP export
+ferroly = { version = "0.4", features = ["obs"] }              # spans + JSON export
+ferroly = { version = "0.4", features = ["obs", "http"] }      # + OTLP/HTTP export
 ```
 
 ## At a glance
@@ -542,8 +542,15 @@ modules.
 Unknown HTTP methods are recorded as `_OTHER`. The `record_*` and `set_route`
 helpers take `&ActiveSpan`, which a `SpanGuard` dereferences to.
 
-`http`, `turbo`, `genai` and `messaging` do not create spans by themselves yet;
-these helpers are what their instrumentation is built from.
+Built-in instrumentation that uses these helpers (each behind the `obs` feature):
+
+- [turbo](turbo.md)'s `trace_context()` middleware extracts W3C trace context
+  and runs a server span per request.
+- The [rest](rest.md) client injects `traceparent` into outgoing requests.
+- [genai](genai.md)'s `ObsObserver` records a span per model call with token usage.
+
+The raw `http` client and `messaging` do not create spans by themselves; use the
+helpers above (and `obs::inject` / `obs::extract`) at those boundaries.
 
 ## Linking logs to traces
 

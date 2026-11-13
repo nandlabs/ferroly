@@ -18,6 +18,47 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Added
 
 <!-- ADDED -->
+- **genai**: streaming is a sequence of typed events —
+  `CompletionChunk::{Start, TextDelta, ReasoningDelta, ToolCallDelta,
+  ProviderData, Usage, Done}` — with `StreamAccumulator` / `collect_stream` to
+  fold a stream into a `CompletionResponse`.
+- **genai**: specific errors — `GenAiError::{RateLimited, Auth, Timeout,
+  ContentFilter, ContextLengthExceeded, Overloaded}` — with `Retry-After` parsed,
+  rate-limit headers kept, and helpers `status()`, `retry_after()`,
+  `is_transient()`, `is_caller_error()`, `kind_label()`, `error_class()`.
+- **genai**: `FinishReason` (with the provider's string in `raw_finish_reason`),
+  `Grounding` / `Citation`, and `CompletionResponse::{id, reasoning,
+  tool_calls(), is_truncated(), decode_value()}`.
+- **genai**: more typed options — `stop`, `seed`, `top_k`, `presence_penalty`,
+  `frequency_penalty`, `user`, `parallel_tool_calls`, `reasoning_effort`,
+  `prompt_cache` — plus `ResponseFormat::Schema` / `strict_schema` and
+  `ToolDefinition::strict`.
+- **genai**: `ProviderOptions` gains timeouts (`connect`, `response`,
+  `stream_idle`, `total`), a custom `AuthProvider` for every provider, extra
+  headers, proxy and TLS passthrough, a ready-made `http::Client`, optional retry,
+  an observer, and body-size caps.
+- **genai**: `OpenAiConfig` for OpenAI-compatible servers and Azure OpenAI;
+  `ClaudeProviderConfig` builder (API version, beta headers,
+  `omit_sampling_params`, `default_max_tokens`).
+- **genai**: usage reports cached, cache-write and reasoning tokens;
+  `ModelInfo::cost_for(&usage)` computes the cost of a call.
+- **genai**: `GenAiObserver` hook with adapters `ObsObserver` (`obs`),
+  `MetricsObserver` (`metrics`) and `LogObserver` (`log`), plus `redact_payload`.
+- **genai**: `MockProvider` — a scripted provider and embedder that records
+  requests, for tests.
+- **genai**: embeddings accept `dimensions` and `user`; large inputs are batched
+  automatically with order preserved. `genai::rag::RagIndex` (feature
+  `vectorstore`) — embed-and-upsert and query-by-text.
+- **genai**: prompt templates gain `{{#if}}` / `{{#unless}}` / `{{#each}}`,
+  `{{> partial}}`, comments, a `\{{` escape, a compiled `Template` with strict
+  rendering, versions, and `InMemoryPromptStore::load_dir`.
+- **genai** (router): `RouterBuilder::from_config`, cumulative budgets (`Budget`,
+  `BudgetStore`, `InMemoryBudgetStore`), sticky routing, `RouteReport` with
+  estimated vs actual cost, tag-based rules, `rank_overrides`, `default_model`,
+  shared `CircuitBreakerRegistry`, `fallback_on_timeout`,
+  `GenAiProvider::model_info_for(model)`.
+- **genai** (router): `ModelInfo` carries `quality_rank`, `speed_rank`, cache
+  prices and an `as_of` date; stale compiled-in prices are reported once.
 - **turbo**: request-scoped extensions (`ctx.set` / `ctx.get`) and shared state
   (`Router::with_state`, `ctx.state`), so middleware can hand identity to
   handlers; `ctx.route()` returns the matched route template.
@@ -300,6 +341,29 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Changed
 
 <!-- CHANGED -->
+- **genai (breaking)**: `CompletionChunk` is an enum (use `chunk.text()` instead
+  of `chunk.delta`); `CompletionResponse` is `#[non_exhaustive]` and its
+  `finish_reason` is `Option<FinishReason>`; `MessagePart` and `ResponseFormat`
+  are `#[non_exhaustive]`; several structs gained fields; `ClaudeProviderConfig`
+  is built with `new` / `with_auth`.
+- **genai (breaking)**: provider failures map to the new error variants (a `429`
+  is `RateLimited`, `401`/`403` is `Auth`, a timeout is `Timeout`) instead of
+  `Api` / `Transport`.
+- **genai**: default timeouts suit model calls — 10 s connect, 10 min until the
+  response starts, 5 min stream idle.
+- **genai**: OpenAI requests send `max_completion_tokens`; streamed requests ask
+  for usage. Ollama sends and parses tools.
+- **genai**: the Claude catalog lists current models; when `max_tokens` is unset
+  the provider derives it from the catalog instead of sending 1024.
+  `ResponseFormat::Json` on Claude returns `Unsupported` (use a schema).
+- **genai**: rendering through `Template`, `PromptTemplate::render_strict`,
+  `InMemoryPromptStore::render` and `Message::from_prompt` is strict; the existing
+  `render` functions stay lenient. `{{ . }}` no longer renders the whole variables
+  object.
+- **genai** (router): `Priority::Quality` and `Priority::Speed` rank by explicit
+  ranks; routing configuration is parsed strictly; a completion that timed out
+  after it was sent is no longer retried or failed over by default; when every
+  breaker is open the error is `RouterError::CircuitOpen`.
 - **turbo (breaking)**: the request path is normalised before routing. `//x`, a
   path without a leading `/`, malformed percent-escapes and encoded control
   characters are answered `400`; dot segments are resolved; `ctx.path()` returns
@@ -479,6 +543,29 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Fixed
 
 <!-- FIXED -->
+- **genai**: OpenAI and Ollama dropped assistant tool calls and tool results from
+  outgoing messages; both now send them correctly and parse parallel tool calls.
+- **genai**: streams no longer lose tool calls, usage, finish reasons or errors; a
+  provider error event, a stalled stream, or a connection that closes early is
+  reported as an error. Multi-byte UTF-8 characters split across network chunks
+  are no longer corrupted.
+- **genai**: a slow completion is no longer re-sent (and billed twice) after a
+  timeout; an abandoned stream no longer leaks its reader task and connection.
+- **genai**: `Options::custom` is now sent to the provider.
+- **genai**: Claude no longer drops `Message::system` when `system_instructions`
+  is set, no longer ignores a requested response format, and no longer truncates
+  silently at 1024 tokens.
+- **genai**: `CompletionResponse::decode` accepts a JSON answer wrapped in a
+  Markdown code fence and reports anything else clearly. API keys can no longer
+  appear in errors, `Debug` output or logs; provider error bodies are size-capped.
+- **genai** (router): chat requests are no longer routed to embedding models; a
+  cancelled call or abandoned stream can no longer leave a model stuck half-open;
+  client errors no longer open the circuit breaker.
+- **genai** (router): `default_strategy`, `rules` and `fallback_depth` from the
+  routing configuration are now applied; an unknown `disabled_capabilities` entry
+  is an error.
+- **build**: `clippy -D warnings` passes with any single feature enabled, and
+  examples and tests build under any feature selection.
 - **turbo**: group-scoped filters could be bypassed with `//api/x`, `api/x` or dot
   segments, and never ran for a group whose prefix contained a parameter. Filters
   are now scoped with the route matcher on the normalised path, and each route

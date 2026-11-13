@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0 OR MIT"
@@ -14,7 +14,10 @@ authors = ["nandlabs"]
 # Runtime dependency budget: tokio + (for TLS) tokio-rustls/rustls only.
 # 1.38 is the floor for the tokio APIs ferroly uses (`watch::Receiver::wait_for`,
 # `watch::Sender::send_if_modified`, `fs::try_exists`, `task::JoinSet`).
-tokio = { version = "1.38", features = ["full"] }
+# No features here: each ferroly feature turns on exactly the tokio features it
+# needs (see crates/ferroly/Cargo.toml), so `lifecycle` alone does not compile
+# tokio's process, fs or net support.
+tokio = { version = "1.38", default-features = false }
 
 # TLS engine (single crypto exception, isolated behind an internal transport trait)
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
@@ -28,16 +31,17 @@ quote = "1"
 syn = { version = "3", features = ["full"] }
 
 # internal proc-macro crate — the only companion crate to `ferroly`
-ferroly-derive    = { path = "crates/ferroly-derive",    version = "0.3.2" }
+ferroly-derive    = { path = "crates/ferroly-derive",    version = "0.4.0" }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 
 # Centralized lints applied to every workspace crate. The codebase is
-# `unsafe`-free except for a single audited region: the read-only memory-mapped
-# file support in `fsutils` (a `#[allow(unsafe_code)]` module wrapping the
-# `mmap`/`munmap` FFI). `deny` keeps every other `unsafe` a hard error while
-# permitting that one reviewed exception.
+# `unsafe`-free except for a single audited region: `fsutils/mmap.rs`, a
+# `#[allow(unsafe_code)]` module wrapping the `mmap`/`munmap` FFI behind the
+# `unsafe fn Mmap::map` (the safe `Mmap::open` copies the file instead). `deny`
+# keeps every other `unsafe` a hard error while permitting that one reviewed
+# exception.
 [workspace.lints.rust]
 unsafe_code = "deny"

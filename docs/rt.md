@@ -10,7 +10,7 @@ sockets and files, and run child processes **without adding `tokio` to their own
 Enable with the `rt` feature (it pulls in `tokio`):
 
 ```toml
-ferroly = { version = "0.3", features = ["rt"] }
+ferroly = { version = "0.4", features = ["rt"] }
 ```
 
 ```rust
