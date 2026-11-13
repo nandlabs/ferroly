@@ -134,8 +134,7 @@ page is a comprehensive developer guide, and they must stay that way:
   "deserialize".
 - **Attribution:** the port lineage is credited once in the top-level [README](README.md).
   Do **not** scatter "ports golly's X" / "(golly: …)" references through code comments or docs;
-  describe what the code does on its own terms. (The Go → Rust design rationale lives in the one
-  dedicated `docs/roadmap-*.md` page.)
+  describe what the code does on its own terms.
 
 ## Commits & pull requests
 

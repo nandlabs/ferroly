@@ -392,3 +392,10 @@ mod classify {
         }
     }
 }
+
+// Compile and run every example in the crate README as a doctest, so the page
+// shown on crates.io cannot drift from the API. Examples marked `no_run` (they
+// need a network or files) are compiled only.
+#[cfg(all(doctest, feature = "full"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

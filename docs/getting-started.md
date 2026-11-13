@@ -158,7 +158,7 @@ async fn main() -> Result<(), ferroly::Error> {
 - **[genai](genai.md)** / **[vectorstore](vectorstore.md)** — LLMs and vector search.
 - **[messaging](messaging.md)** / **[vfs](vfs.md)** — async infrastructure.
 - **[lifecycle](lifecycle.md)** / **[log](log.md)** / **[config](config.md)** — ops glue.
-- **[Roadmap & design decisions](roadmap.md)** — the Go → Rust translation rationale.
+- **[Crate README](../crates/ferroly/README.md)** — security posture and what is deliberately not included.
 
 Every page follows the same shape: overview → enabling → quick start → full API
 reference → in-depth feature sections with examples → error handling →

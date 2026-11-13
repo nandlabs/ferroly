@@ -17,48 +17,127 @@ lenient, so **read the "Changed" section before upgrading**.
 
 ### Added
 
-<!-- ADDED -->
-- **genai**: streaming is a sequence of typed events —
-  `CompletionChunk::{Start, TextDelta, ReasoningDelta, ToolCallDelta,
-  ProviderData, Usage, Done}` — with `StreamAccumulator` / `collect_stream` to
-  fold a stream into a `CompletionResponse`.
-- **genai**: specific errors — `GenAiError::{RateLimited, Auth, Timeout,
-  ContentFilter, ContextLengthExceeded, Overloaded}` — with `Retry-After` parsed,
-  rate-limit headers kept, and helpers `status()`, `retry_after()`,
-  `is_transient()`, `is_caller_error()`, `kind_label()`, `error_class()`.
-- **genai**: `FinishReason` (with the provider's string in `raw_finish_reason`),
-  `Grounding` / `Citation`, and `CompletionResponse::{id, reasoning,
-  tool_calls(), is_truncated(), decode_value()}`.
-- **genai**: more typed options — `stop`, `seed`, `top_k`, `presence_penalty`,
-  `frequency_penalty`, `user`, `parallel_tool_calls`, `reasoning_effort`,
-  `prompt_cache` — plus `ResponseFormat::Schema` / `strict_schema` and
-  `ToolDefinition::strict`.
-- **genai**: `ProviderOptions` gains timeouts (`connect`, `response`,
-  `stream_idle`, `total`), a custom `AuthProvider` for every provider, extra
-  headers, proxy and TLS passthrough, a ready-made `http::Client`, optional retry,
-  an observer, and body-size caps.
-- **genai**: `OpenAiConfig` for OpenAI-compatible servers and Azure OpenAI;
-  `ClaudeProviderConfig` builder (API version, beta headers,
-  `omit_sampling_params`, `default_max_tokens`).
-- **genai**: usage reports cached, cache-write and reasoning tokens;
-  `ModelInfo::cost_for(&usage)` computes the cost of a call.
-- **genai**: `GenAiObserver` hook with adapters `ObsObserver` (`obs`),
-  `MetricsObserver` (`metrics`) and `LogObserver` (`log`), plus `redact_payload`.
-- **genai**: `MockProvider` — a scripted provider and embedder that records
-  requests, for tests.
-- **genai**: embeddings accept `dimensions` and `user`; large inputs are batched
-  automatically with order preserved. `genai::rag::RagIndex` (feature
-  `vectorstore`) — embed-and-upsert and query-by-text.
-- **genai**: prompt templates gain `{{#if}}` / `{{#unless}}` / `{{#each}}`,
-  `{{> partial}}`, comments, a `\{{` escape, a compiled `Template` with strict
-  rendering, versions, and `InMemoryPromptStore::load_dir`.
-- **genai** (router): `RouterBuilder::from_config`, cumulative budgets (`Budget`,
-  `BudgetStore`, `InMemoryBudgetStore`), sticky routing, `RouteReport` with
-  estimated vs actual cost, tag-based rules, `rank_overrides`, `default_model`,
-  shared `CircuitBreakerRegistry`, `fallback_on_timeout`,
-  `GenAiProvider::model_info_for(model)`.
-- **genai** (router): `ModelInfo` carries `quality_rank`, `speed_rank`, cache
-  prices and an `as_of` date; stale compiled-in prices are reported once.
+- **codec**: `codec::Limits` — one parser budget (nesting depth, input size, entry
+  count) enforced by the JSON, XML, YAML and TOML parsers. Every entry point has a
+  `*_with(…, limits)` twin, plus `codec::decode_with`; the plain entry points use
+  the defaults (depth 128, 64 MiB, 10,000,000 entries). Exceeding a limit is
+  `CodecError::LimitExceeded`.
+- **codec**: parse errors in all four formats report the line and column.
+- **codec**: `json::encode_pretty` / `json::to_string_pretty`; `try_encode` for
+  JSON, XML and TOML and `codec::try_encode`, which fail with
+  `CodecError::Unrepresentable` instead of writing a fallback.
+- **codec**: `Encode`/`Decode` for tuples (up to 12), `[T; N]`,
+  `BTreeMap<String, V>`, `HashSet`, `BTreeSet`, `Rc`, `Arc`, `Cow`, `i128`/`u128`,
+  `Duration`, `PathBuf`, and the `std::net` address types; `Encode` for `[T]`,
+  `&T`, `Path`.
+- **codec**: `Value::pointer` / `pointer_mut` (JSON Pointer), `get_mut`,
+  `get_index_mut`, `as_object_mut`, `as_array_mut`, `merge` (deep merge) and
+  `take`; `codec::ValueDecoder` and `codec::from_value_strict` to decode a `Value`
+  without string-to-scalar coercion.
+- **codec**: TOML multi-line basic (`"""`) and literal (`'''`) strings. YAML flow
+  collections, block scalars (`|`, `>`), compact sequence items, sequences at the
+  indentation of their key, trailing comments, and the full set of quoted-string
+  escapes. XML CDATA sections; empty strings, padded strings, nested arrays, empty
+  maps and `vec![None]` now round-trip. Schema `type` may be an array of names.
+- **derive**: `#[derive(Encode)]` / `#[derive(Decode)]` support generic types —
+  type parameters, lifetimes, const parameters and where-clauses. Each type
+  parameter used by an encoded field gets an `Encode` / `Decode` bound; override
+  with `#[ferroly(bound = "...")]` or `#[ferroly(bound(encode = "...", decode = "..."))]`.
+- **derive**: tuple structs (encoded as an array), newtype structs (transparent:
+  just the inner value) and unit structs (`null`).
+- **derive**: enums with data — newtype, tuple and struct variants. Externally
+  tagged by default (`{"Variant": content}`; unit variants stay a plain string);
+  `#[ferroly(tag = "...")]` selects the internally tagged form and
+  `#[ferroly(untagged)]` the untagged one.
+- **derive**: field attributes `#[ferroly(default)]` / `#[ferroly(default = "path")]`,
+  `#[ferroly(skip)]`, `#[ferroly(alias = "...")]` (repeatable, decode only) and
+  `#[ferroly(flatten)]`; container attribute `#[ferroly(deny_unknown_fields)]`;
+  variant-level `alias` and `rename_all`; `rename_all = "SCREAMING-KEBAB-CASE"`.
+- **derive**: `#[derive(FerrolyError)]` supports generic error types, `#[from]` on
+  a named single-field variant or struct, `Option<E>` sources, raw-identifier
+  fields in format strings, fields as width/precision arguments (`{0:>1$}`), and
+  an enum-level `#[error("...")]` fallback.
+- **errutils**: `.context("…")` / `.with_context(|| …)` on any `Result` or `Option`
+  (`Context` trait, `ContextError`), keeping the original error as `source()`;
+  `chain()` to walk an error chain.
+- **errutils**: `Classify` trait and `ErrorKind` (`is_retryable()`,
+  `is_user_error()`, `http_status()`), implemented for `std::io::Error`,
+  `ContextError`, `MultiError`, `ConfigError`, `CliError` and `ferroly::Error`.
+- **errutils**: `MultiError` implements `IntoIterator`, `FromIterator`,
+  `From<Vec<_>>` and a generic `Extend`, and gains `iter()`, `first()` and
+  `into_errors()`.
+- **config**: optional files (`merge_file_optional`) and profile overlays
+  (`merge_profile("config/app", "prod")`).
+- **config**: opt-in `${VAR}` / `${VAR:-default}` interpolation from config keys
+  and the environment, with cycle detection (`ConfigBuilder::interpolate`).
+- **config**: `merge_env_with` + `EnvOptions`: secrets from files
+  (`APP_DB__PASSWORD_FILE=/run/secrets/…`), list values, and case-insensitive key
+  matching so camelCase keys are reachable from the environment.
+- **config**: `Config::require` (reports every missing key),
+  `Config::validate_schema`, `Config::contains`.
+- **config**: provenance (`Config::source`, `Config::sources`) and a redacted dump
+  of the effective configuration (`Config::to_redacted_string`).
+- **config**: `SharedConfig`, a clonable handle with stable snapshots and manual
+  `reload()`.
+- **config**: `merge_cli` / `merge_cli_defaults` to feed a parsed `ferroly::cli`
+  command line into the builder (with the `cli` feature).
+- **cli**: repeatable and delimited options (`multiple`, `delimiter`, `get_all`),
+  counters (`count`, `-vvv`), `choices`, parse-time `validator` / `typed::<T>()`,
+  flag and subcommand aliases, mutually exclusive and required-together groups
+  (`Group`), named and variadic positionals, global flags (`Arg::global`),
+  `subcommand_required`.
+- **cli**: `--version` / `-V`, "did you mean" suggestions, help that lists
+  positionals, shows the parent command path and wraps long descriptions.
+- **cli**: exit-code helpers (`CliError::exit_code`, `Command::parse_or_exit`,
+  `Command::run`) and bash/zsh completion scripts (`Command::completions`).
+- **hash**: `Sha512` and `Sha384`; a generic `Hmac<H>` with `HmacSha384`,
+  `HmacSha512`, `HmacSha1` and a constant-time `verify`; `Md5` and `Crc32`
+  checksums (not cryptographic); `kdf` with HKDF and PBKDF2; a public `base64`
+  module (standard and URL-safe, padded and unpadded, strict decoding plus an
+  explicit `decode_lenient`); a `hex` module and `Digest::from_hex`; `ct_eq` for
+  constant-time comparison; `Secret`, which redacts itself in `Debug`/`Display`
+  and is wiped on drop (best-effort); and `random` for secure random bytes and
+  tokens (Unix only; other platforms return an explicit error).
+- **auth**: `Validation` with `decode_hs256_with` / `decode_hmac_with`: expiry
+  required by default, leeway, `nbf`/`iat` checks, maximum age, audience, issuer,
+  subject, required claims and `typ`. HS384 and HS512. `encode_hmac` /
+  `encode_with_header` (with `kid`). `decode_header`. A `Scopes` helper for
+  `scope` / `scp` / `roles` claims.
+- **auth** (with `http`): verify-only RS256 and ES256 from JWK / JWKS keys (`Jwk`,
+  `Jwks`) and `RemoteJwks`, a cached key set that follows key rotation.
+- **clients**: an RAII circuit-breaker `Permit` (`try_acquire`, `call`,
+  `call_with`), a failure-rate window, state-change callbacks, metrics, and
+  `CircuitBreakerRegistry`. `Retry` with jitter, a total time limit, a shared
+  `RetryBudget`, and a hook that can honour `Retry-After` (`parse_retry_after`).
+  `Bulkhead`, `RateLimiter`, `with_timeout`, `Deadline`, and `Policy`, which
+  composes them.
+- **clients**: refreshing credentials — `AuthProvider::prepare`, `authorize`,
+  `TokenSource`, `RefreshingAuth` and `OAuth2ClientCredentials`
+  (client-credentials grant).
+- **http**: `Client::builder()` with connect, response-head, read-idle and total
+  timeouts, a response-body size cap (64 MiB by default), connection-pool size and
+  idle expiry, a default `User-Agent`, optional redirect following, forward
+  proxies (absolute-form for `http://`, `CONNECT` tunnels for `https://`, basic
+  auth, opt-in `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`), request/response
+  interceptors, opt-in `gzip`/`deflate` response decompression, and
+  `Client::send_streaming` for uploads from an async reader.
+- **http**: client TLS options (`ClientTlsConfig`): custom CA roots in addition to
+  or instead of the web PKI, client certificates, minimum TLS version.
+- **http**: server TLS options (`TlsConfig::builder()`): mutual TLS (required or
+  optional) and minimum TLS version; `ReloadableTlsConfig` +
+  `serve_tls_reloadable` to rotate certificates without a restart.
+- **http**: `Request::peer_addr()`, `local_addr()`, `is_tls()` and
+  `peer_certificates()` for server handlers.
+- **http**: `ServerConfig` gains `write_timeout`, `idle_timeout`,
+  `handler_timeout`, `keep_alive`, `max_header_bytes`, `max_headers`,
+  `max_line_bytes`, `normalize_paths` and `on_error` (`ErrorHook`).
+- **http**: `RequestBuilder::form`, `Multipart`, `percent_encode`,
+  `percent_decode`, `normalize_path`, `form_urlencode`, `format_http_date`,
+  `Uri::resolve`, `Method::try_parse`, `HeaderMap::get_all` / `remove` / `try_set`
+  / `try_append`, more `StatusCode` constants, `Response::uri` and
+  `Response::set_max_body_bytes`.
+- **http**: new `HttpError` variants `ConnectTimeout`, `BodyTooLarge`,
+  `TooManyRedirects`, `Proxy`, `HandlerPanic`, and `HttpError::is_timeout()`.
 - **turbo**: request-scoped extensions (`ctx.set` / `ctx.get`) and shared state
   (`Router::with_state`, `ctx.state`), so middleware can hand identity to
   handlers; `ctx.route()` returns the matched route template.
@@ -134,99 +213,47 @@ lenient, so **read the "Changed" section before upgrading**.
   `WsClient::close_with`; `close_code` constants.
 - **ws**: `WsObserver` / `WsEvent` for metrics; `WsServer::with_handler`,
   `with_config`, `connections()` and `health()`.
-- **codec**: `codec::Limits` — one parser budget (nesting depth, input size, entry
-  count) enforced by the JSON, XML, YAML and TOML parsers. Every entry point has a
-  `*_with(…, limits)` twin, plus `codec::decode_with`; the plain entry points use
-  the defaults (depth 128, 64 MiB, 10,000,000 entries). Exceeding a limit is
-  `CodecError::LimitExceeded`.
-- **codec**: parse errors in all four formats report the line and column.
-- **codec**: `json::encode_pretty` / `json::to_string_pretty`; `try_encode` for
-  JSON, XML and TOML and `codec::try_encode`, which fail with
-  `CodecError::Unrepresentable` instead of writing a fallback.
-- **codec**: `Encode`/`Decode` for tuples (up to 12), `[T; N]`,
-  `BTreeMap<String, V>`, `HashSet`, `BTreeSet`, `Rc`, `Arc`, `Cow`, `i128`/`u128`,
-  `Duration`, `PathBuf`, and the `std::net` address types; `Encode` for `[T]`,
-  `&T`, `Path`.
-- **codec**: `Value::pointer` / `pointer_mut` (JSON Pointer), `get_mut`,
-  `get_index_mut`, `as_object_mut`, `as_array_mut`, `merge` (deep merge) and
-  `take`; `codec::ValueDecoder` and `codec::from_value_strict` to decode a `Value`
-  without string-to-scalar coercion.
-- **codec**: TOML multi-line basic (`"""`) and literal (`'''`) strings. YAML flow
-  collections, block scalars (`|`, `>`), compact sequence items, sequences at the
-  indentation of their key, trailing comments, and the full set of quoted-string
-  escapes. XML CDATA sections; empty strings, padded strings, nested arrays, empty
-  maps and `vec![None]` now round-trip. Schema `type` may be an array of names.
-- **fuzz**: a `toml_parse` fuzz target and a committed seed corpus for every
-  target; a weekly CI fuzz run.
-- **http**: `Client::builder()` with connect, response-head, read-idle and total
-  timeouts, a response-body size cap (64 MiB by default), connection-pool size and
-  idle expiry, a default `User-Agent`, optional redirect following, forward
-  proxies (absolute-form for `http://`, `CONNECT` tunnels for `https://`, basic
-  auth, opt-in `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`), request/response
-  interceptors, opt-in `gzip`/`deflate` response decompression, and
-  `Client::send_streaming` for uploads from an async reader.
-- **http**: client TLS options (`ClientTlsConfig`): custom CA roots in addition to
-  or instead of the web PKI, client certificates, minimum TLS version.
-- **http**: server TLS options (`TlsConfig::builder()`): mutual TLS (required or
-  optional) and minimum TLS version; `ReloadableTlsConfig` +
-  `serve_tls_reloadable` to rotate certificates without a restart.
-- **http**: `Request::peer_addr()`, `local_addr()`, `is_tls()` and
-  `peer_certificates()` for server handlers.
-- **http**: `ServerConfig` gains `write_timeout`, `idle_timeout`,
-  `handler_timeout`, `keep_alive`, `max_header_bytes`, `max_headers`,
-  `max_line_bytes`, `normalize_paths` and `on_error` (`ErrorHook`).
-- **http**: `RequestBuilder::form`, `Multipart`, `percent_encode`,
-  `percent_decode`, `normalize_path`, `form_urlencode`, `format_http_date`,
-  `Uri::resolve`, `Method::try_parse`, `HeaderMap::get_all` / `remove` / `try_set`
-  / `try_append`, more `StatusCode` constants, `Response::uri` and
-  `Response::set_max_body_bytes`.
-- **http**: new `HttpError` variants `ConnectTimeout`, `BodyTooLarge`,
-  `TooManyRedirects`, `Proxy`, `HandlerPanic`, and `HttpError::is_timeout()`.
-- **hash**: `Sha512` and `Sha384`; a generic `Hmac<H>` with `HmacSha384`,
-  `HmacSha512`, `HmacSha1` and a constant-time `verify`; `Md5` and `Crc32`
-  checksums (not cryptographic); `kdf` with HKDF and PBKDF2; a public `base64`
-  module (standard and URL-safe, padded and unpadded, strict decoding plus an
-  explicit `decode_lenient`); a `hex` module and `Digest::from_hex`; `ct_eq` for
-  constant-time comparison; `Secret`, which redacts itself in `Debug`/`Display`
-  and is wiped on drop (best-effort); and `random` for secure random bytes and
-  tokens (Unix only; other platforms return an explicit error).
-- **auth**: `Validation` with `decode_hs256_with` / `decode_hmac_with`: expiry
-  required by default, leeway, `nbf`/`iat` checks, maximum age, audience, issuer,
-  subject, required claims and `typ`. HS384 and HS512. `encode_hmac` /
-  `encode_with_header` (with `kid`). `decode_header`. A `Scopes` helper for
-  `scope` / `scp` / `roles` claims.
-- **auth** (with `http`): verify-only RS256 and ES256 from JWK / JWKS keys (`Jwk`,
-  `Jwks`) and `RemoteJwks`, a cached key set that follows key rotation.
-- **clients**: an RAII circuit-breaker `Permit` (`try_acquire`, `call`,
-  `call_with`), a failure-rate window, state-change callbacks, metrics, and
-  `CircuitBreakerRegistry`. `Retry` with jitter, a total time limit, a shared
-  `RetryBudget`, and a hook that can honour `Retry-After` (`parse_retry_after`).
-  `Bulkhead`, `RateLimiter`, `with_timeout`, `Deadline`, and `Policy`, which
-  composes them.
-- **clients**: refreshing credentials — `AuthProvider::prepare`, `authorize`,
-  `TokenSource`, `RefreshingAuth` and `OAuth2ClientCredentials`
-  (client-credentials grant).
-- **rt**: the `rt-test-util` feature re-exports the paused test clock
-  (`rt::time::{pause, advance, resume}`).
-- **fsutils**: `write_atomic` / `AtomicFile` (temporary sibling, fsync, rename);
-  `TempDir` / `TempFile` (unique names, removed on drop); `LockFile`, an advisory
-  create-new lock file; `Mmap::map`, `Mmap::map_supported`, `Mmap::is_mapped`.
-  Far broader content-type coverage: Office, AVIF/HEIC, JSONL, Parquet, protobuf,
-  fonts and archives by extension; mp4/`ftyp` family, RIFF variants, tar, zstd,
-  xz, bzip2, 7z, fonts and text/HTML/XML/JSON by content.
-- **vfs**: `LocalFs::rooted(dir)` confines every path to one directory (`..`,
-  absolute paths and escaping symlinks are rejected). `MemoryFs` in-memory
-  backend. `VfsRegistry` routes URLs to backends by scheme and copies across them.
-  `Vfs::create` returns a streaming `VfsWriter` published atomically on `finish`.
-  `Vfs::append`, `Vfs::list_page`, `copy_between`, `glob` / `glob_match`,
-  `checksum_sha256` (with `hash`). `Metadata` reports modified and created times,
-  read-only, Unix mode and symlinks.
-- **rt**: `CancellationToken`, `TaskTracker`, `shutdown_signal()`. Declarative
-  `async_test!` / `async_main!` that need no `tokio` dependency.
-  `#[ferroly::rt::main]`. Re-exports for `fs`, `process`, `task_local!`,
-  `LocalSet` / `spawn_local`, `AbortHandle`, `UdpSocket`, Unix sockets,
-  `OnceCell`, `Barrier`, `runtime::Handle`, `MissedTickBehavior`,
-  `io::{split, duplex}`.
+- **genai**: streaming is a sequence of typed events —
+  `CompletionChunk::{Start, TextDelta, ReasoningDelta, ToolCallDelta,
+  ProviderData, Usage, Done}` — with `StreamAccumulator` / `collect_stream` to
+  fold a stream into a `CompletionResponse`.
+- **genai**: specific errors — `GenAiError::{RateLimited, Auth, Timeout,
+  ContentFilter, ContextLengthExceeded, Overloaded}` — with `Retry-After` parsed,
+  rate-limit headers kept, and helpers `status()`, `retry_after()`,
+  `is_transient()`, `is_caller_error()`, `kind_label()`, `error_class()`.
+- **genai**: `FinishReason` (with the provider's string in `raw_finish_reason`),
+  `Grounding` / `Citation`, and `CompletionResponse::{id, reasoning,
+  tool_calls(), is_truncated(), decode_value()}`.
+- **genai**: more typed options — `stop`, `seed`, `top_k`, `presence_penalty`,
+  `frequency_penalty`, `user`, `parallel_tool_calls`, `reasoning_effort`,
+  `prompt_cache` — plus `ResponseFormat::Schema` / `strict_schema` and
+  `ToolDefinition::strict`.
+- **genai**: `ProviderOptions` gains timeouts (`connect`, `response`,
+  `stream_idle`, `total`), a custom `AuthProvider` for every provider, extra
+  headers, proxy and TLS passthrough, a ready-made `http::Client`, optional retry,
+  an observer, and body-size caps.
+- **genai**: `OpenAiConfig` for OpenAI-compatible servers and Azure OpenAI;
+  `ClaudeProviderConfig` builder (API version, beta headers,
+  `omit_sampling_params`, `default_max_tokens`).
+- **genai**: usage reports cached, cache-write and reasoning tokens;
+  `ModelInfo::cost_for(&usage)` computes the cost of a call.
+- **genai**: `GenAiObserver` hook with adapters `ObsObserver` (`obs`),
+  `MetricsObserver` (`metrics`) and `LogObserver` (`log`), plus `redact_payload`.
+- **genai**: `MockProvider` — a scripted provider and embedder that records
+  requests, for tests.
+- **genai**: embeddings accept `dimensions` and `user`; large inputs are batched
+  automatically with order preserved. `genai::rag::RagIndex` (feature
+  `vectorstore`) — embed-and-upsert and query-by-text.
+- **genai**: prompt templates gain `{{#if}}` / `{{#unless}}` / `{{#each}}`,
+  `{{> partial}}`, comments, a `\{{` escape, a compiled `Template` with strict
+  rendering, versions, and `InMemoryPromptStore::load_dir`.
+- **genai** (router): `RouterBuilder::from_config`, cumulative budgets (`Budget`,
+  `BudgetStore`, `InMemoryBudgetStore`), sticky routing, `RouteReport` with
+  estimated vs actual cost, tag-based rules, `rank_overrides`, `default_model`,
+  shared `CircuitBreakerRegistry`, `fallback_on_timeout`,
+  `GenAiProvider::model_info_for(model)`.
+- **genai** (router): `ModelInfo` carries `quality_rank`, `speed_rank`, cache
+  prices and an `as_of` date; stale compiled-in prices are reported once.
 - **vectorstore**: metadata `Filter`s and `min_score` on `Query`; namespaces
   (`MemoryStore::namespace`) for tenant isolation; `get`, `count`, `delete_where`,
   `list`; JSON snapshots (`save` / `load`); `*_sync` methods; `Chunker` for
@@ -259,60 +286,27 @@ lenient, so **read the "Changed" section before upgrading**.
   deliver, `queue_depth`, `pending`; `ProviderRegistry`; `Provider::close`,
   `Receiver::remove_listeners`, `MessagingError::backend` for external provider
   implementations.
-- **errutils**: `.context("…")` / `.with_context(|| …)` on any `Result` or `Option`
-  (`Context` trait, `ContextError`), keeping the original error as `source()`;
-  `chain()` to walk an error chain.
-- **errutils**: `Classify` trait and `ErrorKind` (`is_retryable()`,
-  `is_user_error()`, `http_status()`), implemented for `std::io::Error`,
-  `ContextError`, `MultiError`, `ConfigError`, `CliError` and `ferroly::Error`.
-- **errutils**: `MultiError` implements `IntoIterator`, `FromIterator`,
-  `From<Vec<_>>` and a generic `Extend`, and gains `iter()`, `first()` and
-  `into_errors()`.
-- **`ferroly::Error`**: `?` now works for `vfs::VfsError`, `cli::CliError`,
-  `genai::RouterError`, `rt::JoinError`, `errutils::MultiError` and
-  `errutils::ContextError`.
-- **config**: optional files (`merge_file_optional`) and profile overlays
-  (`merge_profile("config/app", "prod")`).
-- **config**: opt-in `${VAR}` / `${VAR:-default}` interpolation from config keys
-  and the environment, with cycle detection (`ConfigBuilder::interpolate`).
-- **config**: `merge_env_with` + `EnvOptions`: secrets from files
-  (`APP_DB__PASSWORD_FILE=/run/secrets/…`), list values, and case-insensitive key
-  matching so camelCase keys are reachable from the environment.
-- **config**: `Config::require` (reports every missing key),
-  `Config::validate_schema`, `Config::contains`.
-- **config**: provenance (`Config::source`, `Config::sources`) and a redacted dump
-  of the effective configuration (`Config::to_redacted_string`).
-- **config**: `SharedConfig`, a clonable handle with stable snapshots and manual
-  `reload()`.
-- **config**: `merge_cli` / `merge_cli_defaults` to feed a parsed `ferroly::cli`
-  command line into the builder (with the `cli` feature).
-- **cli**: repeatable and delimited options (`multiple`, `delimiter`, `get_all`),
-  counters (`count`, `-vvv`), `choices`, parse-time `validator` / `typed::<T>()`,
-  flag and subcommand aliases, mutually exclusive and required-together groups
-  (`Group`), named and variadic positionals, global flags (`Arg::global`),
-  `subcommand_required`.
-- **cli**: `--version` / `-V`, "did you mean" suggestions, help that lists
-  positionals, shows the parent command path and wraps long descriptions.
-- **cli**: exit-code helpers (`CliError::exit_code`, `Command::parse_or_exit`,
-  `Command::run`) and bash/zsh completion scripts (`Command::completions`).
-- **derive**: `#[derive(Encode)]` / `#[derive(Decode)]` support generic types —
-  type parameters, lifetimes, const parameters and where-clauses. Each type
-  parameter used by an encoded field gets an `Encode` / `Decode` bound; override
-  with `#[ferroly(bound = "...")]` or `#[ferroly(bound(encode = "...", decode = "..."))]`.
-- **derive**: tuple structs (encoded as an array), newtype structs (transparent:
-  just the inner value) and unit structs (`null`).
-- **derive**: enums with data — newtype, tuple and struct variants. Externally
-  tagged by default (`{"Variant": content}`; unit variants stay a plain string);
-  `#[ferroly(tag = "...")]` selects the internally tagged form and
-  `#[ferroly(untagged)]` the untagged one.
-- **derive**: field attributes `#[ferroly(default)]` / `#[ferroly(default = "path")]`,
-  `#[ferroly(skip)]`, `#[ferroly(alias = "...")]` (repeatable, decode only) and
-  `#[ferroly(flatten)]`; container attribute `#[ferroly(deny_unknown_fields)]`;
-  variant-level `alias` and `rename_all`; `rename_all = "SCREAMING-KEBAB-CASE"`.
-- **derive**: `#[derive(FerrolyError)]` supports generic error types, `#[from]` on
-  a named single-field variant or struct, `Option<E>` sources, raw-identifier
-  fields in format strings, fields as width/precision arguments (`{0:>1$}`), and
-  an enum-level `#[error("...")]` fallback.
+- **vfs**: `LocalFs::rooted(dir)` confines every path to one directory (`..`,
+  absolute paths and escaping symlinks are rejected). `MemoryFs` in-memory
+  backend. `VfsRegistry` routes URLs to backends by scheme and copies across them.
+  `Vfs::create` returns a streaming `VfsWriter` published atomically on `finish`.
+  `Vfs::append`, `Vfs::list_page`, `copy_between`, `glob` / `glob_match`,
+  `checksum_sha256` (with `hash`). `Metadata` reports modified and created times,
+  read-only, Unix mode and symlinks.
+- **fsutils**: `write_atomic` / `AtomicFile` (temporary sibling, fsync, rename);
+  `TempDir` / `TempFile` (unique names, removed on drop); `LockFile`, an advisory
+  create-new lock file; `Mmap::map`, `Mmap::map_supported`, `Mmap::is_mapped`.
+  Far broader content-type coverage: Office, AVIF/HEIC, JSONL, Parquet, protobuf,
+  fonts and archives by extension; mp4/`ftyp` family, RIFF variants, tar, zstd,
+  xz, bzip2, 7z, fonts and text/HTML/XML/JSON by content.
+- **rt**: the `rt-test-util` feature re-exports the paused test clock
+  (`rt::time::{pause, advance, resume}`).
+- **rt**: `CancellationToken`, `TaskTracker`, `shutdown_signal()`. Declarative
+  `async_test!` / `async_main!` that need no `tokio` dependency.
+  `#[ferroly::rt::main]`. Re-exports for `fs`, `process`, `task_local!`,
+  `LocalSet` / `spawn_local`, `AbortHandle`, `UdpSocket`, Unix sockets,
+  `OnceCell`, `Barrier`, `runtime::Handle`, `MissedTickBehavior`,
+  `io::{split, duplex}`.
 - **log**: several sinks per logger, each with its own format and minimum level
   (`Sink`, `Logger::add_sink` / `to_sink`); a blocking overflow policy for the
   non-blocking appender (`Overflow::Block`); `RotatingFile` (size and daily
@@ -337,33 +331,100 @@ lenient, so **read the "Changed" section before upgrading**.
   exporters and `obs::shutdown()`; semantic-convention helpers (`obs::http`,
   `obs::messaging`, `obs::genai`); an `OtlpHttpExporter::builder` with headers,
   timeout, batch and queue sizes, retries and statistics.
+- **fuzz**: a `toml_parse` fuzz target and a committed seed corpus for every
+  target; a weekly CI fuzz run.
+- **`ferroly::Error`**: `?` now works for `vfs::VfsError`, `cli::CliError`,
+  `genai::RouterError`, `rt::JoinError`, `errutils::MultiError` and
+  `errutils::ContextError`.
+- **build**: each crate now ships its `LICENSE-APACHE` and `LICENSE-MIT` files.
+  Each `ferroly` feature enables only the `tokio` features it needs; `rt` is the
+  one feature that enables all of tokio.
 
 ### Changed
 
-<!-- CHANGED -->
-- **genai (breaking)**: `CompletionChunk` is an enum (use `chunk.text()` instead
-  of `chunk.delta`); `CompletionResponse` is `#[non_exhaustive]` and its
-  `finish_reason` is `Option<FinishReason>`; `MessagePart` and `ResponseFormat`
-  are `#[non_exhaustive]`; several structs gained fields; `ClaudeProviderConfig`
-  is built with `new` / `with_auth`.
-- **genai (breaking)**: provider failures map to the new error variants (a `429`
-  is `RateLimited`, `401`/`403` is `Auth`, a timeout is `Timeout`) instead of
-  `Api` / `Transport`.
-- **genai**: default timeouts suit model calls — 10 s connect, 10 min until the
-  response starts, 5 min stream idle.
-- **genai**: OpenAI requests send `max_completion_tokens`; streamed requests ask
-  for usage. Ollama sends and parses tools.
-- **genai**: the Claude catalog lists current models; when `max_tokens` is unset
-  the provider derives it from the catalog instead of sending 1024.
-  `ResponseFormat::Json` on Claude returns `Unsupported` (use a schema).
-- **genai**: rendering through `Template`, `PromptTemplate::render_strict`,
-  `InMemoryPromptStore::render` and `Message::from_prompt` is strict; the existing
-  `render` functions stay lenient. `{{ . }}` no longer renders the whole variables
-  object.
-- **genai** (router): `Priority::Quality` and `Priority::Speed` rank by explicit
-  ranks; routing configuration is parsed strictly; a completion that timed out
-  after it was sent is no longer retried or failed over by default; when every
-  breaker is open the error is `RouterError::CircuitOpen`.
+- **codec (breaking)**: JSON and TOML decode strictly — a string is no longer
+  accepted where a number or bool is expected (`"42"` is not an integer). XML,
+  YAML and `Decode::decode(&Value)` keep the lenient behaviour that text-only
+  sources need.
+- **codec (breaking)**: a float decodes into an integer type only when it is a
+  whole number that fits; `1.9` and `1e300` are now errors rather than `1` and
+  `u64::MAX`.
+- **codec**: JSON follows RFC 8259 — `01`, `1.`, `-.5`, numbers that overflow to
+  infinity, and raw control characters inside strings are rejected.
+- **codec (breaking)**: YAML is a strict subset of YAML 1.2 — anchors, aliases,
+  tags, directives, explicit keys, a second `---` document and any line the parser
+  cannot place are errors. Plain scalars follow the core schema (`inf`/`nan` are
+  strings; `.inf`/`.nan`, `True`, `0x1F`, `0o17` resolve). Output: floats keep a
+  `.0`, non-finite floats are `.inf`/`.nan`, empty top-level collections are
+  `{}`/`[]`, bytes are a flow sequence.
+- **codec**: XML output — `null` is `<a/>`; empty arrays, nested arrays, empty
+  objects and empty or padded strings carry a `type` or `xml:space` attribute; map
+  keys that are not XML names are escaped as `_xHHHH_`. XML input — content after
+  the root element, mixed content and `DOCTYPE` are errors; literal CR/CRLF is
+  normalized to LF.
+- **codec**: TOML input — bare words, malformed numbers, a table defined twice, a
+  lone carriage return and raw control characters are errors; CRLF inside a
+  multi-line string decodes to LF.
+- **codec**: schema `"integer"` accepts whole floats; `const`/`enum` compare
+  numbers by value and objects without regard to member order; a `type` keyword
+  that cannot be interpreted is a violation.
+- **codec**: `impl Encode for &str` is now the blanket
+  `impl<T: Encode + ?Sized> Encode for &T`. `CodecError` gained `LimitExceeded`
+  and `Unrepresentable`. Inputs over 64 MiB or 10,000,000 entries are rejected by
+  default.
+- **derive**: `rename_all` treats an acronym as one word: `HTTPServer` becomes
+  `http_server` / `httpServer` / `HttpServer` (was `h_t_t_p_server` / `hTTPServer`
+  / `HTTPServer`). Ordinary snake_case fields and PascalCase variants are
+  unaffected. Use `rename` to keep an old key.
+- **derive**: now compile errors instead of being ignored — an unknown
+  `rename_all` rule, a repeated `#[ferroly(...)]` key, a field-only key on a
+  variant, two fields or variants that map to the same key, `#[from]` on a struct
+  or variant with more than one field, and misplaced `#[from]` / `#[source]` /
+  `#[error]` attributes.
+- **derive**: derived `encode_to` passes the exact number of entries to
+  `Encoder::begin_map` (fields omitted by `skip_none` are no longer counted).
+- **errutils**: `MultiError::source()` returns the first collected error.
+- **config**: `merge_args` no longer guesses that the token after `--flag` is its
+  value. It is taken as the value only when an earlier layer shows the key holds a
+  non-boolean value; otherwise the flag is a switch. `--key=value` always works,
+  and `--` ends flag processing.
+- **config**: a malformed config file is reported as
+  `ConfigError::Parse { path, message }` and a failed `get` conversion as
+  `ConfigError::InvalidValue { key, source }` (both were `ConfigError::Codec`).
+  I/O errors now name the file. `ConfigError` has further new variants.
+- **cli**: positional arguments the command does not declare are rejected
+  (`CliError::UnexpectedArgument`); declare a `variadic()` positional to accept
+  any number.
+- **cli**: `CliError::UnknownFlag` has a new `suggestion` field; `CliError` has new
+  variants; `.env()` / `.default()` now apply to switches and positionals; help
+  layout changed.
+- **hash**: `HmacSha256` is now an alias for `Hmac<Sha256>` (same methods).
+- **auth**: `decode_hs256` parses strictly. It rejects non-canonical or padded
+  base64url, claims or headers that are not JSON objects, duplicate member names,
+  a `crit` header, empty secrets, secrets that are public keys, and tokens over
+  64 KiB. Tokens from issuers that pad base64url no longer verify. `JwtError` has
+  new variants and is `Clone`.
+- **clients**: the `clients` feature now enables `hash` and `codec`. `BearerAuth`,
+  `ApiKeyAuth` and `BasicAuth` no longer show their credentials in `Debug`. A
+  `CircuitBreakerConfig` with `max_half_open: 0` now allows one trial.
+- **http** server: malformed requests are answered
+  (`400`/`408`/`413`/`414`/`417`/`431`/`501`/`505`) and the connection closed.
+  HTTP/1.1 requests need exactly one `Host` header; HTTP/1.0 connections close
+  unless the client asks for keep-alive; responses carry a `Date` header; the
+  server sets `Content-Length`/`Transfer-Encoding` itself; `100 Continue` is sent
+  only after the size check. A client reading slower than the write timeout
+  (30 s per 64 KiB by default) is disconnected.
+- **http** client: `Uri::parse` rejects control characters, spaces and userinfo,
+  drops the `#fragment`, and accepts bracketed IPv6 literals. Response bodies are
+  capped at 64 MiB and body reads time out after 300 s idle by default.
+  `Response::chunk` returns pieces of at most 16 KiB. A `User-Agent` is sent by
+  default.
+- **http**: `HeaderMap::set`/`append` strip every character that is not valid in a
+  header name and all control characters from values; `content_length()` and
+  `is_chunked()` are strict.
+- **http (breaking)**: `Request` can no longer be built with a struct literal (use
+  `Request::new` / `Request::builder`); build `ServerConfig` with
+  `..ServerConfig::default()`.
 - **turbo (breaking)**: the request path is normalised before routing. `//x`, a
   path without a leading `/`, malformed percent-escapes and encoded control
   characters are answered `400`; dot segments are resolved; `ctx.path()` returns
@@ -406,75 +467,29 @@ lenient, so **read the "Changed" section before upgrading**.
   `WsError::Rejected { status }`, and sending on a closed connection is
   `WsError::Closed`. `WsServer::start` on a running server returns
   `ComponentAlreadyStarted` instead of replacing it.
-- **codec (breaking)**: JSON and TOML decode strictly — a string is no longer
-  accepted where a number or bool is expected (`"42"` is not an integer). XML,
-  YAML and `Decode::decode(&Value)` keep the lenient behaviour that text-only
-  sources need.
-- **codec (breaking)**: a float decodes into an integer type only when it is a
-  whole number that fits; `1.9` and `1e300` are now errors rather than `1` and
-  `u64::MAX`.
-- **codec**: JSON follows RFC 8259 — `01`, `1.`, `-.5`, numbers that overflow to
-  infinity, and raw control characters inside strings are rejected.
-- **codec (breaking)**: YAML is a strict subset of YAML 1.2 — anchors, aliases,
-  tags, directives, explicit keys, a second `---` document and any line the parser
-  cannot place are errors. Plain scalars follow the core schema (`inf`/`nan` are
-  strings; `.inf`/`.nan`, `True`, `0x1F`, `0o17` resolve). Output: floats keep a
-  `.0`, non-finite floats are `.inf`/`.nan`, empty top-level collections are
-  `{}`/`[]`, bytes are a flow sequence.
-- **codec**: XML output — `null` is `<a/>`; empty arrays, nested arrays, empty
-  objects and empty or padded strings carry a `type` or `xml:space` attribute; map
-  keys that are not XML names are escaped as `_xHHHH_`. XML input — content after
-  the root element, mixed content and `DOCTYPE` are errors; literal CR/CRLF is
-  normalized to LF.
-- **codec**: TOML input — bare words, malformed numbers, a table defined twice, a
-  lone carriage return and raw control characters are errors; CRLF inside a
-  multi-line string decodes to LF.
-- **codec**: schema `"integer"` accepts whole floats; `const`/`enum` compare
-  numbers by value and objects without regard to member order; a `type` keyword
-  that cannot be interpreted is a violation.
-- **codec**: `impl Encode for &str` is now the blanket
-  `impl<T: Encode + ?Sized> Encode for &T`. `CodecError` gained `LimitExceeded`
-  and `Unrepresentable`. Inputs over 64 MiB or 10,000,000 entries are rejected by
-  default.
-- **http** server: malformed requests are answered
-  (`400`/`408`/`413`/`414`/`417`/`431`/`501`/`505`) and the connection closed.
-  HTTP/1.1 requests need exactly one `Host` header; HTTP/1.0 connections close
-  unless the client asks for keep-alive; responses carry a `Date` header; the
-  server sets `Content-Length`/`Transfer-Encoding` itself; `100 Continue` is sent
-  only after the size check. A client reading slower than the write timeout
-  (30 s per 64 KiB by default) is disconnected.
-- **http** client: `Uri::parse` rejects control characters, spaces and userinfo,
-  drops the `#fragment`, and accepts bracketed IPv6 literals. Response bodies are
-  capped at 64 MiB and body reads time out after 300 s idle by default.
-  `Response::chunk` returns pieces of at most 16 KiB. A `User-Agent` is sent by
-  default.
-- **http**: `HeaderMap::set`/`append` strip every character that is not valid in a
-  header name and all control characters from values; `content_length()` and
-  `is_chunked()` are strict.
-- **http (breaking)**: `Request` can no longer be built with a struct literal (use
-  `Request::new` / `Request::builder`); build `ServerConfig` with
-  `..ServerConfig::default()`.
-- **auth**: `decode_hs256` parses strictly. It rejects non-canonical or padded
-  base64url, claims or headers that are not JSON objects, duplicate member names,
-  a `crit` header, empty secrets, secrets that are public keys, and tokens over
-  64 KiB. Tokens from issuers that pad base64url no longer verify. `JwtError` has
-  new variants and is `Clone`.
-- **hash**: `HmacSha256` is now an alias for `Hmac<Sha256>` (same methods).
-- **clients**: the `clients` feature now enables `hash` and `codec`. `BearerAuth`,
-  `ApiKeyAuth` and `BasicAuth` no longer show their credentials in `Debug`. A
-  `CircuitBreakerConfig` with `max_half_open: 0` now allows one trial.
-- **build**: the minimum `tokio` version is 1.38.
-- **fsutils (breaking)**: `Mmap::open` now reads the file into memory and is sound
-  against concurrent changes to the file. The zero-copy OS mapping is the new
-  `unsafe fn Mmap::map`, and is a real mapping only on 64-bit Linux, Android,
-  macOS, iOS and the BSDs. `sniff` and `detect_content_type` now recognize text
-  (plain, JSON, HTML, XML) where they returned nothing.
-- **vfs (breaking)**: `LocalFs` rejects URL schemes other than `file://` instead
-  of stripping them. `write` replaces files atomically and refuses read-only
-  destinations. `Metadata` is `#[non_exhaustive]` — build it with
-  `Metadata::file` / `Metadata::dir`. `LocalFs` is no longer a unit struct (use
-  `LocalFs::new()`). Directory/file mismatches are reported as `IsDir` / `NotDir`
-  on every platform.
+- **genai (breaking)**: `CompletionChunk` is an enum (use `chunk.text()` instead
+  of `chunk.delta`); `CompletionResponse` is `#[non_exhaustive]` and its
+  `finish_reason` is `Option<FinishReason>`; `MessagePart` and `ResponseFormat`
+  are `#[non_exhaustive]`; several structs gained fields; `ClaudeProviderConfig`
+  is built with `new` / `with_auth`.
+- **genai (breaking)**: provider failures map to the new error variants (a `429`
+  is `RateLimited`, `401`/`403` is `Auth`, a timeout is `Timeout`) instead of
+  `Api` / `Transport`.
+- **genai**: default timeouts suit model calls — 10 s connect, 10 min until the
+  response starts, 5 min stream idle.
+- **genai**: OpenAI requests send `max_completion_tokens`; streamed requests ask
+  for usage. Ollama sends and parses tools.
+- **genai**: the Claude catalog lists current models; when `max_tokens` is unset
+  the provider derives it from the catalog instead of sending 1024.
+  `ResponseFormat::Json` on Claude returns `Unsupported` (use a schema).
+- **genai**: rendering through `Template`, `PromptTemplate::render_strict`,
+  `InMemoryPromptStore::render` and `Message::from_prompt` is strict; the existing
+  `render` functions stay lenient. `{{ . }}` no longer renders the whole variables
+  object.
+- **genai** (router): `Priority::Quality` and `Priority::Speed` rank by explicit
+  ranks; routing configuration is parsed strictly; a completion that timed out
+  after it was sent is no longer retried or failed over by default; when every
+  breaker is open the error is `RouterError::CircuitOpen`.
 - **vectorstore (breaking)**: `Query` is `#[non_exhaustive]` (use `Query::new`).
   Vectors with NaN or infinite components, and empty vectors, are rejected with
   `VectorStoreError::InvalidInput`.
@@ -500,32 +515,17 @@ lenient, so **read the "Changed" section before upgrading**.
   `LocalOptions::drain_timeout`, default 20 s) and fails if some could not be
   delivered; after a stop, sends return `Closed`. `Message::with_header` replaces
   an existing header with the same key.
-- **config**: `merge_args` no longer guesses that the token after `--flag` is its
-  value. It is taken as the value only when an earlier layer shows the key holds a
-  non-boolean value; otherwise the flag is a switch. `--key=value` always works,
-  and `--` ends flag processing.
-- **config**: a malformed config file is reported as
-  `ConfigError::Parse { path, message }` and a failed `get` conversion as
-  `ConfigError::InvalidValue { key, source }` (both were `ConfigError::Codec`).
-  I/O errors now name the file. `ConfigError` has further new variants.
-- **cli**: positional arguments the command does not declare are rejected
-  (`CliError::UnexpectedArgument`); declare a `variadic()` positional to accept
-  any number.
-- **cli**: `CliError::UnknownFlag` has a new `suggestion` field; `CliError` has new
-  variants; `.env()` / `.default()` now apply to switches and positionals; help
-  layout changed.
-- **errutils**: `MultiError::source()` returns the first collected error.
-- **derive**: `rename_all` treats an acronym as one word: `HTTPServer` becomes
-  `http_server` / `httpServer` / `HttpServer` (was `h_t_t_p_server` / `hTTPServer`
-  / `HTTPServer`). Ordinary snake_case fields and PascalCase variants are
-  unaffected. Use `rename` to keep an old key.
-- **derive**: now compile errors instead of being ignored — an unknown
-  `rename_all` rule, a repeated `#[ferroly(...)]` key, a field-only key on a
-  variant, two fields or variants that map to the same key, `#[from]` on a struct
-  or variant with more than one field, and misplaced `#[from]` / `#[source]` /
-  `#[error]` attributes.
-- **derive**: derived `encode_to` passes the exact number of entries to
-  `Encoder::begin_map` (fields omitted by `skip_none` are no longer counted).
+- **vfs (breaking)**: `LocalFs` rejects URL schemes other than `file://` instead
+  of stripping them. `write` replaces files atomically and refuses read-only
+  destinations. `Metadata` is `#[non_exhaustive]` — build it with
+  `Metadata::file` / `Metadata::dir`. `LocalFs` is no longer a unit struct (use
+  `LocalFs::new()`). Directory/file mismatches are reported as `IsDir` / `NotDir`
+  on every platform.
+- **fsutils (breaking)**: `Mmap::open` now reads the file into memory and is sound
+  against concurrent changes to the file. The zero-copy OS mapping is the new
+  `unsafe fn Mmap::map`, and is a real mapping only on 64-bit Linux, Android,
+  macOS, iOS and the BSDs. `sniff` and `detect_content_type` now recognize text
+  (plain, JSON, HTML, XML) where they returned nothing.
 - **log**: sensitive field names (`password`, `token`, `authorization`, …) are
   redacted by default (`Logger::redact(Redactor::none())` turns it off).
   Plain-format keys and values are quoted when they contain whitespace, control
@@ -539,33 +539,65 @@ lenient, so **read the "Changed" section before upgrading**.
   `status`, `links`, `trace_state`, `parent_remote`) and implements `Default`.
   The default sampler follows an upstream "not sampled" decision. The OTLP
   exporter queue is bounded (2048 spans) and its request timeout is 10 s.
+- **build**: the minimum `tokio` version is 1.38.
+- **build**: the `tokio` dependency no longer enables `full` for every feature.
+  If your crate used tokio APIs only because ferroly happened to enable them,
+  depend on `tokio` directly or enable `ferroly`'s `rt` feature.
 
 ### Fixed
 
-<!-- FIXED -->
-- **genai**: OpenAI and Ollama dropped assistant tool calls and tool results from
-  outgoing messages; both now send them correctly and parse parallel tool calls.
-- **genai**: streams no longer lose tool calls, usage, finish reasons or errors; a
-  provider error event, a stalled stream, or a connection that closes early is
-  reported as an error. Multi-byte UTF-8 characters split across network chunks
-  are no longer corrupted.
-- **genai**: a slow completion is no longer re-sent (and billed twice) after a
-  timeout; an abandoned stream no longer leaks its reader task and connection.
-- **genai**: `Options::custom` is now sent to the provider.
-- **genai**: Claude no longer drops `Message::system` when `system_instructions`
-  is set, no longer ignores a requested response format, and no longer truncates
-  silently at 1024 tokens.
-- **genai**: `CompletionResponse::decode` accepts a JSON answer wrapped in a
-  Markdown code fence and reports anything else clearly. API keys can no longer
-  appear in errors, `Debug` output or logs; provider error bodies are size-capped.
-- **genai** (router): chat requests are no longer routed to embedding models; a
-  cancelled call or abandoned stream can no longer leave a model stuck half-open;
-  client errors no longer open the circuit breaker.
-- **genai** (router): `default_strategy`, `rules` and `fallback_depth` from the
-  routing configuration are now applied; an unknown `disabled_capabilities` entry
-  is an error.
-- **build**: `clippy -D warnings` passes with any single feature enabled, and
-  examples and tests build under any feature selection.
+- **codec**: TOML — a multibyte character after a short `\u`/`\U` escape caused a
+  panic; a dotted key or table header with very many segments overflowed the
+  stack (the depth limit now covers key paths).
+- **codec**: XML — an unterminated `<?` or `<!--` caused a panic; a `>` inside an
+  attribute value ended the tag; `[[1,2],[3]]` flattened; map keys could inject
+  markup.
+- **codec**: YAML — documents silently lost or mis-read data (a sequence at the
+  indentation of its key, keys after the first in `- k: v` items, trailing
+  comments, flow collections); `encode` output did not always decode (strings
+  containing `: `, top-level negative numbers, top-level empty collections).
+- **codec**: XML and TOML documents with many distinct keys took quadratic time.
+  Hex escapes and character references accepted a leading `+`. Schema ignored an
+  array-valued `type`, and `enum: [5]` rejected an unsigned `5`.
+- **derive**: raw identifiers no longer leak into keys — a field named `r#type`
+  encodes and decodes as `"type"` (was `"r#type"`).
+- **derive**: `#[derive(FerrolyError)]` on a struct with `#[source]`, `#[from]` or
+  `#[error(transparent)]` now compiles, and `#[from]` on a struct generates the
+  `From` impl. `#[derive(Encode)]` on an enum with no variants compiles.
+- **config**: `ConfigBuilder`'s `Debug` output no longer prints configuration
+  values.
+- **config**: loading from the environment no longer panics when any environment
+  variable is not valid UTF-8.
+- **config**: `.toml` config files are loaded; the unsupported-format error lists
+  every supported extension.
+- **config**: a parse error no longer repeats the offending line of the config
+  file; environment variables with empty key segments (`APP_A____B`) no longer
+  create empty-named keys.
+- **cli**: `--flag=false` on a boolean switch is honoured; `-n=5` yields `5`; a
+  negative number such as `-5` is accepted as an argument; a program's own `-h`
+  flag takes precedence over built-in help; flags marked `global()` are accepted
+  after a subcommand.
+- **auth**: a token could be respelled without invalidating it (non-canonical
+  base64url or stray `=` in the signature); non-object claims were returned as
+  valid.
+- **clients**: a half-open trial whose caller was cancelled left the circuit
+  breaker stuck half-open until restart. Permits release the slot when dropped,
+  and trials taken through `can_execute` are reclaimed after a timeout.
+- **clients**: auth providers printed bearer tokens, API keys and passwords in
+  `Debug` output.
+- **http** server: request smuggling through a second `Transfer-Encoding` header
+  or a coding other than a lone `chunked`; lenient header, `Content-Length`,
+  line-ending and chunk parsing; unbounded chunk-size lines and trailers; a
+  non-reading client holding a connection slot forever; a handler panic dropping
+  the connection without a response (now a `500`, and the server keeps serving).
+- **http** client: request splitting through CR/LF or spaces in URLs, methods and
+  hand-built request targets; `1xx` interim responses taken as the final response;
+  `HEAD` responses with `Content-Length` hanging; truncated bodies reported as
+  success; non-idempotent requests re-sent on a dead pooled connection; unbounded
+  response bodies.
+- **http**: `download_to_file` validates `Content-Range`, restarts when the server
+  ignores `Range`, and reports truncated transfers. Server-Sent Events could be
+  forged through line breaks in `data`, `event` and `id`.
 - **turbo**: group-scoped filters could be bypassed with `//api/x`, `api/x` or dot
   segments, and never ran for a group whose prefix contained a parameter. Filters
   are now scoped with the route matcher on the normalised path, and each route
@@ -599,51 +631,31 @@ lenient, so **read the "Changed" section before upgrading**.
   bounded time before dropping them. Masking keys come from a per-connection
   generator seeded from OS randomness, and the handshake nonce no longer exposes
   the key stream.
-- **codec**: TOML — a multibyte character after a short `\u`/`\U` escape caused a
-  panic; a dotted key or table header with very many segments overflowed the
-  stack (the depth limit now covers key paths).
-- **codec**: XML — an unterminated `<?` or `<!--` caused a panic; a `>` inside an
-  attribute value ended the tag; `[[1,2],[3]]` flattened; map keys could inject
-  markup.
-- **codec**: YAML — documents silently lost or mis-read data (a sequence at the
-  indentation of its key, keys after the first in `- k: v` items, trailing
-  comments, flow collections); `encode` output did not always decode (strings
-  containing `: `, top-level negative numbers, top-level empty collections).
-- **codec**: XML and TOML documents with many distinct keys took quadratic time.
-  Hex escapes and character references accepted a leading `+`. Schema ignored an
-  array-valued `type`, and `enum: [5]` rejected an unsigned `5`.
-- **http** server: request smuggling through a second `Transfer-Encoding` header
-  or a coding other than a lone `chunked`; lenient header, `Content-Length`,
-  line-ending and chunk parsing; unbounded chunk-size lines and trailers; a
-  non-reading client holding a connection slot forever; a handler panic dropping
-  the connection without a response (now a `500`, and the server keeps serving).
-- **http** client: request splitting through CR/LF or spaces in URLs, methods and
-  hand-built request targets; `1xx` interim responses taken as the final response;
-  `HEAD` responses with `Content-Length` hanging; truncated bodies reported as
-  success; non-idempotent requests re-sent on a dead pooled connection; unbounded
-  response bodies.
-- **http**: `download_to_file` validates `Content-Range`, restarts when the server
-  ignores `Range`, and reports truncated transfers. Server-Sent Events could be
-  forged through line breaks in `data`, `event` and `id`.
-- **auth**: a token could be respelled without invalidating it (non-canonical
-  base64url or stray `=` in the signature); non-object claims were returned as
-  valid.
-- **clients**: a half-open trial whose caller was cancelled left the circuit
-  breaker stuck half-open until restart. Permits release the slot when dropped,
-  and trials taken through `can_execute` are reclaimed after a timeout.
-- **clients**: auth providers printed bearer tokens, API keys and passwords in
-  `Debug` output.
-- **fsutils**: the hand-declared `mmap` FFI used the wrong `off_t` width on 32-bit
-  targets and assumed one `MAP_PRIVATE` value for all of Unix; large file lengths
-  were truncated on 32-bit.
-- **vfs**: `read_range` with a huge `len` panicked ("capacity overflow") or
-  zero-filled that much memory; it is now bounded by the file.
+- **genai**: OpenAI and Ollama dropped assistant tool calls and tool results from
+  outgoing messages; both now send them correctly and parse parallel tool calls.
+- **genai**: streams no longer lose tool calls, usage, finish reasons or errors; a
+  provider error event, a stalled stream, or a connection that closes early is
+  reported as an error. Multi-byte UTF-8 characters split across network chunks
+  are no longer corrupted.
+- **genai**: a slow completion is no longer re-sent (and billed twice) after a
+  timeout; an abandoned stream no longer leaks its reader task and connection.
+- **genai**: `Options::custom` is now sent to the provider.
+- **genai**: Claude no longer drops `Message::system` when `system_instructions`
+  is set, no longer ignores a requested response format, and no longer truncates
+  silently at 1024 tokens.
+- **genai**: `CompletionResponse::decode` accepts a JSON answer wrapped in a
+  Markdown code fence and reports anything else clearly. API keys can no longer
+  appear in errors, `Debug` output or logs; provider error bodies are size-capped.
+- **genai** (router): chat requests are no longer routed to embedding models; a
+  cancelled call or abandoned stream can no longer leave a model stuck half-open;
+  client errors no longer open the circuit breaker.
+- **genai** (router): `default_strategy`, `rules` and `fallback_depth` from the
+  routing configuration are now applied; an unknown `disabled_capabilities` entry
+  is an error.
 - **vectorstore**: a failed first `upsert` of a mixed-dimension batch fixed the
   store's dimension; `search` cloned every document; cosine similarity overflowed
   or underflowed for extreme magnitudes; a poisoned lock panicked every later
   caller.
-- **rt**: a bare `#[ferroly::rt::test]` did not compile in a crate without a
-  direct `tokio` dependency, contrary to the 0.3.2 notes.
 - **lifecycle**: a start that timed out, was cancelled or panicked left the
   component in `Starting`; a retry then reported success and started dependents on
   a component that never started. Such a start now ends in `Error`, and concurrent
@@ -657,24 +669,13 @@ lenient, so **read the "Changed" section before upgrading**.
 - **messaging**: `stop()` returned immediately and dropped buffered and retried
   messages; consumer tasks leaked when a `LocalProvider` was dropped without
   `stop()`; `buffer_size: 0` panicked and is now an `InvalidOptions` error.
-- **config**: `ConfigBuilder`'s `Debug` output no longer prints configuration
-  values.
-- **config**: loading from the environment no longer panics when any environment
-  variable is not valid UTF-8.
-- **config**: `.toml` config files are loaded; the unsupported-format error lists
-  every supported extension.
-- **config**: a parse error no longer repeats the offending line of the config
-  file; environment variables with empty key segments (`APP_A____B`) no longer
-  create empty-named keys.
-- **cli**: `--flag=false` on a boolean switch is honoured; `-n=5` yields `5`; a
-  negative number such as `-5` is accepted as an argument; a program's own `-h`
-  flag takes precedence over built-in help; flags marked `global()` are accepted
-  after a subcommand.
-- **derive**: raw identifiers no longer leak into keys — a field named `r#type`
-  encodes and decodes as `"type"` (was `"r#type"`).
-- **derive**: `#[derive(FerrolyError)]` on a struct with `#[source]`, `#[from]` or
-  `#[error(transparent)]` now compiles, and `#[from]` on a struct generates the
-  `From` impl. `#[derive(Encode)]` on an enum with no variants compiles.
+- **vfs**: `read_range` with a huge `len` panicked ("capacity overflow") or
+  zero-filled that much memory; it is now bounded by the file.
+- **fsutils**: the hand-declared `mmap` FFI used the wrong `off_t` width on 32-bit
+  targets and assumed one `MAP_PRIVATE` value for all of Unix; large file lengths
+  were truncated on 32-bit.
+- **rt**: a bare `#[ferroly::rt::test]` did not compile in a crate without a
+  direct `tokio` dependency, contrary to the 0.3.2 notes.
 - **log**: a newline or control character in a field could forge a log record;
   JSON output could repeat `level` / `msg` / `ts`; `Logger::flush()` did not flush
   a synchronous writer; a context provider that logged recursed without bound.
@@ -685,8 +686,42 @@ lenient, so **read the "Changed" section before upgrading**.
   and durations; span ids counted up from 1 in every process; the OTLP exporter
   buffered without limit, ignored the HTTP status, and `flush()` returned before
   anything was sent.
+- **build**: `clippy -D warnings` passes with any single feature enabled, and
+  examples and tests build under any feature selection.
 - **docs**: the crate-level documentation shows the current version and lists
   every module.
+
+### Security
+
+This release fixes defects that are exploitable when the affected module handles
+untrusted input. If you run any of these, upgrade:
+
+- **HTTP request smuggling** (`http` server): a second `Transfer-Encoding`
+  header, or a coding other than a lone `chunked`, was read as a zero-length body
+  and the rest of the stream parsed as further requests.
+- **Request splitting** (`http` client, `rest` client): CR/LF and spaces in URLs,
+  methods and `path_param` values reached the request line.
+- **Authorization bypass** (`turbo`): group-scoped filters, such as an auth
+  filter on `/api`, were skipped for `//api/x`, `api/x` and dot-segment paths,
+  and never ran for groups with a parameter in their prefix.
+- **Remotely triggerable panics and aborts** (`codec`, reachable through
+  `turbo` and `rest` content-type dispatch): TOML `\u` escapes followed by a
+  multibyte character, unterminated XML `<?` / `<!--`, and deeply dotted TOML keys
+  (stack overflow).
+- **Resource exhaustion**: unbounded chunk-size lines and trailers, write paths
+  with no timeout, and quadratic XML / TOML parsing (`http`, `codec`); unbounded
+  WebSocket send queues and ping floods (`ws`); unbounded rate-limit tables and
+  metric label sets (`turbo`); an unbounded OTLP export queue (`obs`).
+- **Response mix-up** (`http` client): `1xx` interim responses were taken as
+  final, so a later request on the same pooled connection could receive another
+  request's body.
+- **Token malleability** (`auth`): non-canonical base64url signatures verified.
+- **Log forging** (`log`): newlines in field values could forge records.
+- **Credential exposure**: auth providers and `ConfigBuilder` printed secrets in
+  `Debug` output.
+- **Unsound `unsafe`** (`fsutils`): the safe `Mmap::open` exposed a mapping that
+  another process could change or truncate; the mapping is now behind
+  `unsafe fn Mmap::map`, and the FFI signature was wrong on 32-bit targets.
 
 ## [0.3.2]
 
