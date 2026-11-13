@@ -37,14 +37,41 @@ pub fn satisfies(m: &ModelInfo, required: &[Capability]) -> bool {
 // ---- rule-based ----------------------------------------------------------
 
 struct Rule {
-    kind: TaskKind,
+    kind: Option<TaskKind>,
+    tags: Vec<String>,
     provider: String,
     model: String,
 }
 
-/// Maps `TaskKind` to an ordered list of `(provider, model)` targets; the first
-/// matching rule is the primary and the remaining same-kind rules (plus the
-/// default) become the fallback tail.
+impl Rule {
+    fn matches(&self, task: &Task) -> bool {
+        if let Some(kind) = self.kind {
+            if task.kind != Some(kind) {
+                return false;
+            }
+        }
+        self.tags.iter().all(|t| task.tags.contains(t))
+    }
+}
+
+/// Maps tasks to an ordered list of `(provider, model)` targets by rule.
+///
+/// A rule matches a task when the task has the rule's [`TaskKind`] (if the
+/// rule names one) **and** carries every tag the rule requires. The matching
+/// rules, in the order they were added, become the primary and its fallbacks;
+/// the default model, if set, is the final fallback. With no matching rule
+/// and no default the strategy abstains.
+///
+/// ```
+/// use ferroly::genai::router::{RuleBasedStrategy, TaskKind};
+///
+/// let rules = RuleBasedStrategy::new()
+///     // Tagged tasks stay on the local model, whatever their kind.
+///     .tag_rule(["sensitive"], "ollama", "llama3")
+///     .rule(TaskKind::CodeGen, "claude", "claude-opus-5-5")
+///     .default_model("openai", "gpt-4o-mini");
+/// # let _ = rules;
+/// ```
 #[derive(Default)]
 pub struct RuleBasedStrategy {
     rules: Vec<Rule>,
@@ -57,16 +84,48 @@ impl RuleBasedStrategy {
         RuleBasedStrategy::default()
     }
 
-    /// Adds a `(kind → provider/model)` rule. Order matters: earlier rules for a
-    /// kind rank ahead of later ones.
+    /// Adds a `(kind → provider/model)` rule. Order matters: earlier rules
+    /// rank ahead of later ones.
     pub fn rule(
-        mut self,
+        self,
         kind: TaskKind,
         provider: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        self.rule_for(Some(kind), Vec::<String>::new(), provider, model)
+    }
+
+    /// Adds a rule matching every task that carries all of `tags`, whatever
+    /// its kind.
+    pub fn tag_rule<I, S>(
+        self,
+        tags: I,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.rule_for(None, tags, provider, model)
+    }
+
+    /// Adds a rule with an optional kind and a set of required tags. A rule
+    /// with neither matches every task.
+    pub fn rule_for<I, S>(
+        mut self,
+        kind: Option<TaskKind>,
+        tags: I,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         self.rules.push(Rule {
             kind,
+            tags: tags.into_iter().map(Into::into).collect(),
             provider: provider.into(),
             model: model.into(),
         });
@@ -86,22 +145,23 @@ impl RoutingStrategy for RuleBasedStrategy {
     }
 
     fn rank(&self, task: &Task, reg: &dyn ModelRegistry) -> Ranking {
-        let mut candidates = Vec::new();
-        if let Some(kind) = task.kind {
-            for (i, r) in self.rules.iter().filter(|r| r.kind == kind).enumerate() {
-                candidates.push(make_candidate(
-                    reg,
-                    &r.provider,
-                    &r.model,
-                    task,
-                    -(i as f64),
-                ));
+        let mut candidates: Vec<Candidate> = Vec::new();
+        let push = |provider: &str, model: &str, candidates: &mut Vec<Candidate>| {
+            if candidates
+                .iter()
+                .any(|c| c.provider == provider && c.model == model)
+            {
+                return; // already ranked by an earlier rule
             }
+            let score = -(candidates.len() as f64);
+            candidates.push(make_candidate(reg, provider, model, task, score));
+        };
+        for r in self.rules.iter().filter(|r| r.matches(task)) {
+            push(&r.provider, &r.model, &mut candidates);
         }
         if let Some((p, m)) = &self.default {
             // The default ranks last (below any matched rule).
-            let score = -(candidates.len() as f64) - 1.0;
-            candidates.push(make_candidate(reg, p, m, task, score));
+            push(p, m, &mut candidates);
         }
         Ranking {
             candidates,
@@ -119,14 +179,7 @@ fn make_candidate(
 ) -> Candidate {
     let est_cost = reg
         .get(provider, model)
-        .map(|m| {
-            let out = if task.est_output_tokens > 0 {
-                task.est_output_tokens
-            } else {
-                default_output_estimate(task.kind)
-            };
-            m.est_cost(task.est_input_tokens, out)
-        })
+        .map(|m| m.est_cost(task.est_input_tokens, task.output_estimate()))
         .unwrap_or(0.0);
     Candidate {
         provider: provider.to_string(),

@@ -11,7 +11,7 @@ use ferroly::genai::router::{
 };
 use ferroly::genai::{
     BoxFuture, Capability, ChunkStream, CompletionChunk, CompletionRequest, CompletionResponse,
-    EmbedRequest, EmbedResponse, Embedder, GenAiError, GenAiProvider, Message, Role,
+    EmbedRequest, EmbedResponse, Embedder, FinishReason, GenAiError, GenAiProvider, Message, Role,
 };
 
 /// How a stub model responds to a call.
@@ -82,12 +82,11 @@ impl GenAiProvider for Stub {
         let outcome = self.outcome(&model);
         Box::pin(async move {
             match outcome {
-                Outcome::Ok => Ok(CompletionResponse {
+                Outcome::Ok => Ok(CompletionResponse::new(
                     model,
-                    message: Message::text(Role::Assistant, "0", "ok"),
-                    finish_reason: Some("stop".into()),
-                    usage: None,
-                }),
+                    Message::text(Role::Assistant, "0", "ok"),
+                )
+                .with_raw_finish_reason("stop")),
                 other => Err(err_for(other)),
             }
         })
@@ -102,14 +101,9 @@ impl GenAiProvider for Stub {
         Box::pin(async move {
             match outcome {
                 Outcome::Ok => {
-                    let (tx, rx) = tokio::sync::mpsc::channel(1);
-                    let _ = tx
-                        .send(Ok(CompletionChunk {
-                            delta: "hi".into(),
-                            finish_reason: Some("stop".into()),
-                            ..Default::default()
-                        }))
-                        .await;
+                    let (tx, rx) = tokio::sync::mpsc::channel(2);
+                    let _ = tx.send(Ok(CompletionChunk::text_delta("hi"))).await;
+                    let _ = tx.send(Ok(CompletionChunk::done(FinishReason::Stop))).await;
                     Ok(rx)
                 }
                 other => Err(err_for(other)),
