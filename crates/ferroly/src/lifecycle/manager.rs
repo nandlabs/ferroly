@@ -1310,6 +1310,8 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 enum SignalEvent {
     Shutdown,
+    /// Only produced on Unix (`SIGHUP`).
+    #[cfg_attr(not(unix), allow(dead_code))]
     Reload,
 }
 

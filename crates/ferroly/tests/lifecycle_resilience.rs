@@ -726,3 +726,46 @@ async fn a_registry_reports_components_without_keeping_the_manager_alive() {
         vec![("disk".to_string(), HealthStatus::Up)]
     );
 }
+
+// ---- multi-threaded runtime -------------------------------------------------
+
+/// Many tasks racing to start the same components on a real multi-threaded
+/// runtime: each component is started exactly once and every caller sees the
+/// real outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_starts_run_each_component_once() {
+    for _ in 0..50 {
+        let log = new_log();
+        let mgr = Arc::new(ComponentManager::with_options(
+            ManagerOptions::new().parallel_start(true),
+        ));
+        let components: Vec<Arc<Scripted>> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|id| Scripted::new(id, &log).arc())
+            .collect();
+        for component in &components {
+            mgr.register(component.clone()).unwrap();
+        }
+        mgr.add_dependency("c", "a").unwrap();
+        mgr.add_dependency("d", "c").unwrap();
+
+        let racers: Vec<_> = (0..8)
+            .map(|_| {
+                let mgr = mgr.clone();
+                tokio::spawn(async move { mgr.start_all().await })
+            })
+            .collect();
+        for racer in racers {
+            racer.await.unwrap().unwrap();
+        }
+
+        assert!(mgr.is_ready());
+        for component in &components {
+            assert_eq!(component.starts(), 1, "{} started once", component.id());
+        }
+        mgr.stop_all().await.unwrap();
+        for component in &components {
+            assert_eq!(component.stops(), 1, "{} stopped once", component.id());
+        }
+    }
+}
