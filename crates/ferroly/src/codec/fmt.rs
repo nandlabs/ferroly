@@ -33,31 +33,38 @@ pub(crate) fn write_i64(out: &mut String, i: i64) {
     write_u64(out, i.unsigned_abs());
 }
 
-/// Appends `f` to `out` (plain form). Non-finite values become `null`.
-/// Used by the XML and YAML encoders, whose scalars are re-parsed leniently.
+/// Appends `f` to `out` in plain form (`250`, `1.5`). Non-finite values use
+/// the spellings Rust's own float parser reads back: `NaN`, `inf`, `-inf`.
+/// Used by the XML encoder, whose scalars are text re-parsed leniently.
 pub(crate) fn write_f64(out: &mut String, f: f64) {
-    if f.is_finite() {
-        let _ = write!(out, "{f}");
+    if f.is_nan() {
+        out.push_str("NaN");
     } else {
-        out.push_str("null");
+        let _ = write!(out, "{f}");
     }
 }
 
-/// Appends `f` in JSON form: a trailing `.0` is added to integer-valued floats
-/// so the value round-trips as a float rather than an integer. Non-finite
-/// values become `null`.
-pub(crate) fn write_json_f64(out: &mut String, f: f64) {
-    if !f.is_finite() {
-        out.push_str("null");
-        return;
-    }
+/// Appends a **finite** `f`, adding a trailing `.0` to integer-valued floats so
+/// the value reads back as a float rather than an integer. Shared by the typed
+/// formats (JSON, YAML, TOML), which each spell non-finite values themselves.
+pub(crate) fn write_finite_f64(out: &mut String, f: f64) {
     let start = out.len();
     let _ = write!(out, "{f}");
     if !out[start..]
         .bytes()
-        .any(|b| matches!(b, b'.' | b'e' | b'E' | b'n' | b'i'))
+        .any(|b| matches!(b, b'.' | b'e' | b'E'))
     {
         out.push_str(".0");
+    }
+}
+
+/// Appends `f` in JSON form (see [`write_finite_f64`]). Non-finite values
+/// become `null`, since JSON has no representation for them.
+pub(crate) fn write_json_f64(out: &mut String, f: f64) {
+    if f.is_finite() {
+        write_finite_f64(out, f);
+    } else {
+        out.push_str("null");
     }
 }
 
@@ -92,5 +99,13 @@ mod tests {
         let mut s = String::new();
         write_f64(&mut s, 250.0);
         assert_eq!(s, "250");
+
+        // Non-finite plain forms are the ones `str::parse::<f64>` accepts.
+        for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut s = String::new();
+            write_f64(&mut s, f);
+            let back: f64 = s.parse().unwrap();
+            assert!(back == f || (back.is_nan() && f.is_nan()), "{s}");
+        }
     }
 }

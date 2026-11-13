@@ -39,5 +39,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "toml_parse"
+path = "fuzz_targets/toml_parse.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent workspace.
 [workspace]
