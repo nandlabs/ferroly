@@ -365,9 +365,17 @@ let router = Router::new()
 ```
 
 - **`metrics()`** installs a middleware that records, per request:
-  - `http_requests_total` — counter, labelled by `method` + `status`.
-  - `http_request_duration_seconds` — histogram, labelled by `method`.
+  - `http_requests_total` — counter, labelled by `method`, `route` and `status`.
+  - `http_request_duration_seconds` — histogram, labelled by `method` and `route`.
   - `http_requests_in_flight` — gauge.
+
+  Every label comes from a bounded set, so a client cannot create series:
+  `method` is a standard method or `OTHER`; `route` is the matched route
+  *template* (`/users/:id`, never the raw path) or `unmatched`; `status` is the
+  response status, or `cancelled` when the request was dropped before a response.
+  The in-flight gauge and the timer are RAII guards, so a cancelled request does
+  not leak a count. Use `metrics_in(&registry)` to record into your own registry
+  instead of the global one.
 - **`metrics_route(path)`** registers a `GET` route serving
   `global().encode()` with `content-type: text/plain; version=0.0.4`.
 
@@ -387,13 +395,13 @@ scrape_configs:
 ```
 # HELP http_requests_total Total HTTP requests
 # TYPE http_requests_total counter
-http_requests_total{method="GET",status="200"} 5
+http_requests_total{method="GET",route="/users/:id",status="200"} 5
 # HELP http_request_duration_seconds HTTP request latency in seconds
 # TYPE http_request_duration_seconds histogram
-http_request_duration_seconds_bucket{method="GET",le="0.005"} 3
-http_request_duration_seconds_bucket{method="GET",le="+Inf"} 5
-http_request_duration_seconds_sum{method="GET"} 0.081
-http_request_duration_seconds_count{method="GET"} 5
+http_request_duration_seconds_bucket{method="GET",route="/users/:id",le="0.005"} 3
+http_request_duration_seconds_bucket{method="GET",route="/users/:id",le="+Inf"} 5
+http_request_duration_seconds_sum{method="GET",route="/users/:id"} 0.081
+http_request_duration_seconds_count{method="GET",route="/users/:id"} 5
 ```
 
 - Families are ordered by name, series by label set; labels within a series are
@@ -413,7 +421,7 @@ The same data in OpenMetrics 1.0 text, for scrapers that negotiate
 ```
 # HELP http_requests Total HTTP requests
 # TYPE http_requests counter
-http_requests_total{method="GET",status="200"} 5
+http_requests_total{method="GET",route="/users/:id",status="200"} 5
 # HELP rpc_duration_seconds RPC latency
 # TYPE rpc_duration_seconds histogram
 # UNIT rpc_duration_seconds seconds

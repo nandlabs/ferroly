@@ -393,17 +393,6 @@ fn normalize_request_target(method: &Method, target: &[u8]) -> Option<(String, O
     Some((target, Some(authority.to_string())))
 }
 
-/// Reads a request line and headers with the default limits. Kept for the
-/// WebSocket handshake, which only needs the method, target and headers.
-#[cfg_attr(not(feature = "ws"), allow(dead_code))]
-pub(crate) async fn read_request_head<R: AsyncBufRead + Unpin>(
-    r: &mut R,
-) -> Result<(Method, String, HeaderMap), HttpError> {
-    let mut started = false;
-    let head = read_request_head_with(r, &HeadLimits::server(), &mut started).await?;
-    Ok((head.method, head.target, head.headers))
-}
-
 /// A parsed status line plus headers.
 #[derive(Debug)]
 pub(crate) struct ResponseHead {

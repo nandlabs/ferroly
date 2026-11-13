@@ -545,9 +545,12 @@ req_log.info("charge", &[("amount_cents", 4999.into())]);
 returns fields to merge into the record. Providers should return an **empty vec**
 when there is no active context, so background logs stay clean.
 
-[turbo](turbo.md)'s `trace_context()` registers a provider that reads a
-task-local `trace_id` for the in-flight request, so every line logged while
-handling that request carries it.
+[turbo](turbo.md)'s `trace_context()` registers a provider for the in-flight
+request, so every line logged while handling it carries a `request_id` (an
+inbound `X-Request-Id` if it passes a strict check, otherwise generated) and a
+`trace_id`. With the `obs` feature the middleware also extracts W3C trace
+context, runs a server span for the request, and `trace_id` is that span's W3C
+trace id.
 
 ```rust
 use ferroly::log::{add_context_provider, info, Logger, set_global};

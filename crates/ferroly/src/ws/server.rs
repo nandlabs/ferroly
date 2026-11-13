@@ -757,17 +757,6 @@ async fn refuse(inner: &Inner, stream: &mut BufReader<Conn>, reject: UpgradeReje
     .await;
 }
 
-/// `http::io::read_request_head` is the fixed-limit reader the `http` module
-/// keeps for this handshake, but the handshake needs the HTTP version, the
-/// configurable limits and the error status, so it calls
-/// `read_request_head_with` instead. This reference only keeps a `ws`-only
-/// build free of a dead-code warning for that function; delete it together
-/// with the function.
-#[allow(dead_code)]
-fn legacy_head_reader_is_referenced() {
-    let _ = ferroly::http::io::read_request_head::<BufReader<Conn>>;
-}
-
 // ---- lifecycle Component -------------------------------------------------
 
 struct Running {

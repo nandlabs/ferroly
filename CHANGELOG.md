@@ -18,6 +18,81 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Added
 
 <!-- ADDED -->
+- **turbo**: request-scoped extensions (`ctx.set` / `ctx.get`) and shared state
+  (`Router::with_state`, `ctx.state`), so middleware can hand identity to
+  handlers; `ctx.route()` returns the matched route template.
+- **turbo**: asynchronous filters and authenticators (`filter_async`,
+  `auth_async`) on routers, groups and routes.
+- **turbo**: `ctx.peer_addr()`, `ctx.is_tls()`, `ctx.peer_certificates()`, and
+  `TrustedProxies` / `ctx.client_ip()` for deployments behind reverse proxies.
+- **turbo**: `*name` catch-all segments, nested groups, `Router::mount`, and
+  `Route` for per-route middleware, filters, body limit and timeout. Groups gain
+  `head`, `options`, `add`, `route`, `layer`, `group`.
+- **turbo**: `Router::validate`, `problems` and `try_into_handler` report
+  malformed patterns, conflicting routes and unusable middleware configuration
+  (`RouteError`) without panicking.
+- **turbo**: handlers may return any `IntoResponse` type, including
+  `Result<HttpResponse, E>`. `Problem` renders RFC 9457
+  `application/problem+json`; `Classified<E>` renders any `errutils::Classify`
+  error.
+- **turbo**: middleware — `cors` (`Cors`), `security_headers`
+  (`SecurityHeaders`), `request_id`, `csrf` (`Csrf`, with the `hash` feature) and
+  `rate_limit_with` (`RateLimit`, with `RateLimit-*` / `Retry-After` headers and a
+  bounded table).
+- **turbo**: cookies (`ctx.cookie`, `SetCookie` with secure defaults and
+  `__Host-` / `__Secure-` rules), `ctx.form()`, `ctx.multipart()` with
+  `MultipartLimits`, and `ctx.validate()` / `ctx.read_valid()` (422 with
+  per-field details).
+- **turbo**: `StaticFiles` / `Router::static_files` with `ETag`, `Last-Modified`,
+  conditional requests, `Range`, and confinement to the root directory.
+- **turbo**: `Router::body_limit`, `Router::request_timeout`;
+  `serve_with_shutdown`, `serve_with_config`, `serve_listener`, `serve_tls`,
+  `serve_tls_reloadable`, `serve_tls_listener`.
+- **turbo**: JWT — `jwt_auth_with`, `jwt_auth_hmac_with`, `jwt_auth_jwks`,
+  `JwtAuth` (including optional auth and `Group::jwt`), verified claims via
+  `ctx.claims()`, and `require_scopes` / `require_any_scope` / `require_roles` /
+  `require_any_role`.
+- **turbo**: `trace_context()` extracts W3C trace context and runs a server span
+  per request (with `obs`); `metrics_in(&registry)`.
+- **rest**: client `base_url`, `default_header`, `default_query`; connect / read /
+  total timeouts, response-body cap, proxy, TLS, redirects, interceptors, user
+  agent, decompression; `http_client` to share a transport; `try_with_options`.
+- **rest**: per-host circuit breakers (`circuit_breaker`, `circuit_breakers`) and a
+  `Policy` hook.
+- **rest**: `Response::headers`, `header`, `status`, `url`, `into_bytes`, `link`,
+  `next_link`; `Response::error_for_status()`, an `error_for_status(true)` client
+  option, and `ClientError::Status { status, body }`.
+- **rest**: `RequestBuilder::accept`, `idempotency_key`, `idempotent`;
+  `Client::patch`, `head`, `options`; `Client::paginate` (cursors) and
+  `paginate_links` (`Link: rel="next"`). The client injects W3C trace context into
+  outgoing requests (with `obs`).
+- **rest**: `ServerOptions::config` (`ServerConfig`) and `ServerOptions::tls`
+  (`TlsConfig` or `ReloadableTlsConfig`); `Server::last_error`, `Server::is_tls`;
+  `ServerBuilder::patch`, `head`, `options`, `route`, `group`, `layer`, `cors`,
+  `security_headers`, `request_id`, `try_build`.
+- **ws**: per-connection async handlers — `WsHandler`, `WsConn` (id, request
+  path/query/headers, peer address, TLS state, `recv`, `send`,
+  `close(code, reason)`) and a clonable `WsSender` for pushing from other tasks;
+  `server::serve_with_config` with graceful shutdown.
+- **ws**: `WsServerConfig` for every limit and timeout (max connections,
+  frame/message size, handshake, idle, write, keepalive ping and pong deadline,
+  close, drain, queue capacities, header limits).
+- **ws**: `UpgradeHook` to authenticate or reject an upgrade with an HTTP response
+  before the `101`, and to attach per-connection context; `OriginPolicy`
+  (`SameOrigin`, `AllowList`, `Any`).
+- **ws**: `Hub` with rooms — broadcast to all, to a room or to one connection id,
+  with a `SlowConsumerPolicy`.
+- **ws**: `wss` and mutual TLS on the server (`WsServerConfig::tls`); custom
+  request headers, subprotocols and `ClientTlsConfig` on the client; subprotocol
+  negotiation on both sides.
+- **ws**: client keepalive pings, connect and handshake timeouts, and
+  `ReconnectingClient` with exponential backoff, jitter and an `on_connect`
+  resubscribe hook.
+- **ws**: close codes are visible to applications — `Message::Close { code,
+  reason }` is the last message of every connection; `close(code, reason)` /
+  `WsClient::close_with`; `close_code` constants.
+- **ws**: `WsObserver` / `WsEvent` for metrics; `WsServer::with_handler`,
+  `with_config`, `connections()` and `health()`.
 - **codec**: `codec::Limits` — one parser budget (nesting depth, input size, entry
   count) enforced by the JSON, XML, YAML and TOML parsers. Every entry point has a
   `*_with(…, limits)` twin, plus `codec::decode_with`; the plain entry points use
@@ -225,6 +300,48 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Changed
 
 <!-- CHANGED -->
+- **turbo (breaking)**: the request path is normalised before routing. `//x`, a
+  path without a leading `/`, malformed percent-escapes and encoded control
+  characters are answered `400`; dot segments are resolved; `ctx.path()` returns
+  the normalised path. Paths are case-sensitive.
+- **turbo**: path parameters are percent-decoded, and query keys as well as
+  values. A query that is not valid percent-encoded UTF-8 is a `400`.
+- **turbo (breaking)**: the most specific route wins regardless of registration
+  order. `HEAD` (for `GET` routes) and `OPTIONS` are answered automatically; opt
+  out with `auto_head(false)` / `auto_options(false)`.
+- **turbo**: `metrics()` labels `http_requests_total` and
+  `http_request_duration_seconds` with the route template (`route`), and reports
+  non-standard methods as `OTHER`.
+- **turbo**: `trace_context()` accepts an inbound `X-Request-Id` only if it is
+  1–128 characters of `A-Z a-z 0-9 . _ -`, adds a `request_id` log field, and with
+  `obs` logs the W3C trace id as `trace_id`.
+- **turbo**: `jwt_auth(secret)` keeps its lenient validation (no `exp` required);
+  use `jwt_auth_with` for new code.
+- **rest (breaking)**: `ServerOptions` has new public fields; build it with
+  `..Default::default()`.
+- **rest**: `Client::new()` no longer disables timeouts — 30 s connect, 60 s
+  response head, 300 s read idle, 64 MiB response body.
+- **rest**: `retry_policy` accepts `impl Into<Retry>`. Idempotent requests are
+  retried on transient transport errors and on `502` / `503` / `504` / `429`,
+  honouring `Retry-After`; non-idempotent requests only when opted in.
+- **rest**: requests send `Accept: <content type>, */*;q=0.5` unless one is set.
+  `/health` runs the registry's liveness checks and `/ready` its readiness checks,
+  through the asynchronous registry API.
+- **ws (breaking)**: `WsClient::send` is now `async` and waits for space in a
+  bounded queue; use `try_send` for the non-waiting form.
+- **ws (breaking)**: `Message` has a new `Close { code, reason }` variant; `recv`
+  yields it before returning `None`.
+- **ws (breaking)**: `WsOptions` has new fields (end struct literals with
+  `..WsOptions::default()`) and its defaults are now finite: 16 MiB per frame,
+  64 MiB per message, 10 s connect and handshake timeouts.
+- **ws (breaking)**: servers apply `OriginPolicy::SameOrigin` by default — a
+  browser connecting from another origin gets `403` until it is allow-listed.
+  Requests without an `Origin` header are unaffected.
+- **ws**: servers now default to a 120 s idle timeout, a 30 s write timeout and a
+  30 s keepalive ping with a 10 s pong deadline. A non-101 handshake response is
+  `WsError::Rejected { status }`, and sending on a closed connection is
+  `WsError::Closed`. `WsServer::start` on a running server returns
+  `ComponentAlreadyStarted` instead of replacing it.
 - **codec (breaking)**: JSON and TOML decode strictly — a string is no longer
   accepted where a number or bool is expected (`"42"` is not an integer). XML,
   YAML and `Decode::decode(&Value)` keep the lenient behaviour that text-only
@@ -362,6 +479,39 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Fixed
 
 <!-- FIXED -->
+- **turbo**: group-scoped filters could be bypassed with `//api/x`, `api/x` or dot
+  segments, and never ran for a group whose prefix contained a parameter. Filters
+  are now scoped with the route matcher on the normalised path, and each route
+  re-checks its groups' filters before the handler runs.
+- **turbo**: arbitrary HTTP method tokens and request paths could create unbounded
+  metric label values; the in-flight gauge and duration histogram are recorded by
+  guards, so a cancelled request no longer leaks a count.
+- **rest**: `path_param` values were substituted raw, so `/`, `?`, `#`, `..` or
+  CR/LF in a value could change the path, query or request line. Values are now
+  percent-encoded for their position; values that cannot be a path segment are
+  refused.
+- **rest**: the retry documentation promised retries on 5xx responses, but only
+  transport errors were retried. Refreshing auth providers (OAuth 2.0,
+  `RefreshingAuth`) were never prepared, so their requests went out without
+  credentials.
+- **rest**: `Server` could not be restarted, discarded serve errors, and a
+  cancelled `start` left it unusable.
+- **ws**: a peer that stops reading (or floods pings) can no longer grow memory —
+  outgoing and incoming queues are bounded, pending pongs are coalesced, and a
+  slow consumer is closed with `1008`.
+- **ws**: control frames must be final and at most 125 bytes; unmasked client
+  frames, masked server frames, reserved bits, unknown opcodes and out-of-order
+  fragments close the connection with `1002`; invalid UTF-8 closes it with `1007`
+  instead of being replaced; oversized frames and messages close it with `1009`;
+  close-frame payloads are validated and the status code is echoed.
+- **ws**: the server validates the whole upgrade request and answers a bad one
+  with an HTTP error instead of `101`; the client verifies `Upgrade`,
+  `Connection` and `Sec-WebSocket-Accept`, and refuses a subprotocol or extension
+  it did not offer.
+- **ws**: stopping a server sends close `1001` to live connections and waits a
+  bounded time before dropping them. Masking keys come from a per-connection
+  generator seeded from OS randomness, and the handshake nonce no longer exposes
+  the key stream.
 - **codec**: TOML — a multibyte character after a short `\u`/`\U` escape caused a
   panic; a dotted key or table header with very many segments overflowed the
   stack (the depth limit now covers key paths).

@@ -276,6 +276,7 @@ Implementations provided:
 | `MultiError` | the common kind of its members when it can be determined and they all agree, else `Unknown` |
 | `ferroly::Error` | delegates to the wrapped module error — see below |
 | `ConfigError`, `CliError` | `InvalidInput` (see [config](config.md), [cli](cli.md)) |
+| `rest::ClientError` | by cause: a timeout is `Timeout`, an open breaker `Unavailable`, a `Status` error by its HTTP status, a bad request `InvalidInput` (see [rest](rest.md)) |
 
 A boxed `dyn Error` cannot be asked for its kind, which is why wrappers answer
 `Unknown` unless they find an error type they recognise.

@@ -274,13 +274,7 @@ impl errutils::Classify for Error {
                 }
             }
             #[cfg(feature = "rest")]
-            Error::Rest(e) => match e {
-                rest::ClientError::InvalidRequest { .. } => K::InvalidInput,
-                rest::ClientError::Transport { .. } => std::error::Error::source(e)
-                    .and_then(|s| s.downcast_ref::<http::HttpError>())
-                    .map_or(K::Unknown, classify::http),
-                _ => K::Unknown,
-            },
+            Error::Rest(e) => errutils::Classify::kind(e),
             #[cfg(feature = "ws")]
             Error::Ws(_) => K::Unavailable,
             #[cfg(feature = "http")]

@@ -25,7 +25,7 @@
 
 The original [`encode_hs256`](#legacy-encode_hs256--decode_hs256) /
 `decode_hs256` pair is kept for compatibility. It is what
-[turbo](turbo.md)'s `jwt_auth` middleware calls.
+[turbo](turbo.md)'s JWT middleware calls.
 
 ### Where the cryptography comes from
 
@@ -518,15 +518,22 @@ fn authorize(token: &str, secret: &[u8], validation: &Validation) -> Result<(), 
 | a truncated or over-long signature | `InvalidSignature` | no prefix matching |
 | a token over 64 KiB | `Malformed` | bounded work before authentication |
 
-## Use with turbo's `jwt_auth` middleware
+## Use with turbo's JWT middleware
 
-[turbo](turbo.md)'s `jwt_auth` layer calls the legacy `decode_hs256`: it pulls
-the bearer token from the `Authorization` header, verifies it against the
-configured secret, and rejects the request otherwise. It therefore inherits the
-strict parsing above, but not the `Validation` policy — in particular it does
-not require `exp`. For audience/issuer checks, expiry enforcement or
-asymmetric tokens, verify with `decode_hs256_with` or `RemoteJwks::verify` in
-an `auth` filter of your own.
+[turbo](turbo.md) builds its JWT authentication on this module:
+
+| turbo API | Verifies with | Notes |
+|---|---|---|
+| `jwt_auth_with(secret, Validation)` | `decode_hs256_with` | the recommended form: `exp` required, 16-byte minimum secret, your audience / issuer / leeway policy |
+| `jwt_auth_hmac_with(alg, secret, Validation)` | `decode_hmac_with` | HS384 / HS512 |
+| `jwt_auth_jwks(...)` | `Jwks` / `RemoteJwks::verify` | RS256 / ES256 from an identity provider, following key rotation |
+| `JwtAuth` | any of the above | builder form, including optional authentication and `Group::jwt` |
+| `jwt_auth(secret)` | legacy `decode_hs256` | kept for compatibility: strict parsing, but **no** `Validation` policy and no `exp` requirement |
+
+Verified claims are available to handlers through `ctx.claims()`, and
+`require_scopes` / `require_any_scope` / `require_roles` / `require_any_role`
+guard routes using [`Scopes`](#scopes-and-roles). A failed check answers `401`
+with a `WWW-Authenticate` header, or `403` for a missing scope.
 
 ## Limitations
 
@@ -555,7 +562,7 @@ For obtaining tokens as a *client* (OAuth 2.0 client credentials), see
 
 - [hash](hash.md) — the HMAC, SHA-2, base64 and `Secret` primitives.
 - [clients](clients.md) — outbound auth providers and OAuth 2.0 client credentials.
-- [turbo](turbo.md) — the `jwt_auth` middleware built on `decode_hs256`.
+- [turbo](turbo.md) — `jwt_auth_with`, `jwt_auth_jwks` and the scope guards built on this module.
 - [codec](codec.md) — the [`Value`](codec.md) type used for claims.
 
 ---
