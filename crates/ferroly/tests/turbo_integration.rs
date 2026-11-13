@@ -385,14 +385,14 @@ async fn trace_context_propagates_trace_id() {
     ferroly::log::set_global(ferroly::log::Logger::json().to_writer(buf.clone()));
 
     let router = Router::new().trace_context().get("/t", |_ctx| async move {
-        // Logged deep in the handler with no logger threaded in — the trace_id
-        // set by `trace_context` must still attach.
+        // Logged deep in the handler with no logger threaded in — the request
+        // context set by `trace_context` must still attach.
         ferroly::log::info("in-handler", &[]);
         HttpResponse::text(StatusCode::OK, "ok")
     });
     let base = spawn(router).await;
 
-    let _ = Client::new()
+    let resp = Client::new()
         .send(
             Request::builder(Method::Get, &format!("{base}/t"))
                 .unwrap()
@@ -401,10 +401,18 @@ async fn trace_context_propagates_trace_id() {
         )
         .await
         .unwrap();
+    // The (valid) inbound id is echoed.
+    assert_eq!(resp.headers().get("x-request-id"), Some("req-42"));
 
     let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-    assert!(out.contains(r#""trace_id":"req-42""#), "log was {out:?}");
+    assert!(out.contains(r#""request_id":"req-42""#), "log was {out:?}");
     assert!(out.contains(r#""msg":"in-handler""#), "log was {out:?}");
+    // Without `obs` the trace id is the request id; with it, the id of the
+    // request's span (covered in `turbo_observe.rs`).
+    #[cfg(not(feature = "obs"))]
+    assert!(out.contains(r#""trace_id":"req-42""#), "log was {out:?}");
+    #[cfg(feature = "obs")]
+    assert!(out.contains(r#""span_id":""#), "log was {out:?}");
 }
 
 #[cfg(feature = "auth")]
@@ -539,6 +547,9 @@ async fn strict_slash_and_rate_limit() {
     assert_eq!(send(&base, Method::Get, "/").await.0, 429);
 }
 
+// `metrics()` / `metrics_route()` exist only with the `metrics` feature; without
+// this gate `cargo check --features turbo --all-targets` fails.
+#[cfg(feature = "metrics")]
 #[tokio::test]
 async fn metrics_middleware_and_endpoint() {
     let router = Router::new()
@@ -561,7 +572,7 @@ async fn metrics_middleware_and_endpoint() {
         "body={body}"
     );
     assert!(
-        body.contains(r#"http_requests_total{method="GET",status="200"}"#),
+        body.contains(r#"http_requests_total{method="GET",route="/hello",status="200"}"#),
         "body={body}"
     );
     assert!(
