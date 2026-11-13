@@ -1,10 +1,11 @@
 //! HTTP client + server framework.
 //!
 //! A full HTTP client and server framework, entirely in-house. The **client** wraps
-//! [`ferroly::http::Client`] with codec-aware bodies, pluggable auth, and retry.
-//! The **server** wraps the first-class [`ferroly::turbo`] router and the
-//! [`ferroly::http`] server, integrated with [`ferroly::lifecycle`] for graceful
-//! start/stop.
+//! [`ferroly::http::Client`] with codec-aware bodies, pluggable auth, retry,
+//! circuit breaking and pagination. The **server** wraps the first-class
+//! [`ferroly::turbo`] router and the [`ferroly::http`] server (plain or TLS),
+//! integrated with [`ferroly::lifecycle`] for graceful start/stop and
+//! restart.
 //!
 //! ```no_run
 //! use ferroly::rest::{Client, Server, ServerOptions};
@@ -31,8 +32,8 @@ mod server;
 
 pub use client::{Client, ClientOptions, ClientOptionsBuilder, RequestBuilder, Response};
 pub use error::ClientError;
-pub use server::{Server, ServerBuilder, ServerOptions};
+pub use server::{Server, ServerBuilder, ServerOptions, ServerTls};
 
 // Re-export the router/handler types REST handlers use.
 pub use ferroly::http::{HttpResponse, Method, StatusCode};
-pub use ferroly::turbo::{Ctx, Router};
+pub use ferroly::turbo::{Cors, Ctx, Group, IntoResponse, Route, Router, SecurityHeaders};
