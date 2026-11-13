@@ -32,11 +32,10 @@
 //! | Every function, type and module re-exported here | yes |
 //! | `select!`, `join!`, `try_join!`, `pin!`, `task_local!` | yes |
 //! | [`async_test!`] and [`async_main!`] | yes |
-//! | `#[ferroly::rt::test]` / `#[ferroly::rt::main]` **bare** | **no** — the attribute expands to `::tokio::…` paths |
-//! | `#[ferroly::rt::test(crate = "ferroly::rt::__tokio")]` (and the same for `main`) | yes |
+//! | `#[ferroly::rt::test]` / `#[ferroly::rt::main]` | yes |
 //!
-//! The two attribute macros are tokio's own, re-exported unchanged; a re-export
-//! cannot change the crate path a procedural macro emits. See
+//! The two attributes wrap tokio's own and point them at Ferroly's copy of
+//! tokio, so they need no `tokio` dependency. See
 //! [Entry points and async tests](#entry-points-and-async-tests) below.
 //!
 //! # Entry points and async tests
@@ -61,15 +60,15 @@
 //! ```
 //!
 //! The attribute forms accept every tokio option (`flavor`, `worker_threads`,
-//! `start_paused`, …) but must be told where tokio lives:
+//! `start_paused`, …):
 //!
 //! ```no_run
-//! #[ferroly::rt::main(crate = "ferroly::rt::__tokio")]
+//! #[ferroly::rt::main]
 //! async fn main() {}
 //! ```
 //!
 //! ```
-//! #[ferroly::rt::test(crate = "ferroly::rt::__tokio")]
+//! #[ferroly::rt::test(flavor = "multi_thread", worker_threads = 2)]
 //! async fn it_works() {}
 //! # fn main() {}
 //! ```
@@ -103,9 +102,9 @@ pub use cancel::{CancellationToken, DropGuard};
 pub use shutdown::{shutdown_signal, ShutdownSignal};
 pub use tracker::{TaskTracker, TrackerTimeout};
 
-/// The `tokio` crate itself, for the one place a path to it must be spelled
-/// out: the `crate = "…"` argument of the [`macro@test`] and [`macro@main`]
-/// attributes (`#[ferroly::rt::test(crate = "ferroly::rt::__tokio")]`).
+/// The `tokio` crate itself. The [`macro@test`] and [`macro@main`] attributes
+/// expand to this path; you only spell it out yourself when the `ferroly`
+/// dependency is renamed (`crate = "renamed::rt::__tokio"`).
 ///
 /// This path is a supported part of the API for that purpose. Reaching through
 /// it for anything else works, but ties your code to whichever tokio version
@@ -256,37 +255,37 @@ pub mod runtime {
 
 // ---- entry points and tests ---------------------------------------------------
 
-/// tokio's `#[test]` attribute for async tests, re-exported unchanged.
+/// The `#[test]` attribute for async tests.
 ///
-/// **A bare `#[ferroly::rt::test]` only compiles in a crate that also depends
-/// on `tokio`**: the attribute expands to `::tokio::…` paths, and a re-export
-/// cannot change that. In a crate that depends only on `ferroly`, either point
-/// it at Ferroly's copy of tokio with the `crate` argument —
+/// It is tokio's test attribute, pointed at Ferroly's copy of tokio so it works
+/// in a crate that depends only on `ferroly`. Every tokio option is accepted
+/// (`flavor`, `worker_threads`, `start_paused`, …).
 ///
 /// ```
-/// #[ferroly::rt::test(crate = "ferroly::rt::__tokio")]
+/// #[ferroly::rt::test]
 /// async fn it_works() { /* … */ }
 /// # fn main() {}
 /// ```
 ///
-/// — or use the declarative [`async_test!`], which needs no argument. (If you
-/// renamed the `ferroly` dependency, use your name in the `crate` path.)
-#[doc(no_inline)]
-pub use tokio::test;
+/// The generated code names `::ferroly`, so if you renamed the `ferroly`
+/// dependency pass the path yourself —
+/// `#[renamed::rt::test(crate = "renamed::rt::__tokio")]` — or use the
+/// declarative [`async_test!`].
+pub use ferroly_derive::rt_test as test;
 
-/// tokio's `#[main]` attribute, re-exported unchanged.
+/// The `#[main]` attribute for an async entry point.
 ///
-/// Like [`macro@test`], the bare form only compiles next to a direct `tokio`
-/// dependency. Without one, pass the `crate` argument —
+/// Like [`macro@test`], it is tokio's attribute pointed at Ferroly's copy of
+/// tokio, and accepts every tokio option.
 ///
 /// ```no_run
-/// #[ferroly::rt::main(crate = "ferroly::rt::__tokio")]
+/// #[ferroly::rt::main]
 /// async fn main() { /* … */ }
 /// ```
 ///
-/// — or use the declarative [`async_main!`].
-#[doc(no_inline)]
-pub use tokio::main;
+/// With a renamed `ferroly` dependency, pass `crate = "renamed::rt::__tokio"`
+/// or use the declarative [`async_main!`].
+pub use ferroly_derive::rt_main as main;
 
 /// Builds a current-thread runtime and runs `future` on it. Support code for
 /// [`async_test!`]; not part of the public API.

@@ -18,6 +18,56 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Added
 
 <!-- ADDED -->
+- **http**: `Client::builder()` with connect, response-head, read-idle and total
+  timeouts, a response-body size cap (64 MiB by default), connection-pool size and
+  idle expiry, a default `User-Agent`, optional redirect following, forward
+  proxies (absolute-form for `http://`, `CONNECT` tunnels for `https://`, basic
+  auth, opt-in `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`), request/response
+  interceptors, opt-in `gzip`/`deflate` response decompression, and
+  `Client::send_streaming` for uploads from an async reader.
+- **http**: client TLS options (`ClientTlsConfig`): custom CA roots in addition to
+  or instead of the web PKI, client certificates, minimum TLS version.
+- **http**: server TLS options (`TlsConfig::builder()`): mutual TLS (required or
+  optional) and minimum TLS version; `ReloadableTlsConfig` +
+  `serve_tls_reloadable` to rotate certificates without a restart.
+- **http**: `Request::peer_addr()`, `local_addr()`, `is_tls()` and
+  `peer_certificates()` for server handlers.
+- **http**: `ServerConfig` gains `write_timeout`, `idle_timeout`,
+  `handler_timeout`, `keep_alive`, `max_header_bytes`, `max_headers`,
+  `max_line_bytes`, `normalize_paths` and `on_error` (`ErrorHook`).
+- **http**: `RequestBuilder::form`, `Multipart`, `percent_encode`,
+  `percent_decode`, `normalize_path`, `form_urlencode`, `format_http_date`,
+  `Uri::resolve`, `Method::try_parse`, `HeaderMap::get_all` / `remove` / `try_set`
+  / `try_append`, more `StatusCode` constants, `Response::uri` and
+  `Response::set_max_body_bytes`.
+- **http**: new `HttpError` variants `ConnectTimeout`, `BodyTooLarge`,
+  `TooManyRedirects`, `Proxy`, `HandlerPanic`, and `HttpError::is_timeout()`.
+- **hash**: `Sha512` and `Sha384`; a generic `Hmac<H>` with `HmacSha384`,
+  `HmacSha512`, `HmacSha1` and a constant-time `verify`; `Md5` and `Crc32`
+  checksums (not cryptographic); `kdf` with HKDF and PBKDF2; a public `base64`
+  module (standard and URL-safe, padded and unpadded, strict decoding plus an
+  explicit `decode_lenient`); a `hex` module and `Digest::from_hex`; `ct_eq` for
+  constant-time comparison; `Secret`, which redacts itself in `Debug`/`Display`
+  and is wiped on drop (best-effort); and `random` for secure random bytes and
+  tokens (Unix only; other platforms return an explicit error).
+- **auth**: `Validation` with `decode_hs256_with` / `decode_hmac_with`: expiry
+  required by default, leeway, `nbf`/`iat` checks, maximum age, audience, issuer,
+  subject, required claims and `typ`. HS384 and HS512. `encode_hmac` /
+  `encode_with_header` (with `kid`). `decode_header`. A `Scopes` helper for
+  `scope` / `scp` / `roles` claims.
+- **auth** (with `http`): verify-only RS256 and ES256 from JWK / JWKS keys (`Jwk`,
+  `Jwks`) and `RemoteJwks`, a cached key set that follows key rotation.
+- **clients**: an RAII circuit-breaker `Permit` (`try_acquire`, `call`,
+  `call_with`), a failure-rate window, state-change callbacks, metrics, and
+  `CircuitBreakerRegistry`. `Retry` with jitter, a total time limit, a shared
+  `RetryBudget`, and a hook that can honour `Retry-After` (`parse_retry_after`).
+  `Bulkhead`, `RateLimiter`, `with_timeout`, `Deadline`, and `Policy`, which
+  composes them.
+- **clients**: refreshing credentials — `AuthProvider::prepare`, `authorize`,
+  `TokenSource`, `RefreshingAuth` and `OAuth2ClientCredentials`
+  (client-credentials grant).
+- **rt**: the `rt-test-util` feature re-exports the paused test clock
+  (`rt::time::{pause, advance, resume}`).
 - **fsutils**: `write_atomic` / `AtomicFile` (temporary sibling, fsync, rename);
   `TempDir` / `TempFile` (unique names, removed on drop); `LockFile`, an advisory
   create-new lock file; `Mmap::map`, `Mmap::map_supported`, `Mmap::is_mapped`.
@@ -151,6 +201,34 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Changed
 
 <!-- CHANGED -->
+- **http** server: malformed requests are answered
+  (`400`/`408`/`413`/`414`/`417`/`431`/`501`/`505`) and the connection closed.
+  HTTP/1.1 requests need exactly one `Host` header; HTTP/1.0 connections close
+  unless the client asks for keep-alive; responses carry a `Date` header; the
+  server sets `Content-Length`/`Transfer-Encoding` itself; `100 Continue` is sent
+  only after the size check. A client reading slower than the write timeout
+  (30 s per 64 KiB by default) is disconnected.
+- **http** client: `Uri::parse` rejects control characters, spaces and userinfo,
+  drops the `#fragment`, and accepts bracketed IPv6 literals. Response bodies are
+  capped at 64 MiB and body reads time out after 300 s idle by default.
+  `Response::chunk` returns pieces of at most 16 KiB. A `User-Agent` is sent by
+  default.
+- **http**: `HeaderMap::set`/`append` strip every character that is not valid in a
+  header name and all control characters from values; `content_length()` and
+  `is_chunked()` are strict.
+- **http (breaking)**: `Request` can no longer be built with a struct literal (use
+  `Request::new` / `Request::builder`); build `ServerConfig` with
+  `..ServerConfig::default()`.
+- **auth**: `decode_hs256` parses strictly. It rejects non-canonical or padded
+  base64url, claims or headers that are not JSON objects, duplicate member names,
+  a `crit` header, empty secrets, secrets that are public keys, and tokens over
+  64 KiB. Tokens from issuers that pad base64url no longer verify. `JwtError` has
+  new variants and is `Clone`.
+- **hash**: `HmacSha256` is now an alias for `Hmac<Sha256>` (same methods).
+- **clients**: the `clients` feature now enables `hash` and `codec`. `BearerAuth`,
+  `ApiKeyAuth` and `BasicAuth` no longer show their credentials in `Debug`. A
+  `CircuitBreakerConfig` with `max_half_open: 0` now allows one trial.
+- **build**: the minimum `tokio` version is 1.38.
 - **fsutils (breaking)**: `Mmap::open` now reads the file into memory and is sound
   against concurrent changes to the file. The zero-copy OS mapping is the new
   `unsafe fn Mmap::map`, and is a real mapping only on 64-bit Linux, Android,
@@ -230,6 +308,27 @@ lenient, so **read the "Changed" section before upgrading**.
 ### Fixed
 
 <!-- FIXED -->
+- **http** server: request smuggling through a second `Transfer-Encoding` header
+  or a coding other than a lone `chunked`; lenient header, `Content-Length`,
+  line-ending and chunk parsing; unbounded chunk-size lines and trailers; a
+  non-reading client holding a connection slot forever; a handler panic dropping
+  the connection without a response (now a `500`, and the server keeps serving).
+- **http** client: request splitting through CR/LF or spaces in URLs, methods and
+  hand-built request targets; `1xx` interim responses taken as the final response;
+  `HEAD` responses with `Content-Length` hanging; truncated bodies reported as
+  success; non-idempotent requests re-sent on a dead pooled connection; unbounded
+  response bodies.
+- **http**: `download_to_file` validates `Content-Range`, restarts when the server
+  ignores `Range`, and reports truncated transfers. Server-Sent Events could be
+  forged through line breaks in `data`, `event` and `id`.
+- **auth**: a token could be respelled without invalidating it (non-canonical
+  base64url or stray `=` in the signature); non-object claims were returned as
+  valid.
+- **clients**: a half-open trial whose caller was cancelled left the circuit
+  breaker stuck half-open until restart. Permits release the slot when dropped,
+  and trials taken through `can_execute` are reclaimed after a timeout.
+- **clients**: auth providers printed bearer tokens, API keys and passwords in
+  `Debug` output.
 - **fsutils**: the hand-declared `mmap` FFI used the wrong `off_t` width on 32-bit
   targets and assumed one `MAP_PRIVATE` value for all of Unix; large file lengths
   were truncated on 32-bit.

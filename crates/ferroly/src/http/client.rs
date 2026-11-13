@@ -96,7 +96,7 @@ struct Config {
 }
 
 /// A low-level HTTP/1.1 client. Higher-level ergonomics (auth, retry,
-/// codec bodies) are layered on top in [`crate::clients`] / [`crate::rest`].
+/// codec bodies) are layered on top in `ferroly::clients` / `ferroly::rest`.
 ///
 /// Cloning a `Client` shares its connection pool, so clone freely.
 #[derive(Clone)]

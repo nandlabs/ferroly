@@ -136,17 +136,18 @@ A typical service wires these in `main`:
 use ferroly::lifecycle::ComponentManager;
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() {
+#[ferroly::rt::main]
+async fn main() -> Result<(), ferroly::Error> {
     ferroly::log::set_global(ferroly::log::Logger::json());
 
     let server = Arc::new(build_rest_server());       // impls Component
     let bus = Arc::new(build_message_bus());          // impls Component
 
     let manager = ComponentManager::new();
-    manager.register(server);
-    manager.register(bus);
-    manager.start_and_wait().await.unwrap();          // start all, block on SIGINT, stop all
+    manager.register(server)?;                        // a duplicate id is an error
+    manager.register(bus)?;
+    manager.start_and_wait().await?;                  // start all, block on SIGINT/SIGTERM, stop all
+    Ok(())
 }
 ```
 

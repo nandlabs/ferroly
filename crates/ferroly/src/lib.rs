@@ -168,6 +168,17 @@ pub enum Error {
     #[error(transparent)]
     Auth(#[from] auth::JwtError),
 
+    /// A missing scope or role on otherwise valid credentials.
+    #[cfg(feature = "auth")]
+    #[error(transparent)]
+    Scope(#[from] auth::ScopeError),
+
+    /// A credential could not be obtained or refreshed (for example an OAuth 2.0
+    /// token request failed).
+    #[cfg(feature = "clients")]
+    #[error(transparent)]
+    Credentials(#[from] clients::AuthError),
+
     /// A router path/query parameter error.
     #[cfg(feature = "turbo")]
     #[error(transparent)]
@@ -278,6 +289,15 @@ impl errutils::Classify for Error {
             Error::Breaker(_) => K::Unavailable,
             #[cfg(feature = "auth")]
             Error::Auth(_) => K::Unauthenticated,
+            #[cfg(feature = "auth")]
+            Error::Scope(_) => K::PermissionDenied,
+            #[cfg(feature = "clients")]
+            Error::Credentials(e) => match e {
+                clients::AuthError::Transport(_) => K::Unavailable,
+                clients::AuthError::Rejected { .. } => K::Unauthenticated,
+                clients::AuthError::Config(_) => K::InvalidInput,
+                _ => K::Unknown,
+            },
             #[cfg(feature = "turbo")]
             Error::Param(_) => K::InvalidInput,
             #[cfg(feature = "messaging")]

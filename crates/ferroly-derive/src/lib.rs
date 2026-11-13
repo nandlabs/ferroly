@@ -190,3 +190,129 @@ pub fn derive_error(input: TokenStream) -> TokenStream {
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
+
+/// `#[ferroly::rt::test]` — the async test attribute.
+///
+/// Expands to tokio's test attribute with its `crate` path pointed at Ferroly's
+/// re-export of tokio, so a crate that depends only on `ferroly` can use it
+/// bare. Every tokio option (`flavor`, `worker_threads`, `start_paused`, …) is
+/// passed through. An explicit `crate = "…"` argument is respected as written.
+///
+/// Use it through `ferroly::rt::test`; it is not meant to be named directly.
+#[proc_macro_attribute]
+pub fn rt_test(args: TokenStream, item: TokenStream) -> TokenStream {
+    rt_entry("test", args.into(), item.into()).into()
+}
+
+/// `#[ferroly::rt::main]` — the async entry-point attribute.
+///
+/// The `main` counterpart of [`macro@rt_test`]: tokio's `main` attribute with
+/// its `crate` path pointed at Ferroly's re-export of tokio.
+///
+/// Use it through `ferroly::rt::main`; it is not meant to be named directly.
+#[proc_macro_attribute]
+pub fn rt_main(args: TokenStream, item: TokenStream) -> TokenStream {
+    rt_entry("main", args.into(), item.into()).into()
+}
+
+/// Wraps `item` in tokio's `test`/`main` attribute, adding
+/// `crate = "::ferroly::rt::__tokio"` unless the caller chose a path already.
+fn rt_entry(
+    which: &str,
+    args: proc_macro2::TokenStream,
+    item: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let attr = proc_macro2::Ident::new(which, proc_macro2::Span::call_site());
+    if rt_args_name_a_crate(&args) {
+        return quote::quote! {
+            #[::ferroly::rt::__tokio::#attr(#args)]
+            #item
+        };
+    }
+    let separator = if args.is_empty() {
+        proc_macro2::TokenStream::new()
+    } else {
+        quote::quote!(,)
+    };
+    quote::quote! {
+        #[::ferroly::rt::__tokio::#attr(crate = "::ferroly::rt::__tokio" #separator #args)]
+        #item
+    }
+}
+
+/// Whether the attribute arguments already contain a top-level `crate = …`.
+fn rt_args_name_a_crate(args: &proc_macro2::TokenStream) -> bool {
+    let mut previous_was_crate = false;
+    for token in args.clone() {
+        match token {
+            proc_macro2::TokenTree::Ident(ident) => previous_was_crate = ident == "crate",
+            proc_macro2::TokenTree::Punct(punct)
+                if punct.as_char() == '=' && previous_was_crate =>
+            {
+                return true;
+            }
+            _ => previous_was_crate = false,
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod rt_entry_tests {
+    use super::{rt_args_name_a_crate, rt_entry};
+    use quote::quote;
+
+    #[test]
+    fn bare_attribute_gets_the_ferroly_tokio_path() {
+        let out = rt_entry(
+            "test",
+            quote!(),
+            quote!(
+                async fn t() {}
+            ),
+        )
+        .to_string();
+        assert!(out.contains(":: ferroly :: rt :: __tokio :: test"), "{out}");
+        assert!(out.contains("crate = \"::ferroly::rt::__tokio\""), "{out}");
+    }
+
+    #[test]
+    fn options_are_passed_through_after_the_crate_path() {
+        let out = rt_entry(
+            "main",
+            quote!(flavor = "multi_thread", worker_threads = 2),
+            quote!(
+                async fn main() {}
+            ),
+        )
+        .to_string();
+        assert!(out.contains(":: ferroly :: rt :: __tokio :: main"), "{out}");
+        assert!(
+            out.contains("crate = \"::ferroly::rt::__tokio\" , flavor"),
+            "{out}"
+        );
+        assert!(out.contains("worker_threads = 2"), "{out}");
+    }
+
+    #[test]
+    fn an_explicit_crate_argument_is_respected() {
+        let args = quote!(crate = "my::tokio", start_paused = true);
+        assert!(rt_args_name_a_crate(&args));
+        let out = rt_entry(
+            "test",
+            args,
+            quote!(
+                async fn t() {}
+            ),
+        )
+        .to_string();
+        assert!(out.contains("crate = \"my::tokio\""), "{out}");
+        assert!(!out.contains("\"::ferroly::rt::__tokio\""), "{out}");
+    }
+
+    #[test]
+    fn a_value_that_mentions_crate_is_not_a_crate_argument() {
+        assert!(!rt_args_name_a_crate(&quote!(flavor = "crate")));
+        assert!(!rt_args_name_a_crate(&quote!()));
+    }
+}

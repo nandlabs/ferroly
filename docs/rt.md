@@ -41,14 +41,11 @@ dev-dependency:
 | `select!`, `join!`, `try_join!`, `pin!`, `task_local!` | yes |
 | `async_test!`, `async_main!` (Ferroly's own) | yes |
 | `CancellationToken`, `TaskTracker`, `shutdown_signal` | yes |
-| `#[ferroly::rt::test]` / `#[ferroly::rt::main]` written **bare** | **no** — compile error: `cannot find crate tokio` |
-| `#[ferroly::rt::test(crate = "ferroly::rt::__tokio")]` (and the same for `main`) | yes |
-| `time::pause` / `advance` / `resume` (paused test clock) | **not available** — see [Not re-exported](#not-re-exported) |
+| `#[ferroly::rt::test]` / `#[ferroly::rt::main]` | yes |
+| `time::pause` / `advance` / `resume` (paused test clock) | with the `rt-test-util` feature — see [The paused test clock](#the-paused-test-clock) |
 
-The two attributes are tokio's own procedural macros, re-exported unchanged.
-They expand to `::tokio::…` paths, and a re-export cannot change the paths a
-procedural macro emits — so the bare form only compiles in a crate that also
-depends on `tokio`. The next section shows the two ways around that.
+The two attributes wrap tokio's own and point them at Ferroly's copy of tokio,
+so they compile in a crate that depends only on `ferroly`.
 
 ## Entry points and async tests
 
@@ -100,24 +97,24 @@ They do not take tokio's options (`flavor`, `worker_threads`, `start_paused`,
 ### Attribute macros (all of tokio's options)
 
 `#[ferroly::rt::test]` and `#[ferroly::rt::main]` accept everything
-`#[tokio::test]` / `#[tokio::main]` do. In a crate without its own `tokio`
-dependency, tell them where tokio lives with the `crate` argument:
+`#[tokio::test]` / `#[tokio::main]` do, and need no `tokio` dependency:
 
 ```rust
-#[ferroly::rt::main(crate = "ferroly::rt::__tokio")]
+#[ferroly::rt::main]
 async fn main() { /* … */ }
 
-#[ferroly::rt::test(crate = "ferroly::rt::__tokio")]
+#[ferroly::rt::test]
 async fn it_works() { /* … */ }
 
-#[ferroly::rt::test(crate = "ferroly::rt::__tokio", flavor = "multi_thread", worker_threads = 2)]
+#[ferroly::rt::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_two_workers() { /* … */ }
 ```
 
-`ferroly::rt::__tokio` is the `tokio` crate, re-exported for exactly this
-purpose; it is hidden from the generated docs but is a supported path. If you
-renamed the `ferroly` dependency in your `Cargo.toml`, use your name in the
-string. In a crate that *does* depend on `tokio`, the bare attributes work too.
+The generated code names `::ferroly`. If you renamed the `ferroly` dependency in
+your `Cargo.toml`, pass the path yourself with tokio's `crate` argument —
+`#[renamed::rt::test(crate = "renamed::rt::__tokio")]` — or use the declarative
+macros above. (`ferroly::rt::__tokio` is the `tokio` crate, re-exported for this
+purpose; it is hidden from the generated docs but is a supported path.)
 
 ### By hand
 
@@ -154,14 +151,28 @@ fn main() {
 `ferroly::rt::fs` is the raw tokio file surface. For path-confined or
 backend-agnostic file access use [vfs](vfs.md).
 
+### The paused test clock
+
+`time::pause`, `time::advance` and `time::resume` exist only when tokio's
+`test-util` feature is on, which Ferroly does not enable for normal builds. Turn
+it on for tests with the `rt-test-util` feature:
+
+```toml
+[dev-dependencies]
+ferroly = { version = "0.4", features = ["rt-test-util"] }
+```
+
+```rust
+#[ferroly::rt::test(start_paused = true)]
+async fn timeouts_fire_without_waiting() {
+    let sleep = ferroly::rt::time::sleep(std::time::Duration::from_secs(3600));
+    ferroly::rt::time::advance(std::time::Duration::from_secs(3600)).await;
+    sleep.await;
+}
+```
+
 ### Not re-exported
 
-- **`time::pause`, `time::advance`, `time::resume`** — the paused test clock
-  exists only when tokio's `test-util` feature is enabled, and Ferroly does not
-  enable it for normal builds. A test suite that wants a paused clock needs its
-  own `tokio` dev-dependency with `test-util` (after which
-  `#[tokio::test(start_paused = true)]` and `tokio::time::advance` work
-  alongside `ferroly::rt`).
 - Anything else in tokio that is not in the table above (`tokio::io::Lines`
   types, `tokio::net::tcp` split halves, `tokio::task::Builder`, runtime
   metrics, …).
