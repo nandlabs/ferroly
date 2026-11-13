@@ -6,7 +6,7 @@ use ferroly::genai::Capability;
 
 /// A fixed-vocabulary rule key for [`RuleBasedStrategy`](super::RuleBasedStrategy)
 /// lookups. Carries no model mapping on its own; finer-grained policy uses
-/// [`Task::tags`].
+/// [`Task::tags`], which rules can match as well.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskKind {
@@ -24,10 +24,37 @@ pub enum TaskKind {
     Reason,
 }
 
+impl TaskKind {
+    /// Parses a kind name as used in configuration (`chat`, `codegen` /
+    /// `code_gen`, `summarize`, `extract`, `classify`, `reason`), ignoring
+    /// case. `None` for anything else.
+    pub fn parse(name: &str) -> Option<TaskKind> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "chat" => TaskKind::Chat,
+            "codegen" | "code_gen" | "code" => TaskKind::CodeGen,
+            "summarize" | "summarise" | "summary" => TaskKind::Summarize,
+            "extract" | "extraction" => TaskKind::Extract,
+            "classify" | "classification" => TaskKind::Classify,
+            "reason" | "reasoning" => TaskKind::Reason,
+            _ => return None,
+        })
+    }
+}
+
 /// What to optimize the selection for.
+///
+/// | Priority | Ranks by | Ties broken by |
+/// |---|---|---|
+/// | `Quality` | [`ModelInfo::quality_rank`](super::ModelInfo::quality_rank), highest first | lower estimated cost, then `provider/model` name |
+/// | `Speed` | [`ModelInfo::speed_rank`](super::ModelInfo::speed_rank), highest first | lower estimated cost, then name |
+/// | `Cost` | estimated cost, lowest first | higher quality rank, then name |
+///
+/// A model without the relevant rank sorts after every ranked model; among
+/// unranked models the context size is used as a rough stand-in (larger for
+/// `Quality`, smaller for `Speed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Priority {
-    /// Prefer faster / smaller models.
+    /// Prefer the fastest model.
     Speed,
     /// Prefer the cheapest model that fits.
     Cost,
@@ -54,7 +81,9 @@ pub struct Pin {
 pub struct Task {
     /// Rule-lookup key (optional; route purely on capabilities when `None`).
     pub kind: Option<TaskKind>,
-    /// Free-form policy tags, e.g. `["sensitive", "long-context"]`.
+    /// Free-form policy tags, e.g. `["sensitive", "long-context"]`. A
+    /// [`RuleBasedStrategy`](super::RuleBasedStrategy) rule may require tags:
+    /// it then matches only tasks carrying all of them.
     pub tags: Vec<String>,
     /// Estimated input tokens (limit + cost checks).
     pub est_input_tokens: u32,
@@ -70,6 +99,14 @@ pub struct Task {
     pub pin: Option<Pin>,
     /// Overall deadline across all attempts.
     pub deadline: Option<Instant>,
+    /// The key (tenant, user, API key id) whose cumulative spend this call is
+    /// charged to and checked against, when the router has a budget
+    /// configured.
+    pub budget_key: Option<String>,
+    /// Calls with the same key keep being routed to the model that last
+    /// served that key, as long as it is still eligible — useful for prompt
+    /// caches and consistent behaviour within a conversation.
+    pub sticky_key: Option<String>,
 }
 
 impl Task {
@@ -122,5 +159,33 @@ impl Task {
     pub fn deadline(mut self, at: Instant) -> Self {
         self.deadline = Some(at);
         self
+    }
+
+    /// Adds a policy tag.
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    /// Charges the call to a cumulative budget key.
+    pub fn budget_key(mut self, key: impl Into<String>) -> Self {
+        self.budget_key = Some(key.into());
+        self
+    }
+
+    /// Keeps calls with this key on the same model.
+    pub fn sticky_key(mut self, key: impl Into<String>) -> Self {
+        self.sticky_key = Some(key.into());
+        self
+    }
+
+    /// The output-token estimate used for cost ranking: the explicit
+    /// estimate, or the default for the task kind.
+    pub fn output_estimate(&self) -> u32 {
+        if self.est_output_tokens > 0 {
+            self.est_output_tokens
+        } else {
+            super::strategy::default_output_estimate(self.kind)
+        }
     }
 }

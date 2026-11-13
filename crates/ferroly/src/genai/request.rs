@@ -13,28 +13,93 @@ pub struct ToolDefinition {
     pub description: String,
     /// A JSON Schema describing the tool's parameters.
     pub parameters: Value,
+    /// Ask the provider to guarantee that the arguments match `parameters`
+    /// exactly (OpenAI and Claude "strict" tools). The schema must then meet
+    /// the provider's strict-schema rules (`additionalProperties: false`,
+    /// every property required).
+    pub strict: bool,
 }
 
 impl ToolDefinition {
-    /// Creates a tool definition.
+    /// Creates a (non-strict) tool definition.
     pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
             parameters,
+            strict: false,
         }
+    }
+
+    /// Turns strict argument validation on or off.
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 }
 
+/// A named JSON Schema for structured output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonSchemaFormat {
+    /// A name for the schema (letters, digits, `_` and `-`). OpenAI requires
+    /// one; other providers ignore it.
+    pub name: String,
+    /// What the output represents, for the model's benefit.
+    pub description: Option<String>,
+    /// The JSON Schema the output must conform to.
+    pub schema: Value,
+    /// Ask the provider to **guarantee** conformance (OpenAI `strict: true`).
+    /// The schema must then meet the provider's strict-schema rules.
+    pub strict: bool,
+}
+
 /// The requested shape of the model's response.
+///
+/// | Variant | OpenAI | Claude | Ollama |
+/// |---|---|---|---|
+/// | `Json` | `response_format: {type: "json_object"}` | **not supported** — the Messages API has no schema-less JSON mode, so the call fails with `GenAiError::Unsupported`; use a schema | `format: "json"` |
+/// | `JsonSchema` / `Schema` | `response_format: {type: "json_schema", …}` | `output_config.format: {type: "json_schema", schema}` | `format: <schema>` |
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResponseFormat {
     /// Free-form text (the default).
     Text,
-    /// A JSON object (provider "JSON mode").
+    /// A JSON object (provider "JSON mode"), with no schema.
     Json,
-    /// A JSON object conforming to the given JSON Schema.
+    /// A JSON object conforming to the given JSON Schema — shorthand for
+    /// [`Schema`](ResponseFormat::Schema) with the name `response` and
+    /// `strict: false`.
     JsonSchema(Value),
+    /// A JSON object conforming to a named schema, optionally strict.
+    Schema(JsonSchemaFormat),
+}
+
+impl ResponseFormat {
+    /// A named schema with strict conformance requested.
+    pub fn strict_schema(name: impl Into<String>, schema: Value) -> Self {
+        ResponseFormat::Schema(JsonSchemaFormat {
+            name: name.into(),
+            description: None,
+            schema,
+            strict: true,
+        })
+    }
+
+    /// The schema this format carries, as `(name, description, schema,
+    /// strict)`; `None` for `Text` and `Json`.
+    #[allow(dead_code)] // used by the feature-gated providers
+    pub(crate) fn schema_parts(&self) -> Option<(&str, Option<&str>, &Value, bool)> {
+        match self {
+            ResponseFormat::JsonSchema(schema) => Some(("response", None, schema, false)),
+            ResponseFormat::Schema(f) => Some((
+                f.name.as_str(),
+                f.description.as_deref(),
+                &f.schema,
+                f.strict,
+            )),
+            _ => None,
+        }
+    }
 }
 
 /// How the model should decide whether to call a tool.
@@ -53,7 +118,7 @@ pub enum ToolChoice {
 /// A provider-agnostic completion request.
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
-    /// The model identifier (e.g. `gpt-4o`, `claude-sonnet-5`).
+    /// The model identifier (e.g. `gpt-4o`, `claude-sonnet-5-5`).
     pub model: String,
     /// The conversation so far.
     pub messages: Vec<Message>,

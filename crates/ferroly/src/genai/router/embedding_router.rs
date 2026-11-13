@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use ferroly::genai::{BoxFuture, Capability, EmbedRequest, EmbedResponse, Embedder, GenAiError};
 
-use super::execute::is_retryable;
+use super::execute::classify;
 use super::registry::ModelRegistry;
 use super::route::{Candidate, Route};
 use super::strategy::RoutingStrategy;
@@ -57,7 +57,15 @@ impl EmbeddingRouter {
             task.required.push(Capability::Embeddings);
         }
         let reg = self.registry.read().expect("registry lock").clone();
-        let ranking = self.strategy.rank(&task, reg.as_ref());
+        let mut ranking = self.strategy.rank(&task, reg.as_ref());
+        // Whatever the strategy ranked, only a model the registry knows to
+        // embed (or does not know at all) can serve an embedding call.
+        ranking
+            .candidates
+            .retain(|c| match reg.get(&c.provider, &c.model) {
+                Some(info) => info.has(Capability::Embeddings),
+                None => true,
+            });
         if ranking.candidates.is_empty() {
             return Err(RouterError::NoRoute {
                 reason: format!(
@@ -94,11 +102,12 @@ impl EmbeddingRouter {
                 match embedder.embed(req).await {
                     Ok(resp) => return Ok(resp),
                     Err(e) => {
-                        let retry = is_retryable(&e, None);
-                        last_err = Some(e);
-                        if !retry {
-                            return Err(RouterError::GenAi(last_err.expect("just set")));
+                        // Embedding is idempotent, so a timeout is failed over
+                        // like any other transient error.
+                        if !classify(&e, true, true).fallover {
+                            return Err(RouterError::GenAi(e));
                         }
+                        last_err = Some(e);
                     }
                 }
             }
@@ -108,7 +117,9 @@ impl EmbeddingRouter {
                     last: e,
                 }),
                 None => Err(RouterError::NoRoute {
-                    reason: "no attemptable embedder".to_string(),
+                    reason: "no candidate could be attempted: no embedder is registered for the \
+                             ranked provider(s)"
+                        .to_string(),
                 }),
             }
         })

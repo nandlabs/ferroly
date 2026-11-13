@@ -11,9 +11,14 @@ use ferroly::genai::{
 /// [`GenAiProvider`] object-safe without the `async-trait` dependency.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// A stream of streaming completion chunks, delivered over a tokio channel.
+/// A stream of streaming completion events, delivered over a tokio channel.
 ///
-/// Consume with `while let Some(chunk) = stream.recv().await { ... }`.
+/// Consume with `while let Some(chunk) = stream.recv().await { ... }`, or fold
+/// it into a [`CompletionResponse`] with
+/// [`collect_stream`](crate::genai::collect_stream). Each item is a
+/// [`CompletionChunk`] event or the error that ended the stream. Dropping the
+/// receiver cancels the stream: the provider's reader task stops and closes
+/// its connection.
 pub type ChunkStream = tokio::sync::mpsc::Receiver<Result<CompletionChunk, GenAiError>>;
 
 /// A provider-agnostic LLM backend.
@@ -54,5 +59,13 @@ pub trait GenAiProvider: Send + Sync {
     /// rule or pin. Providers override this to advertise their catalog.
     fn model_catalog(&self) -> Vec<ModelInfo> {
         Vec::new()
+    }
+
+    /// The catalog entry for `model`, if this provider advertises one.
+    ///
+    /// The default scans [`model_catalog`](GenAiProvider::model_catalog);
+    /// providers with an indexed catalog may override it.
+    fn model_info_for(&self, model: &str) -> Option<ModelInfo> {
+        self.model_catalog().into_iter().find(|m| m.name == model)
     }
 }

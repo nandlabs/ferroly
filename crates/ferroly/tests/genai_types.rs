@@ -5,8 +5,8 @@
 use ferroly::codec::Value;
 use ferroly::genai::{
     BoxFuture, Capability, ChunkStream, CompletionChunk, CompletionRequest, CompletionResponse,
-    GenAiError, GenAiProvider, Message, MessagePart, Options, ResponseFormat, Role, ToolChoice,
-    ToolDefinition, Usage,
+    FinishReason, GenAiError, GenAiProvider, Message, MessagePart, Options, RateLimitInfo,
+    ResponseFormat, Role, TimeoutPhase, ToolChoice, ToolDefinition, Usage,
 };
 use std::sync::Arc;
 
@@ -75,16 +75,15 @@ fn tool_choice_and_structured_output() {
         city: String,
         population: u32,
     }
-    let resp = CompletionResponse {
-        model: "m".into(),
-        message: Message::text(
+    let resp = CompletionResponse::new(
+        "m",
+        Message::text(
             Role::Assistant,
             "r",
             r#"{"city":"Paris","population":2100000}"#,
         ),
-        finish_reason: Some("stop".into()),
-        usage: None,
-    };
+    )
+    .with_raw_finish_reason("stop");
     let answer: Answer = resp.decode().unwrap();
     assert_eq!(
         answer,
@@ -123,19 +122,27 @@ fn response_helpers() {
         prompt_tokens: Some(3),
         completion_tokens: Some(5),
         total_tokens: Some(8),
+        ..Default::default()
     };
-    let resp = CompletionResponse {
-        model: "m".into(),
-        message: Message::text(Role::Assistant, "r", "hi there"),
-        finish_reason: Some("stop".into()),
-        usage: Some(usage.clone()),
-    };
+    assert_eq!(Usage::new(3, 5), usage);
+    let resp = CompletionResponse::new("m", Message::text(Role::Assistant, "r", "hi there"))
+        .with_raw_finish_reason("end_turn")
+        .with_usage(usage.clone());
     assert_eq!(resp.text(), "hi there");
+    // The normalized reason and the provider's own string are both kept.
+    assert_eq!(resp.finish_reason, Some(FinishReason::Stop));
+    assert_eq!(resp.raw_finish_reason.as_deref(), Some("end_turn"));
+    assert!(!resp.is_truncated());
     assert_eq!(resp.usage.unwrap(), usage);
 
-    let chunk = CompletionChunk::default();
-    assert!(chunk.delta.is_empty());
+    // A chunk that is not text contributes no text.
+    assert_eq!(CompletionChunk::done(FinishReason::Stop).text(), "");
+    assert_eq!(CompletionChunk::text_delta("hi").text(), "hi");
     assert_eq!(Usage::default(), Usage::default());
+
+    let from_text = CompletionResponse::from_text("m", "plain");
+    assert_eq!(from_text.text(), "plain");
+    assert_eq!(from_text.finish_reason, Some(FinishReason::Stop));
 }
 
 #[test]
@@ -154,10 +161,40 @@ fn error_display_covers_every_variant() {
         },
         GenAiError::ResponseParse("bad".into()),
         GenAiError::Config("cfg".into()),
+        GenAiError::Timeout {
+            phase: TimeoutPhase::Response,
+        },
+        GenAiError::RateLimited {
+            message: "slow".into(),
+            retry_after: None,
+            limits: RateLimitInfo::default(),
+        },
+        GenAiError::Auth {
+            status: 401,
+            message: "no".into(),
+        },
+        GenAiError::ContentFilter {
+            message: "blocked".into(),
+        },
+        GenAiError::ContextLengthExceeded {
+            message: "too long".into(),
+        },
+        GenAiError::Overloaded {
+            status: 529,
+            message: "busy".into(),
+            retry_after: None,
+        },
     ];
+    let mut labels = std::collections::HashSet::new();
     for e in &errors {
         assert!(!e.to_string().is_empty());
+        assert!(labels.insert(e.kind_label()), "duplicate label for {e}");
     }
+    assert_eq!(
+        errors[7].to_string(),
+        "request timed out (response)",
+        "the timeout phase is part of the message"
+    );
 }
 
 /// A minimal provider used to exercise the trait directly.
@@ -172,12 +209,10 @@ impl GenAiProvider for Mock {
         _request: CompletionRequest,
     ) -> BoxFuture<'_, Result<CompletionResponse, GenAiError>> {
         Box::pin(async {
-            Ok(CompletionResponse {
-                model: "mock".into(),
-                message: Message::text(Role::Assistant, "r", "pong"),
-                finish_reason: None,
-                usage: None,
-            })
+            Ok(CompletionResponse::new(
+                "mock",
+                Message::text(Role::Assistant, "r", "pong"),
+            ))
         })
     }
     fn complete_stream(
@@ -186,12 +221,9 @@ impl GenAiProvider for Mock {
     ) -> BoxFuture<'_, Result<ChunkStream, GenAiError>> {
         Box::pin(async {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
-            tx.send(Ok(CompletionChunk {
-                delta: "pong".into(),
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
+            tx.send(Ok(CompletionChunk::text_delta("pong")))
+                .await
+                .unwrap();
             Ok(rx)
         })
     }
@@ -220,5 +252,5 @@ async fn provider_trait_via_dyn() {
         .await
         .unwrap();
     let chunk = stream.recv().await.unwrap().unwrap();
-    assert_eq!(chunk.delta, "pong");
+    assert_eq!(chunk.text(), "pong");
 }
