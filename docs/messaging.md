@@ -639,7 +639,7 @@ impl LocalProvider {
 }
 
 pub struct LocalOptions {
-    pub drain_timeout: Duration,   // default 30 s — used by `stop` and `close`
+    pub drain_timeout: Duration,   // default 20 s — used by `stop` and `close`
     pub dedup_window: usize,       // default 0 (de-duplication off)
 }
 ```
@@ -648,7 +648,7 @@ An in-process bus that implements [`Provider`](#provider) over bounded in-memory
 
 - `new(id)` / `with_options(id, options)` — creates the bus with a component id (used by the [lifecycle](#lifecycle-integration) integration).
 - `set_observer(obs)` — installs an [`Observer`](#observer).
-- `pending()` — messages accepted and not yet completed, across all destinations (buffered, delayed, or being handled).
+- `pending()` — messages accepted and not yet completed, across all destinations (buffered, delayed, or being handled). A send that is waiting for buffer room (`OnFull::Block`) is counted too.
 - `queue_depth(addr)` — messages buffered for an address (not counting ones being handled), or `None` if nothing listens there.
 - `downgrade()` — a `WeakLocalProvider` (with `upgrade() -> Option<LocalProvider>`) that does not keep the bus alive.
 
@@ -1001,10 +1001,11 @@ for lost in &report.undelivered {
 
 After a shutdown the provider is stopped and has **no listeners**. The lifecycle `start()` reopens it; listeners must be added again. A second `shutdown` on a stopped provider returns an empty report.
 
-Two things to keep in mind:
+Things to keep in mind:
 
 - Sends made **by handlers** are refused during the drain like any other send. A handler that forwards to another destination should return `Ack::Retry` when its send fails; if the drain ends first, the message is reported as undelivered.
 - A handler that blocks its thread without ever awaiting cannot be cancelled. `shutdown` still returns at the deadline, but that handler's task runs on until it yields.
+- **An abandoned shutdown still stops the provider.** If the `shutdown` future is dropped before it completes — typically because a supervisor's own stop timeout fired first — the drain is cut short: consumers are stopped at once and the provider ends up stopped, as if the drain timeout had passed. The undelivered messages are still reported through `on_dropped`; only the `DrainReport` is lost with the future. For that reason keep `LocalOptions::drain_timeout` (default 20 s) **below** the stop timeout of whatever supervises the provider (the lifecycle manager's default is 30 s), so the drain finishes — and reports — on its own terms.
 
 ### Listener self-healing
 

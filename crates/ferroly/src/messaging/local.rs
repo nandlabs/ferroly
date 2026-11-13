@@ -449,31 +449,77 @@ impl Inner {
         }
     }
 
-    /// Stops the consumers at once and reports what was still buffered. Used
-    /// when the last handle is dropped without a `shutdown`.
-    fn abandon_all(&mut self) {
+    /// Stops every consumer at once and closes the provider: aborts the
+    /// queues (an idle consumer ends, a busy one cancels its handler and gives
+    /// its message up), reports whatever was still buffered, forgets the
+    /// listeners, and marks the provider stopped.
+    ///
+    /// Synchronous and idempotent, so it can run from a `Drop`. Returns the
+    /// buffered messages it took and the consumer tasks, which are already on
+    /// their way out.
+    fn force_stop(&self) -> (Vec<Undelivered>, Vec<JoinHandle<()>>) {
         let consumers = std::mem::take(
-            self.consumers
-                .get_mut()
+            &mut *self
+                .consumers
+                .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
-        for (queue, _task) in consumers {
+        let mut buffered = Vec::new();
+        let mut tasks = Vec::with_capacity(consumers.len());
+        for (queue, task) in consumers {
             queue.abort();
             for env in queue.take_all() {
                 self.core
                     .notify(|o| o.on_dropped(&queue.addr, &env.msg, DropReason::Shutdown));
                 self.core.completed();
+                buffered.push(Undelivered {
+                    addr: queue.addr.clone(),
+                    message: env.msg,
+                });
             }
+            tasks.push(task);
         }
+        {
+            let mut routing = self
+                .routing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            routing.queues.clear();
+            routing.topics.clear();
+            routing.dedup.clear();
+            routing.phase = Phase::Stopped;
+        }
+        // Dropping the reply slots fails the requests still waiting.
+        self.replies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        (buffered, tasks)
     }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
         // Every `LocalProvider` handle is gone. The consumer tasks hold only a
-        // weak reference, so this runs even while they are alive; aborting
-        // their queues makes each of them finish instead of leaking.
-        self.abandon_all();
+        // weak reference, so this runs even while they are alive; stopping
+        // them here makes each of them finish instead of leaking.
+        let _ = self.force_stop();
+    }
+}
+
+/// Forces the provider to stop if a `shutdown` is abandoned part-way (its
+/// future dropped, for example by a caller's timeout), so a cancelled drain
+/// can never leave consumers running behind a provider that refuses sends.
+struct StopOnDrop<'a> {
+    inner: &'a Inner,
+    armed: bool,
+}
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.inner.force_stop();
+        }
     }
 }
 
@@ -632,7 +678,8 @@ impl LocalProvider {
     }
 
     /// The number of messages accepted and not yet completed across all
-    /// destinations (buffered, delayed, or being handled).
+    /// destinations: buffered, delayed, or being handled. A send that is
+    /// waiting for buffer room ([`OnFull::Block`]) is counted too.
     pub fn pending(&self) -> usize {
         *self.inner.core.pending.borrow()
     }
@@ -681,8 +728,17 @@ impl LocalProvider {
     /// Afterwards the provider is stopped and has no listeners; the lifecycle
     /// `start` reopens it. Calling `shutdown` on a stopped provider returns an
     /// empty report.
+    ///
+    /// # Cancellation
+    ///
+    /// If this future is dropped before it completes (for example because a
+    /// supervisor's stop timeout fired first), the drain is cut short: the
+    /// consumers are stopped at once and the provider ends up stopped, exactly
+    /// as if the drain timeout had passed. The undelivered messages are still
+    /// reported through the observer; only the [`DrainReport`] is lost with
+    /// the future.
     pub async fn shutdown(&self, drain_timeout: Duration) -> DrainReport {
-        let inner = &self.inner;
+        let inner: &Inner = &self.inner;
         let core = &inner.core;
         let _serial = inner.stop_lock.lock().await;
 
@@ -693,17 +749,29 @@ impl LocalProvider {
             }
             routing.phase = Phase::Draining;
         }
-        // No listener can be added from here on, so this is every consumer.
-        let (queues, consumers): (Vec<Arc<Queue>>, Vec<JoinHandle<()>>) =
-            std::mem::take(&mut *inner.consumers.lock().unwrap())
-                .into_iter()
-                .unzip();
+        // From here on the consumers must be stopped even if this future is
+        // dropped before it finishes.
+        let mut stop = StopOnDrop { inner, armed: true };
+        // Leftovers of an earlier shutdown that was abandoned are not ours.
+        core.leftovers.lock().unwrap().clear();
+
+        // No listener can be added any more, so this is every consumer.
+        let queues: Vec<Arc<Queue>> = inner
+            .consumers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(queue, _)| queue.clone())
+            .collect();
         let deadline = Instant::now() + drain_timeout;
         let mut unhandled: Vec<Undelivered> = Vec::new();
 
         // Messages that only become due after the deadline cannot complete.
+        // Each loss is reported as it is decided, so the observer has been
+        // told even if the caller abandons the shutdown.
         for queue in &queues {
             for env in queue.take_delayed_after(deadline) {
+                core.notify(|o| o.on_dropped(&queue.addr, &env.msg, DropReason::Shutdown));
                 core.completed();
                 unhandled.push(Undelivered {
                     addr: queue.addr.clone(),
@@ -718,37 +786,14 @@ impl LocalProvider {
 
         // Stop the consumers and wait for them. An idle one sees its queue end;
         // a busy one cancels its handler and hands the message over.
-        for queue in &queues {
-            queue.abort();
-        }
+        let (buffered, consumers) = inner.force_stop();
+        stop.armed = false;
+        unhandled.extend(buffered);
         for consumer in consumers {
             let _ = consumer.await;
         }
-
-        for queue in &queues {
-            for env in queue.take_all() {
-                core.completed();
-                unhandled.push(Undelivered {
-                    addr: queue.addr.clone(),
-                    message: env.msg,
-                });
-            }
-        }
-        for lost in &unhandled {
-            core.notify(|o| o.on_dropped(&lost.addr, &lost.message, DropReason::Shutdown));
-        }
         // In-flight messages were reported by the consumer that gave them up.
         unhandled.append(&mut core.leftovers.lock().unwrap());
-
-        {
-            let mut routing = inner.routing.lock().unwrap();
-            routing.queues.clear();
-            routing.topics.clear();
-            routing.dedup.clear();
-            routing.phase = Phase::Stopped;
-        }
-        // Dropping the reply slots fails the requests still waiting.
-        inner.replies.lock().unwrap().clear();
 
         DrainReport {
             undelivered: unhandled,

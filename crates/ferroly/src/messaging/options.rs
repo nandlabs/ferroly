@@ -213,7 +213,11 @@ impl Default for ListenerOptions {
 pub struct LocalOptions {
     /// How long `stop()` (the lifecycle `Component` impl) and
     /// [`Provider::close`](crate::messaging::Provider::close) wait for buffered
-    /// messages to be handled before giving up. Default 30 s.
+    /// messages to be handled before giving up. Default 20 s.
+    ///
+    /// Keep it below the stop timeout of whatever supervises the provider (the
+    /// lifecycle manager's default is 30 s): if the supervisor gives up first,
+    /// the drain is cut short and the provider is stopped at once.
     pub drain_timeout: Duration,
     /// De-duplication window: the number of recent message ids remembered per
     /// destination. A message whose id ([`headers::MESSAGE_ID`]) is still in
@@ -227,7 +231,7 @@ pub struct LocalOptions {
 impl Default for LocalOptions {
     fn default() -> Self {
         Self {
-            drain_timeout: Duration::from_secs(30),
+            drain_timeout: Duration::from_secs(20),
             dedup_window: 0,
         }
     }

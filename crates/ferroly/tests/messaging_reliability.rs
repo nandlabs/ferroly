@@ -520,6 +520,99 @@ async fn a_removed_listener_stuck_in_a_handler_does_not_hang_shutdown() {
     assert_eq!(bodies, ["backlog", "in-flight"]);
 }
 
+/// A bus with one listener stuck in a handler and one message buffered behind
+/// it. The handler holds a clone of `token` for as long as its task lives.
+async fn stuck_bus(watcher: &Arc<Watcher>, token: &Arc<()>) -> LocalProvider {
+    let bus = LocalProvider::new("bus");
+    bus.set_observer(watcher.clone());
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let held = token.clone();
+    bus.add_listener(
+        "chan://q",
+        handler(move |_m| {
+            let (_held, started) = (held.clone(), started_tx.clone());
+            async move {
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+                Ack::Ok
+            }
+        }),
+        ListenerOptions::default(),
+    )
+    .await
+    .unwrap();
+    send(&bus, "chan://q", "in-flight").await;
+    send(&bus, "chan://q", "buffered").await;
+    started_rx.recv().await.unwrap();
+    bus
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_shutdown_still_stops_the_consumers() {
+    let watcher = Arc::new(Watcher::default());
+    let token = Arc::new(());
+    let bus = stuck_bus(&watcher, &token).await;
+
+    // The caller gives up after 1 s of a 60 s drain: the shutdown future is
+    // dropped mid-drain.
+    let abandoned = tokio::time::timeout(Duration::from_secs(1), bus.shutdown(DRAIN)).await;
+    assert!(abandoned.is_err(), "the drain was still in progress");
+
+    // The provider must not be left half-stopped: its consumers end...
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(Arc::strong_count(&token), 1, "the consumer task is gone");
+    // ...the messages it could not deliver were reported, not lost...
+    let mut dropped = watcher.dropped.lock().unwrap().clone();
+    dropped.sort_by(|a, b| a.1.cmp(&b.1));
+    let bodies: Vec<&str> = dropped.iter().map(|d| d.1.as_str()).collect();
+    assert_eq!(bodies, ["buffered", "in-flight"]);
+    assert_eq!(bus.pending(), 0);
+    // ...and it is cleanly stopped: sends are refused, a second shutdown has
+    // nothing to do, and `start` reopens it.
+    assert!(matches!(
+        bus.send("chan://q", Message::text("x"), SendOptions::default())
+            .await,
+        Err(MessagingError::Closed(_))
+    ));
+    assert!(bus.shutdown(DRAIN).await.is_clean());
+
+    Component::start(&bus).await.unwrap();
+    let log = new_log();
+    bus.add_listener("chan://q", acking(&log), ListenerOptions::default())
+        .await
+        .unwrap();
+    send(&bus, "chan://q", "after restart").await;
+    assert!(bus.shutdown(DRAIN).await.is_clean());
+    assert_eq!(entries(&log), ["after restart"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manager_stop_timeout_shorter_than_the_drain_stops_the_bus_anyway() {
+    use ferroly::lifecycle::{ComponentManager, ComponentState, LifecycleError};
+
+    let watcher = Arc::new(Watcher::default());
+    let token = Arc::new(());
+    let bus = stuck_bus(&watcher, &token).await;
+    let mgr = ComponentManager::new();
+    mgr.register(Arc::new(bus.clone())).unwrap();
+    mgr.start_all().await.unwrap();
+
+    // The manager allows 2 s; the bus would drain for 20 s by default.
+    let began = Instant::now();
+    let err = mgr
+        .stop_all_with_timeout(Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert_eq!(began.elapsed(), Duration::from_secs(2));
+    assert!(matches!(err, LifecycleError::Timeout(_)), "{err}");
+    assert_eq!(mgr.get_state("bus"), Some(ComponentState::Error));
+
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(Arc::strong_count(&token), 1, "the consumer task is gone");
+    assert_eq!(watcher.dropped.lock().unwrap().len(), 2);
+    assert_eq!(bus.pending(), 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn stop_awaits_the_consumer_tasks() {
     let bus = LocalProvider::new("t");
