@@ -29,7 +29,6 @@ mod auth;
 mod breaker;
 mod bulkhead;
 mod error;
-#[cfg(feature = "codec")]
 mod oauth2;
 mod policy;
 mod ratelimit;
@@ -38,25 +37,9 @@ mod rng;
 mod timeout;
 
 // `ferroly::hash` owns the single base64 implementation and the `Secret`
-// type. `clients` does not (yet) depend on the `hash` feature, so when `hash`
-// is disabled the very same source files are compiled into this module
-// instead — one implementation either way, no second copy to keep in sync.
-// Once the `clients` feature implies `hash`, the two `#[path]` fallbacks below
-// can be deleted.
-#[cfg(not(feature = "hash"))]
-#[allow(dead_code)]
-#[path = "../hash/base64.rs"]
-pub(crate) mod base64;
-#[cfg(feature = "hash")]
+// type; the `clients` feature implies `hash`.
 pub(crate) use ferroly::hash::base64;
-
-#[cfg(not(feature = "hash"))]
-#[path = "../hash/secret.rs"]
-mod secret;
-#[cfg(feature = "hash")]
 pub use ferroly::hash::Secret;
-#[cfg(not(feature = "hash"))]
-pub use secret::Secret;
 
 pub use auth::{
     authorize, AccessToken, ApiKeyAuth, AuthProvider, BasicAuth, BearerAuth, RefreshingAuth,
@@ -70,7 +53,6 @@ pub use bulkhead::{Bulkhead, BulkheadPermit};
 pub use error::{
     AuthError, BulkheadFullError, CircuitOpenError, PolicyError, RateLimitedError, TimeoutError,
 };
-#[cfg(feature = "codec")]
 pub use oauth2::{ClientAuthStyle, OAuth2ClientCredentials};
 pub use policy::{ErrorClass, Policy};
 pub use ratelimit::RateLimiter;

@@ -32,7 +32,7 @@ http = [
     "dep:rustls-pki-types",
     "dep:webpki-roots",
 ]
-clients = ["http", "dep:tokio"]
+clients = ["http", "hash", "codec", "dep:tokio"]
 genai = ["codec", "clients", "http", "dep:tokio"]
 openai = ["genai"]
 claude = ["genai"]
@@ -49,6 +49,8 @@ messaging = ["codec", "lifecycle", "dep:tokio"]
 vfs = ["dep:tokio"]
 hash = []
 rt = ["dep:tokio"]
+# Adds the paused test clock (`rt::time::{pause, advance, resume}`). Test-only.
+rt-test-util = ["rt", "tokio/test-util"]
 cli = []
 obs = ["codec"]
 full = [
@@ -80,6 +82,10 @@ full = [
 # `test-util` (not part of tokio's `full`) enables the paused test clock used to
 # make timing-dependent tests deterministic. Dev-only — no runtime impact.
 tokio = { workspace = true, features = ["test-util"] }
+
+[[example]]
+name = "codec_roundtrip"
+required-features = ["codec"]
 
 # The model-router example needs a concrete provider (which pulls `genai`).
 [[example]]

@@ -141,6 +141,13 @@ pub mod time {
         error::Elapsed, interval, interval_at, sleep, sleep_until, timeout, timeout_at, Duration,
         Instant, Interval, MissedTickBehavior, Sleep, Timeout,
     };
+
+    /// The paused test clock, available with the `rt-test-util` feature
+    /// (enable it under `[dev-dependencies]`): freeze time with [`pause`],
+    /// move it with [`advance`], and return to the real clock with [`resume`].
+    #[cfg(feature = "rt-test-util")]
+    #[doc(no_inline)]
+    pub use tokio::time::{advance, pause, resume};
 }
 
 // ---- synchronization -----------------------------------------------------

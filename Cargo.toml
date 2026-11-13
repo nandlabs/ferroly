@@ -12,7 +12,9 @@ authors = ["nandlabs"]
 
 [workspace.dependencies]
 # Runtime dependency budget: tokio + (for TLS) tokio-rustls/rustls only.
-tokio = { version = "1", features = ["full"] }
+# 1.38 is the floor for the tokio APIs ferroly uses (`watch::Receiver::wait_for`,
+# `watch::Sender::send_if_modified`, `fs::try_exists`, `task::JoinSet`).
+tokio = { version = "1.38", features = ["full"] }
 
 # TLS engine (single crypto exception, isolated behind an internal transport trait)
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
