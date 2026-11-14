@@ -689,7 +689,9 @@ fn trust_test_ca() -> ClientTlsConfig {
 async fn wss_server_and_client_with_a_private_ca() {
     let config = fast_config().tls(TlsConfig::from_pem(SERVER_CERT, SERVER_KEY).unwrap());
     let server = start(config, describe).await;
-    let url = format!("wss://localhost:{}/secure", server.addr.port());
+    // 127.0.0.1, not localhost: the server listens on IPv4 only, and on
+    // Windows a refused `::1` attempt alone takes about the connect timeout.
+    let url = format!("wss://127.0.0.1:{}/secure", server.addr.port());
 
     let mut client = WsClient::dial(&url, fast_options().tls(trust_test_ca()))
         .await
@@ -706,7 +708,7 @@ async fn wss_server_and_client_with_a_private_ca() {
     assert!(matches!(untrusted, Err(WsError::Connect(_))));
     // A plaintext client cannot talk to the TLS port.
     let plain = WsClient::dial(
-        &format!("ws://localhost:{}/", server.addr.port()),
+        &format!("ws://127.0.0.1:{}/", server.addr.port()),
         WsOptions {
             handshake_timeout: Duration::from_millis(500),
             ..fast_options()
@@ -739,7 +741,7 @@ async fn wss_with_mutual_tls_exposes_the_client_certificate() {
             }
         });
     let server = start(config, echo).await;
-    let url = format!("wss://localhost:{}/", server.addr.port());
+    let url = format!("wss://127.0.0.1:{}/", server.addr.port());
 
     let with_cert = fast_options().tls(
         trust_test_ca()
@@ -849,8 +851,12 @@ async fn reconnecting_client_gives_up_after_max_attempts() {
             max_attempts: Some(4),
             ..ReconnectOptions::default()
         });
+    // Windows takes about a second to report a refused connection, so four
+    // attempts can exceed the usual per-step bound.
     let started = std::time::Instant::now();
-    let result = within("giving up", client.recv()).await;
+    let result = tokio::time::timeout(Duration::from_secs(30), client.recv())
+        .await
+        .expect("giving up");
     assert!(matches!(result, Err(WsError::Connect(_))), "{result:?}");
     // Three backoff delays separate the four attempts (jitter may halve
     // each): at least 5 + 10 + 20 ms.
@@ -858,7 +864,9 @@ async fn reconnecting_client_gives_up_after_max_attempts() {
     assert!(!client.is_connected());
     assert_eq!(client.reconnects(), 0);
     assert!(matches!(
-        within("send", client.send(Message::text("x"))).await,
+        tokio::time::timeout(Duration::from_secs(30), client.send(Message::text("x")))
+            .await
+            .expect("send"),
         Err(WsError::Connect(_))
     ));
 }
