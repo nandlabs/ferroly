@@ -24,7 +24,7 @@ body:
       label: Affected Module / Feature
       description: Which part of Ferroly is affected? (Maps to a Cargo feature flag.)
       options:
-        - "codec (JSON/XML/YAML, Encode/Decode)"
+        - "codec (JSON/XML/YAML/TOML, Encode/Decode)"
         - "codec::schema (JSON-Schema validator)"
         - "config"
         - "errutils"
@@ -41,7 +41,11 @@ body:
         - "vfs (virtual filesystem)"
         - "log (structured logging)"
         - "metrics (Prometheus)"
-        - "auth (HS256 JWT)"
+        - "auth (JWT)"
+        - "hash (SHA / HMAC / base64)"
+        - "cli (command-line parser)"
+        - "obs (tracing / OTLP)"
+        - "rt (async runtime surface)"
         - "ferroly-derive (proc-macros)"
         - "Build / packaging / features"
         - "Other / not sure"

@@ -13,7 +13,7 @@ Ferroly is one crate with many optional modules. **Nothing but `codec` and
 ```toml
 [dependencies]
 # Everything (simplest while exploring):
-ferroly = { version = "0.3", features = ["full"] }
+ferroly = { version = "0.4", features = ["full"] }
 ```
 
 Once you know what you need, trim it:
@@ -21,7 +21,7 @@ Once you know what you need, trim it:
 ```toml
 [dependencies]
 # A JSON API server that talks to OpenAI and does vector search:
-ferroly = { version = "0.3", default-features = false, features = ["rest", "openai", "vectorstore"] }
+ferroly = { version = "0.4", default-features = false, features = ["rest", "openai", "vectorstore"] }
 ```
 
 Most async modules also need a runtime; add `tokio` yourself when you write
@@ -136,17 +136,18 @@ A typical service wires these in `main`:
 use ferroly::lifecycle::ComponentManager;
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() {
+#[ferroly::rt::main]
+async fn main() -> Result<(), ferroly::Error> {
     ferroly::log::set_global(ferroly::log::Logger::json());
 
     let server = Arc::new(build_rest_server());       // impls Component
     let bus = Arc::new(build_message_bus());          // impls Component
 
     let manager = ComponentManager::new();
-    manager.register(server);
-    manager.register(bus);
-    manager.start_and_wait().await.unwrap();          // start all, block on SIGINT, stop all
+    manager.register(server)?;                        // a duplicate id is an error
+    manager.register(bus)?;
+    manager.start_and_wait().await?;                  // start all, block on SIGINT/SIGTERM, stop all
+    Ok(())
 }
 ```
 
@@ -157,7 +158,7 @@ async fn main() {
 - **[genai](genai.md)** / **[vectorstore](vectorstore.md)** — LLMs and vector search.
 - **[messaging](messaging.md)** / **[vfs](vfs.md)** — async infrastructure.
 - **[lifecycle](lifecycle.md)** / **[log](log.md)** / **[config](config.md)** — ops glue.
-- **[Roadmap & design decisions](roadmap.md)** — the Go → Rust translation rationale.
+- **[Crate README](../crates/ferroly/README.md)** — security posture and what is deliberately not included.
 
 Every page follows the same shape: overview → enabling → quick start → full API
 reference → in-depth feature sections with examples → error handling →

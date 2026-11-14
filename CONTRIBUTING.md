@@ -33,18 +33,36 @@ cargo fmt --all --check
 # lints (warnings are errors)
 cargo clippy --workspace --all-targets --features ferroly/full -- -D warnings
 
-# tests (default features and full)
+# tests (default features, full, and the derive crate)
 cargo test -p ferroly
 cargo test -p ferroly --features full
+cargo test -p ferroly-derive
 
-# license / advisory / duplicate-dependency policy (see below)
+# the feature you touched must also lint and document cleanly on its own
+cargo clippy -p ferroly --no-default-features --features <feature> --lib -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ferroly --no-default-features --features <feature>
+
+# dependency budget, and license / advisory policy (see below)
+./.github/scripts/check-dependency-budget.sh
 cargo deny check
 ```
 
+CI runs the single-feature lint and rustdoc for **every** feature (the
+`Feature isolation` job), because building only `full` hides a feature that forgets
+a dependency edge, leaves dead code behind, or links to another feature's docs.
+Gate cross-feature code with `#[cfg(feature = "…")]`, give integration tests a
+`#![cfg(feature = "…")]` header, and declare `required-features` on examples.
+
+The parsers that read untrusted input have `cargo-fuzz` targets under `fuzz/`
+(run weekly in CI) and an always-on generative suite in
+`crates/ferroly/tests/codec_fuzz.rs`. A new parser needs both.
+
 ## Versioning & releases (please read)
 
-**Every pull request into `main` must carry a version bump** — CI enforces this via
-the `version-guard` job, and a red check there is almost always one of the steps below.
+**Every pull request that changes the published crates (anything under `crates/`)
+must carry a version bump** — CI enforces this via the `version-guard` job, and a red
+check there is almost always one of the steps below. PRs that touch only CI, docs
+outside the crates, or the lockfile are exempt: they release nothing.
 
 1. **Bump the crate version** in the root `Cargo.toml` under `[workspace.package]`.
    The crate is pre-1.0, so:
@@ -55,8 +73,8 @@ the `version-guard` job, and a red check there is almost always one of the steps
 3. **Add a matching `## [<version>]` section to `CHANGELOG.md`** describing your
    change. `version-guard` fails if the version has no changelog entry
    (`## [Unreleased]` does not count).
-4. **Do not create the git tag.** The `v<version>` tag is created automatically when
-   your PR merges to `main`. A version that has *already* been tagged is rejected —
+4. **Do not create the git tag.** The `v<version>` tag is created automatically, on the
+   commit that introduced the version, when your PR merges to `main`. A version that has *already* been tagged is rejected —
    that is the signal to bump again.
 
 After bumping, run `cargo build --features full --locked` so `Cargo.lock` picks up the
@@ -75,7 +93,9 @@ Ferroly's defining goal is to be **self-contained**. This is enforced, not aspir
   and it must stay isolated behind `ferroly::http`'s internal transport — no TLS types in any
   public API.
 
-PRs that add a dependency to `Cargo.toml` will be asked to remove it. If you believe an
+CI's `Dependency budget` job fails when either crate gains a direct dependency outside
+this list (`.github/scripts/check-dependency-budget.sh`). PRs that add a dependency to
+`Cargo.toml` will be asked to remove it. If you believe an
 exception is genuinely warranted, open an issue to discuss it *before* writing code.
 
 ## Code style & conventions
@@ -114,8 +134,7 @@ page is a comprehensive developer guide, and they must stay that way:
   "deserialize".
 - **Attribution:** the port lineage is credited once in the top-level [README](README.md).
   Do **not** scatter "ports golly's X" / "(golly: …)" references through code comments or docs;
-  describe what the code does on its own terms. (The Go → Rust design rationale lives in the one
-  dedicated `docs/roadmap-*.md` page.)
+  describe what the code does on its own terms.
 
 ## Commits & pull requests
 

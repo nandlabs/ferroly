@@ -22,7 +22,7 @@ jobs:
     name: Create version tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -44,8 +44,14 @@ jobs:
             exit 0
           fi
 
+          # Tag the commit that introduced this version, not whatever happens to
+          # be at HEAD — a later non-release merge must not move the release
+          # point if an earlier run was skipped or failed.
+          COMMIT="$(git log --format=%H --reverse -S"version = \"$VERSION\"" -- Cargo.toml | head -1)"
+          COMMIT="${COMMIT:-$(git rev-parse HEAD)}"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "$TAG"
+          git tag -a "$TAG" -m "$TAG" "$COMMIT"
           git push origin "$TAG"
-          echo "Created and pushed $TAG."
+          echo "Created and pushed $TAG at $COMMIT."

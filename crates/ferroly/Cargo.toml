@@ -24,15 +24,29 @@ errutils = []
 codec = []
 config = ["codec"]
 fsutils = []
-lifecycle = ["dep:tokio"]
+lifecycle = [
+    "dep:tokio",
+    "tokio/rt",
+    "tokio/sync",
+    "tokio/time",
+    "tokio/macros",
+    "tokio/signal",
+]
 http = [
     "dep:tokio",
+    "tokio/rt",
+    "tokio/sync",
+    "tokio/time",
+    "tokio/macros",
+    "tokio/net",
+    "tokio/io-util",
+    "tokio/fs",
     "dep:tokio-rustls",
     "dep:rustls",
     "dep:rustls-pki-types",
     "dep:webpki-roots",
 ]
-clients = ["http", "dep:tokio"]
+clients = ["http", "hash", "codec", "dep:tokio"]
 genai = ["codec", "clients", "http", "dep:tokio"]
 openai = ["genai"]
 claude = ["genai"]
@@ -46,9 +60,13 @@ auth = ["codec", "hash"]
 log = ["codec"]
 metrics = []
 messaging = ["codec", "lifecycle", "dep:tokio"]
-vfs = ["dep:tokio"]
+vfs = ["dep:tokio", "tokio/rt", "tokio/fs", "tokio/io-util"]
 hash = []
-rt = ["dep:tokio"]
+# The runtime surface re-exports all of tokio, so it is the one feature that
+# enables `tokio/full`.
+rt = ["dep:tokio", "tokio/full"]
+# Adds the paused test clock (`rt::time::{pause, advance, resume}`). Test-only.
+rt-test-util = ["rt", "tokio/test-util"]
 cli = []
 obs = ["codec"]
 full = [
@@ -79,7 +97,11 @@ full = [
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) enables the paused test clock used to
 # make timing-dependent tests deterministic. Dev-only — no runtime impact.
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[[example]]
+name = "codec_roundtrip"
+required-features = ["codec"]
 
 # The model-router example needs a concrete provider (which pulls `genai`).
 [[example]]

@@ -91,14 +91,15 @@ pub struct Violation {
 
 ## Supported keywords
 
-The validator recognizes this keyword set; unknown keywords are ignored
-(they never cause a failure).
+The validator recognizes this keyword set. Keywords outside it are ignored —
+see [Limitations](#limitations) for what that means for a schema that relies on
+one.
 
 | Keyword | Applies to | Behavior |
 | --- | --- | --- |
-| `type` | any | one of `string`, `integer`, `number`, `boolean`, `object`, `array`, `null`. A mismatch is reported and further checks on that node are skipped (to avoid noise). An unknown type string never fails. |
-| `const` | any | value must equal the given `Value` exactly. |
-| `enum` | any | value must equal one of the array's members. |
+| `type` | any | a type name — `string`, `integer`, `number`, `boolean`, `object`, `array`, `null` — or a **non-empty array of type names**, any of which may match (`["string", "null"]`). A mismatch is reported and further checks on that node are skipped (to avoid noise). A `type` the validator cannot interpret — an unknown name, an empty array, a non-string member, or any other shape — **fails closed**: it is reported as a violation whose message starts with `schema error:`. |
+| `const` | any | value must equal the given value (see [Equality](#equality)). |
+| `enum` | any | value must equal one of the array's members (see [Equality](#equality)). |
 | `minimum` / `maximum` | numbers | inclusive bounds (compared as `f64`). |
 | `minLength` / `maxLength` | strings | bounds on **character** count (not bytes). |
 | `minItems` / `maxItems` | arrays | bounds on element count. |
@@ -108,12 +109,65 @@ The validator recognizes this keyword set; unknown keywords are ignored
 
 Type-mapping notes:
 
-- `integer` matches `Value::Int` and `Value::UInt`.
+- `integer` matches `Value::Int`, `Value::UInt`, and a `Value::Float` with a
+  zero fractional part (`1.0`), as JSON Schema defines it. `1.5`, `NaN`, and
+  infinities are not integers.
 - `number` matches `Int`, `UInt`, or `Float`.
 - Numeric bounds (`minimum`/`maximum`) apply to any numeric `Value`, compared as
   `f64`.
 - `properties` only validates keys that are **present**; use `required` to
   mandate presence. A property absent from the data is simply not checked.
+
+### Equality
+
+`const` and `enum` compare by **JSON value**, not by how the `Value` happens to
+be stored:
+
+- Numbers compare by value across `Int`, `UInt`, and `Float`: `5`, `5u64`, and
+  `5.0` are all equal, so `"enum": [5]` accepts a `u32` field that encoded as
+  `UInt(5)`. `5` and `5.5` are different, and values beyond `i64` keep their
+  identity (`u64::MAX` is not `-1`).
+- Objects compare **without regard to member order**: `{"a": 1, "b": 2}` equals
+  `{"b": 2, "a": 1}`. Member counts and every value must match.
+- Arrays compare element by element, **in order**.
+- The rules apply recursively, so a number nested in an array or object inside
+  a `const` compares by value too.
+
+```rust
+use ferroly::codec::{json, schema, Value};
+
+// Any numeric representation of 5 is "5".
+let schema_enum = json::from_str(r#"{ "enum": [5, "five"] }"#).unwrap();
+assert!(schema::validate(&schema_enum, &Value::Int(5)).is_ok());
+assert!(schema::validate(&schema_enum, &Value::UInt(5)).is_ok());
+assert!(schema::validate(&schema_enum, &Value::Float(5.0)).is_ok());
+assert!(schema::validate(&schema_enum, &Value::Float(5.5)).is_err());
+
+// Object members may come in any order.
+let schema_const = json::from_str(r#"{ "const": {"a": 1, "b": [1, 2]} }"#).unwrap();
+let same = json::from_str(r#"{"b": [1, 2], "a": 1}"#).unwrap();
+let reordered_array = json::from_str(r#"{"b": [2, 1], "a": 1}"#).unwrap();
+assert!(schema::validate(&schema_const, &same).is_ok());
+assert!(schema::validate(&schema_const, &reordered_array).is_err());
+```
+
+### Type unions
+
+```rust
+use ferroly::codec::{json, schema};
+
+let nullable = json::from_str(r#"{ "type": ["string", "null"] }"#).unwrap();
+assert!(schema::validate(&nullable, &json::from_str(r#""x""#).unwrap()).is_ok());
+assert!(schema::validate(&nullable, &json::from_str("null").unwrap()).is_ok());
+
+let errs = schema::validate(&nullable, &json::from_str("5").unwrap()).unwrap_err();
+assert_eq!(errs[0].message, "expected one of the types 'string', 'null'");
+
+// A typo in a type name is reported, not silently accepted.
+let typo = json::from_str(r#"{ "type": "strnig" }"#).unwrap();
+let errs = schema::validate(&typo, &json::from_str(r#""x""#).unwrap()).unwrap_err();
+assert_eq!(errs[0].message, "schema error: unknown type 'strnig'");
+```
 
 ## Validating against a JSON Schema
 
@@ -205,11 +259,20 @@ it returns `Err(Vec<Violation>)` so a caller gets the complete list in one pass.
 Each `Violation` is `Display`-formatted as `"{path}: {message}"`; join them for a
 report, or map them onto field-level API errors by `path`.
 
-There is no "schema is malformed" error — a schema whose keywords are missing or
-of an unexpected shape simply contributes no checks. Validate your schemas as
-inputs during development if they come from an untrusted source.
+There is no separate "schema is malformed" error type. A `type` keyword the
+validator cannot interpret is reported as an ordinary `Violation` (its message
+starts with `schema error:`), so a broken schema fails validation instead of
+passing everything. Other keywords of an unexpected shape (a non-numeric
+`minimum`, a non-array `required`) contribute no checks, and keywords outside
+the supported set are ignored — review schemas that come from an untrusted or
+third-party source against the [supported keyword list](#supported-keywords).
 
 ## Limitations
+
+Unsupported keywords are **ignored, not rejected**: a schema that relies on one
+validates more loosely than its author intended (for example,
+`"additionalProperties": false` does not reject extra properties). Check a
+schema against the list below before relying on it.
 
 Deliberately **unsupported** keywords, and why:
 
@@ -226,8 +289,10 @@ Other bounds:
 
 - `minLength` / `maxLength` count Unicode **characters**, not bytes or grapheme
   clusters.
-- Numeric comparison is done in `f64`, so extremely large integers can lose
-  precision at the boundary.
+- `minimum` / `maximum` compare in `f64`, so extremely large integers can lose
+  precision at the boundary. (`const` / `enum` compare integers exactly.)
+- Duplicate keys in an object resolve last-wins, as elsewhere in the codec, for
+  `properties`, `required`, and object equality.
 - `properties` validates only present keys; combine with `required` to mandate
   presence.
 

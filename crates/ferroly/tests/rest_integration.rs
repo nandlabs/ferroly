@@ -105,6 +105,7 @@ async fn auth_prefix_and_error_status() {
             path_prefix: "/api".into(),
             listen_host: "127.0.0.1".into(),
             listen_port: 0,
+            ..Default::default()
         })
         .get("/whoami", |ctx| async move {
             HttpResponse::text(
