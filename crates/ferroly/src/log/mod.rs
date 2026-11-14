@@ -328,7 +328,7 @@ fn context_fields() -> Vec<(String, Value)> {
 }
 
 /// The current trace context as log fields: `trace_id` and `span_id` of the
-/// active [`ferroly::obs`](../obs/index.html) span, or an empty vec when no
+/// active [`obs`](../obs/index.html) span, or an empty vec when no
 /// span is active.
 ///
 /// Without the `obs` feature this always returns an empty vec, so code that

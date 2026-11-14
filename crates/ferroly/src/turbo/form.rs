@@ -476,16 +476,11 @@ fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     let last_start = haystack.len() - needle.len();
     let mut i = from;
     while i <= last_start {
-        match haystack[i..=last_start].iter().position(|&b| b == first) {
-            Some(offset) => {
-                i += offset;
-                if haystack[i..i + needle.len()] == *needle {
-                    return Some(i);
-                }
-                i += 1;
-            }
-            None => return None,
+        i += haystack[i..=last_start].iter().position(|&b| b == first)?;
+        if haystack[i..i + needle.len()] == *needle {
+            return Some(i);
         }
+        i += 1;
     }
     None
 }
