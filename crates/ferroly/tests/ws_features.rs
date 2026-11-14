@@ -844,15 +844,21 @@ async fn reconnecting_client_gives_up_after_max_attempts() {
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
-    let mut client = ReconnectingClient::new(format!("ws://{addr}/"), fast_options())
-        .with_reconnect(ReconnectOptions {
+    // Windows reports a refused connection only after about 2 s of SYN
+    // retries; a longer connect timeout keeps that a `Connect` error.
+    let options = WsOptions {
+        connect_timeout: Duration::from_secs(10),
+        ..fast_options()
+    };
+    let mut client = ReconnectingClient::new(format!("ws://{addr}/"), options).with_reconnect(
+        ReconnectOptions {
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
             max_attempts: Some(4),
             ..ReconnectOptions::default()
-        });
-    // Windows takes about a second to report a refused connection, so four
-    // attempts can exceed the usual per-step bound.
+        },
+    );
+    // Four attempts at ~2 s each on Windows exceed the usual per-step bound.
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(Duration::from_secs(30), client.recv())
         .await
