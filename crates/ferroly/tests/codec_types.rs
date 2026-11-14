@@ -115,8 +115,11 @@ fn codec_errors_display() {
 fn json_escapes_and_unicode() {
     let v = json::from_str(r#""a\n\t\"\\\/\b\fA""#).unwrap();
     assert_eq!(v.as_str(), Some("a\n\t\"\\/\u{8}\u{c}A"));
-    // surrogate pair -> emoji
-    let e = json::from_str(r#""😀""#).unwrap();
+    // surrogate pair -> emoji (assembled from pieces, so the parser really
+    // sees the two escapes rather than an already-decoded character)
+    let escaped = ["\"", "\\u", "D83D", "\\u", "DE00", "\""].concat();
+    assert!(escaped.is_ascii());
+    let e = json::from_str(&escaped).unwrap();
     assert_eq!(e.as_str(), Some("😀"));
     // escaping round-trips
     let s = json::to_string(&Value::Str("tab\tquote\"".into()));

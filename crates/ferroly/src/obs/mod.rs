@@ -2,26 +2,65 @@
 //!
 //! This module records units of work as **spans** (a named, timed operation)
 //! and **events** (a point-in-time note attached to a span). Spans nest: a span
-//! opened while another is active becomes its child, inheriting the same
-//! `trace_id` and pointing back at its parent via `parent_id`, so a whole
-//! request forms one causally-linked tree. A root span mints a fresh
-//! `trace_id`. Each span carries typed structured fields backed by
-//! [`ferroly::codec::Value`], so numbers stay numbers when rendered.
+//! started while another is current becomes its child, inheriting the same
+//! trace id and pointing back at its parent, so a whole request forms one
+//! causally-linked tree — across threads, `.await` points and, through the W3C
+//! `traceparent` header, across services. Each span carries typed structured
+//! fields backed by [`ferroly::codec::Value`], a [kind](SpanKind), a
+//! [status](Status) and optional [links](Link).
 //!
-//! Everything is std-only. Identifiers need no randomness source: a per-process
-//! seed (nanoseconds since the epoch, captured once) is combined with atomic
-//! counters, yielding a 16-byte `trace_id` and an 8-byte `span_id` exposed as
-//! lowercase hex. Uniqueness within the process is what matters. The current
-//! span is tracked in a thread-local stack, so spans on different threads are
-//! independent and no locking is needed on the hot path.
+//! Everything in the core is std-only.
 //!
-//! A global [`Level`] filter drops spans and events below the threshold cheaply
-//! — a filtered span never touches the thread-local stack. When a span finishes
-//! (its [`SpanGuard`] is dropped) it is assembled into a [`FinishedSpan`] and
-//! handed to the installed [`Exporter`], if any. With no exporter installed,
-//! finishing a span is a near-free no-op. A built-in [`JsonExporter`] renders
-//! one JSON object per span; back it with any writer, or supply your own
-//! exporter to forward spans to a collector.
+//! # Identifiers
+//!
+//! A [`TraceId`] is 16 random bytes and a [`SpanId`] 8, shown as lowercase hex.
+//! They come from a per-thread xoshiro256** generator seeded from the wall
+//! clock, a monotonic clock, the process and thread ids, stack and heap
+//! addresses and `RandomState` (operating-system entropy). They are never
+//! all-zero and never sequential, so traces from different processes and
+//! restarts do not collide.
+//!
+//! # The current context
+//!
+//! "The current span" is a [`Context`] — a small `Send + Sync + Clone` value —
+//! kept in a per-thread stack of attachments. There are three ways to put a
+//! span there, for three situations:
+//!
+//! | Code | Use | How |
+//! |---|---|---|
+//! | synchronous | [`Span::enter`] → [`SpanGuard`] | current on this thread until the guard drops |
+//! | asynchronous | [`instrument`]`(future, span)` | current **during each poll** of the future, on whichever thread polls it |
+//! | anything | [`Span::child_of`]`(&ctx)` + [`Span::start`] | no ambient state at all: the parent is passed explicitly |
+//!
+//! [`with_context`] and [`with_current_context`] carry a context into a future
+//! without opening a span — that is how a spawned task or one branch of a
+//! `join!` inherits its parent.
+//!
+//! Every attachment is removed **by its own identity**, never by position:
+//! guards can be dropped in any order, and a span's fields, events and duration
+//! live in the span itself rather than in the stack, so one span can never end
+//! up with another's data.
+//!
+//! ## Async rule of thumb
+//!
+//! Do not hold a [`SpanGuard`] across an `.await` in a bare future: while that
+//! future is suspended its span would still look current to whatever else is
+//! polled on the same thread. Wrap the future with [`instrument`] (or
+//! [`with_current_context`]) instead. A wrapped future owns its part of the
+//! context stack — including any guards it does hold across awaits — and
+//! installs it only while it is being polled, so sibling futures under
+//! `join!`/`select!` and tasks on a work-stealing runtime never see each
+//! other's spans. This works with every executor; it does not use task-locals.
+//!
+//! # Sampling, filtering, export
+//!
+//! A global [`Level`] filter drops spans and events below the threshold
+//! cheaply. A [`Sampler`] decides per trace whether spans are recorded; the
+//! decision propagates through [`Context::is_sampled`] and the `traceparent`
+//! flags. When a recorded span finishes it is assembled into a
+//! [`FinishedSpan`] and handed to the installed [`Exporter`]s — a built-in
+//! [`JsonExporter`], the OTLP/HTTP exporter (with the `http` feature), or your
+//! own. With no exporter installed, finishing a span is a near-free no-op.
 //!
 //! ```
 //! use std::sync::{Arc, Mutex};
@@ -51,20 +90,38 @@
 
 #![deny(missing_docs)]
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::fmt;
 use std::io::Write;
-use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ferroly::codec::{json, Value};
 
+mod context;
+mod id;
 #[cfg(feature = "http")]
 mod otlp;
+mod resource;
+mod sampler;
+mod semconv;
+mod span;
+
+pub use context::{
+    current, extract, inject, inject_current, suppress, with_context, with_current_context,
+    Context, ContextGuard, TraceParentError, WithContext, TRACEPARENT_HEADER, TRACESTATE_HEADER,
+};
+pub use id::{SpanId, TraceId};
 #[cfg(feature = "http")]
-pub use otlp::OtlpHttpExporter;
+pub use otlp::{OtlpBuilder, OtlpHttpExporter, OtlpStats};
+pub use resource::Resource;
+pub use sampler::{sampler, set_sampler, Sampler};
+pub use semconv::{genai, http, messaging};
+pub use span::{
+    event, instrument, record, set_error, set_status, ActiveSpan, FinishedSpan, Instrument,
+    Instrumented, Link, Span, SpanEvent, SpanGuard, SpanKind, Status, MAX_SPAN_EVENTS,
+    MAX_SPAN_FIELDS, MAX_SPAN_LINKS,
+};
 
 // ---- level ---------------------------------------------------------------
 
@@ -129,353 +186,117 @@ fn enabled(level: Level) -> bool {
     (level as u8) >= LEVEL.load(Ordering::Relaxed)
 }
 
-// ---- identifiers ---------------------------------------------------------
-
-const HEX: &[u8; 16] = b"0123456789abcdef";
-
-/// Renders bytes as a lowercase hex string.
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
-}
-
-/// Nanoseconds since the epoch, captured once per process, used as the high
-/// half of every `trace_id` so ids do not collide with another run.
-fn seed() -> u64 {
-    static SEED: OnceLock<u64> = OnceLock::new();
-    *SEED.get_or_init(|| now_unix_nanos() as u64)
-}
-
-/// Wall-clock nanoseconds since the Unix epoch (0 if the clock predates it).
-fn now_unix_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
-/// Mints a fresh 8-byte span identifier as hex (16 chars).
-fn new_span_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    hex(&n.to_be_bytes())
-}
-
-/// Mints a fresh 16-byte trace identifier as hex (32 chars): the process seed
-/// followed by a monotonic counter.
-fn new_trace_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&seed().to_be_bytes());
-    bytes[8..].copy_from_slice(&n.to_be_bytes());
-    hex(&bytes)
-}
-
-// ---- finished records ----------------------------------------------------
-
-/// A point-in-time event captured on a span.
-#[derive(Debug, Clone)]
-pub struct SpanEvent {
-    /// Severity of the event.
-    pub level: Level,
-    /// Human-readable message.
-    pub message: String,
-    /// Typed structured fields describing the event.
-    pub fields: Vec<(String, Value)>,
-    /// Wall-clock nanoseconds since the Unix epoch at which it was recorded.
-    pub unix_nanos: u128,
-}
-
-/// A completed span, ready to be exported.
-#[derive(Debug, Clone)]
-pub struct FinishedSpan {
-    /// The span's name.
-    pub name: String,
-    /// The 32-char hex trace identifier shared by every span in the trace.
-    pub trace_id: String,
-    /// The 16-char hex identifier unique to this span.
-    pub span_id: String,
-    /// The parent span's id, or `None` for a root span.
-    pub parent_id: Option<String>,
-    /// The span's severity level.
-    pub level: Level,
-    /// Wall-clock nanoseconds since the Unix epoch at which the span started.
-    pub start_unix_nanos: u128,
-    /// Elapsed nanoseconds between entering and finishing the span.
-    pub duration_nanos: u128,
-    /// Typed structured fields attached to the span.
-    pub fields: Vec<(String, Value)>,
-    /// Events recorded on the span, in order.
-    pub events: Vec<SpanEvent>,
-}
-
 // ---- exporter ------------------------------------------------------------
 
 /// A sink for finished spans. Implementations must be safe to share across
-/// threads because a single exporter is installed process-wide.
+/// threads because exporters are installed process-wide.
+///
+/// Exporters are called with **no internal lock held**, so an exporter may
+/// itself call [`set_exporter`], [`flush`] or start spans. Spans that finish
+/// on a thread while it is inside an exporter call are not exported (which
+/// keeps an exporter's own instrumentation from feeding back into it).
 pub trait Exporter: Send + Sync {
-    /// Consumes one finished span. Called once per span, when its guard drops.
+    /// Consumes one finished span. Called once per span, when it ends.
     fn export(&self, span: &FinishedSpan);
 
     /// Flushes any buffered output. The default does nothing.
     fn flush(&self) {}
+
+    /// Flushes and releases resources; no span is delivered afterwards. The
+    /// default calls [`flush`](Exporter::flush).
+    fn shutdown(&self) {
+        self.flush();
+    }
 }
+
+type ExporterList = Arc<[Arc<dyn Exporter>]>;
 
 static HAS_EXPORTER: AtomicBool = AtomicBool::new(false);
-
-fn exporter_slot() -> &'static Mutex<Option<Box<dyn Exporter>>> {
-    static SLOT: OnceLock<Mutex<Option<Box<dyn Exporter>>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
-}
-
-/// Installs the process-wide exporter, replacing any previous one. Until one is
-/// installed, finishing a span is a cheap no-op.
-pub fn set_exporter(exporter: Box<dyn Exporter>) {
-    let mut slot = exporter_slot().lock().unwrap_or_else(|e| e.into_inner());
-    *slot = Some(exporter);
-    HAS_EXPORTER.store(true, Ordering::Release);
-}
-
-/// Flushes the installed exporter, if any.
-pub fn flush() {
-    if !HAS_EXPORTER.load(Ordering::Acquire) {
-        return;
-    }
-    let slot = exporter_slot().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(exporter) = slot.as_ref() {
-        exporter.flush();
-    }
-}
-
-/// Hands a finished span to the installed exporter, gated on a cheap atomic so
-/// the common "no exporter" path never touches the lock.
-fn export(span: &FinishedSpan) {
-    if !HAS_EXPORTER.load(Ordering::Acquire) {
-        return;
-    }
-    let slot = exporter_slot().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(exporter) = slot.as_ref() {
-        exporter.export(span);
-    }
-}
-
-// ---- thread-local current-span stack -------------------------------------
-
-/// A span that is currently entered on this thread. Fields and events are
-/// accumulated here until the span finishes.
-struct Live {
-    name: String,
-    level: Level,
-    trace_id: String,
-    span_id: String,
-    parent_id: Option<String>,
-    start: Instant,
-    start_unix_nanos: u128,
-    fields: Vec<(String, Value)>,
-    events: Vec<SpanEvent>,
-}
+static EXPORTERS: RwLock<Option<ExporterList>> = RwLock::new(None);
 
 thread_local! {
-    static STACK: RefCell<Vec<Live>> = const { RefCell::new(Vec::new()) };
+    /// Set while this thread is inside an exporter callback.
+    static EXPORTING: Cell<bool> = const { Cell::new(false) };
 }
 
-// ---- span builder --------------------------------------------------------
-
-/// A builder for a span. Configure it with [`level`](Span::level) and
-/// [`field`](Span::field), then call [`enter`](Span::enter) to make it the
-/// current span on this thread.
-pub struct Span {
-    name: String,
-    level: Level,
-    fields: Vec<(String, Value)>,
+/// A snapshot of the installed exporters: the lock is released before any of
+/// them is called.
+fn exporters() -> Option<ExporterList> {
+    EXPORTERS.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-impl Span {
-    /// Starts building a span with the given name at [`Level::Info`].
-    pub fn new(name: impl Into<String>) -> Span {
-        Span {
-            name: name.into(),
-            level: Level::Info,
-            fields: Vec::new(),
-        }
-    }
-
-    /// Sets the span's severity level.
-    pub fn level(mut self, level: Level) -> Span {
-        self.level = level;
-        self
-    }
-
-    /// Attaches a typed field. Any type convertible into a
-    /// [`ferroly::codec::Value`] works, so `("k", "v")`, `("k", 5)`, and
-    /// `("k", true)` are all accepted.
-    pub fn field(mut self, key: impl Into<String>, value: impl Into<Value>) -> Span {
-        self.fields.push((key.into(), value.into()));
-        self
-    }
-
-    /// Enters the span, making it current on this thread and returning an RAII
-    /// [`SpanGuard`] that finishes and exports it on drop.
-    ///
-    /// If the span's level is below the global threshold it is not entered: the
-    /// returned guard is inert and the thread-local stack is untouched. When
-    /// entered, the span links to the innermost currently-entered span as its
-    /// parent (inheriting that span's `trace_id`); with none active it becomes
-    /// a root with a fresh `trace_id`.
-    pub fn enter(self) -> SpanGuard {
-        if !enabled(self.level) {
-            return SpanGuard {
-                active: false,
-                _not_send: PhantomData,
-            };
-        }
-        STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            let (trace_id, parent_id) = match stack.last() {
-                Some(top) => (top.trace_id.clone(), Some(top.span_id.clone())),
-                None => (new_trace_id(), None),
-            };
-            stack.push(Live {
-                name: self.name,
-                level: self.level,
-                trace_id,
-                span_id: new_span_id(),
-                parent_id,
-                start: Instant::now(),
-                start_unix_nanos: now_unix_nanos(),
-                fields: self.fields,
-                events: Vec::new(),
-            });
-        });
-        SpanGuard {
-            active: true,
-            _not_send: PhantomData,
-        }
-    }
-}
-
-// ---- span guard ----------------------------------------------------------
-
-/// An RAII handle to an entered span. While it is alive its span is the current
-/// span on this thread; dropping it finishes the span and exports it.
-///
-/// Guards must be dropped in reverse order of entry (the usual scope-based
-/// nesting). The type is deliberately neither `Send` nor `Sync`: a span belongs
-/// to the thread that entered it.
-pub struct SpanGuard {
-    active: bool,
-    _not_send: PhantomData<*const ()>,
-}
-
-impl SpanGuard {
-    /// Adds a field to this span after it has been entered. A no-op on an inert
-    /// (filtered-out) guard.
-    pub fn record(&self, key: impl Into<String>, value: impl Into<Value>) {
-        if !self.active {
-            return;
-        }
-        STACK.with(|cell| {
-            if let Some(top) = cell.borrow_mut().last_mut() {
-                top.fields.push((key.into(), value.into()));
-            }
-        });
-    }
-
-    /// Records an event on this span. Dropped if `level` is below the global
-    /// threshold or the guard is inert.
-    pub fn event(&self, level: Level, message: impl Into<String>, fields: Vec<(String, Value)>) {
-        if !self.active || !enabled(level) {
-            return;
-        }
-        let ev = SpanEvent {
-            level,
-            message: message.into(),
-            fields,
-            unix_nanos: now_unix_nanos(),
-        };
-        STACK.with(|cell| {
-            if let Some(top) = cell.borrow_mut().last_mut() {
-                top.events.push(ev);
-            }
-        });
-    }
-}
-
-impl Drop for SpanGuard {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let live = STACK.with(|cell| cell.borrow_mut().pop());
-        let live = match live {
-            Some(l) => l,
-            None => return,
-        };
-        let finished = FinishedSpan {
-            name: live.name,
-            trace_id: live.trace_id,
-            span_id: live.span_id,
-            parent_id: live.parent_id,
-            level: live.level,
-            start_unix_nanos: live.start_unix_nanos,
-            duration_nanos: live.start.elapsed().as_nanos(),
-            fields: live.fields,
-            events: live.events,
-        };
-        export(&finished);
-    }
-}
-
-// ---- free-standing events ------------------------------------------------
-
-/// Records a point-in-time event on the current span.
-///
-/// If a span is active on this thread the event is attached to it. If there is
-/// no current span and the level passes the filter, the event is emitted as a
-/// standalone zero-duration [`FinishedSpan`] named `"event"` carrying the
-/// single event, so it still reaches the exporter. Events below the global
-/// threshold are dropped.
-pub fn event(level: Level, message: impl Into<String>, fields: Vec<(String, Value)>) {
-    if !enabled(level) {
-        return;
-    }
-    let mut ev = Some(SpanEvent {
-        level,
-        message: message.into(),
-        fields,
-        unix_nanos: now_unix_nanos(),
-    });
-    let attached = STACK.with(|cell| {
-        let mut stack = cell.borrow_mut();
-        if let Some(top) = stack.last_mut() {
-            top.events.push(ev.take().expect("event present"));
-            true
-        } else {
-            false
-        }
-    });
-    if attached {
-        return;
-    }
-    // No current span: emit a synthetic span so the event is not lost.
-    let ev = ev.expect("event present");
-    let finished = FinishedSpan {
-        name: "event".to_string(),
-        trace_id: new_trace_id(),
-        span_id: new_span_id(),
-        parent_id: None,
-        level,
-        start_unix_nanos: ev.unix_nanos,
-        duration_nanos: 0,
-        fields: Vec::new(),
-        events: vec![ev],
+fn store_exporters(list: Vec<Arc<dyn Exporter>>) {
+    let mut slot = EXPORTERS.write().unwrap_or_else(|e| e.into_inner());
+    HAS_EXPORTER.store(!list.is_empty(), Ordering::Release);
+    *slot = if list.is_empty() {
+        None
+    } else {
+        Some(Arc::from(list))
     };
-    export(&finished);
+}
+
+/// Installs the process-wide exporter, replacing any previously installed
+/// ones. Until one is installed, finishing a span is a cheap no-op.
+pub fn set_exporter(exporter: Box<dyn Exporter>) {
+    store_exporters(vec![Arc::from(exporter)]);
+}
+
+/// Installs an additional exporter next to the existing ones; every finished
+/// span is delivered to each.
+pub fn add_exporter(exporter: Box<dyn Exporter>) {
+    let mut list: Vec<Arc<dyn Exporter>> = exporters().map(|l| l.to_vec()).unwrap_or_default();
+    list.push(Arc::from(exporter));
+    store_exporters(list);
+}
+
+/// Removes every installed exporter without flushing them.
+pub fn clear_exporters() {
+    store_exporters(Vec::new());
+}
+
+/// Flushes the installed exporters, if any.
+pub fn flush() {
+    if let Some(list) = exporters() {
+        for exporter in list.iter() {
+            exporter.flush();
+        }
+    }
+}
+
+/// Shuts the installed exporters down (each flushes what it holds) and removes
+/// them. Call it once on the way out of the process.
+pub fn shutdown() {
+    let list = exporters();
+    clear_exporters();
+    if let Some(list) = list {
+        for exporter in list.iter() {
+            exporter.shutdown();
+        }
+    }
+}
+
+/// True when at least one exporter is installed (a cheap atomic check).
+fn has_exporter() -> bool {
+    HAS_EXPORTER.load(Ordering::Acquire)
+}
+
+/// Hands a finished span to the installed exporters.
+fn export(span: &FinishedSpan) {
+    if !has_exporter() || EXPORTING.with(|flag| flag.replace(true)) {
+        return;
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            EXPORTING.with(|flag| flag.set(false));
+        }
+    }
+    let _reset = Reset;
+    if let Some(list) = exporters() {
+        for exporter in list.iter() {
+            exporter.export(span);
+        }
+    }
 }
 
 // ---- built-in JSON exporter ----------------------------------------------
@@ -525,19 +346,20 @@ fn fields_value(fields: &[(String, Value)]) -> Value {
     Value::Object(fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
+fn opt_str(value: &Option<String>) -> Value {
+    match value {
+        Some(s) => Value::Str(s.clone()),
+        None => Value::Null,
+    }
+}
+
 /// Builds the JSON [`Value`] tree for a finished span.
 fn span_to_value(span: &FinishedSpan) -> Value {
-    let mut obj: Vec<(String, Value)> = Vec::with_capacity(9);
+    let mut obj: Vec<(String, Value)> = Vec::with_capacity(14);
     obj.push(("name".to_string(), Value::Str(span.name.clone())));
     obj.push(("trace_id".to_string(), Value::Str(span.trace_id.clone())));
     obj.push(("span_id".to_string(), Value::Str(span.span_id.clone())));
-    obj.push((
-        "parent_id".to_string(),
-        match &span.parent_id {
-            Some(p) => Value::Str(p.clone()),
-            None => Value::Null,
-        },
-    ));
+    obj.push(("parent_id".to_string(), opt_str(&span.parent_id)));
     obj.push(("level".to_string(), Value::Str(span.level.to_string())));
     obj.push((
         "start_unix_nanos".to_string(),
@@ -563,6 +385,35 @@ fn span_to_value(span: &FinishedSpan) -> Value {
         .collect();
     obj.push(("events".to_string(), Value::Array(events)));
 
+    obj.push(("kind".to_string(), Value::Str(span.kind.as_str().into())));
+    obj.push((
+        "status".to_string(),
+        Value::Str(span.status.as_str().into()),
+    ));
+    if let Some(message) = span.status.message() {
+        obj.push(("status_message".to_string(), Value::Str(message.into())));
+    }
+    if !span.links.is_empty() {
+        let links: Vec<Value> = span
+            .links
+            .iter()
+            .map(|link| {
+                Value::Object(vec![
+                    ("trace_id".to_string(), Value::Str(link.trace_id.clone())),
+                    ("span_id".to_string(), Value::Str(link.span_id.clone())),
+                    ("fields".to_string(), fields_value(&link.fields)),
+                ])
+            })
+            .collect();
+        obj.push(("links".to_string(), Value::Array(links)));
+    }
+    if span.trace_state.is_some() {
+        obj.push(("trace_state".to_string(), opt_str(&span.trace_state)));
+    }
+    if span.parent_remote {
+        obj.push(("parent_remote".to_string(), Value::Bool(true)));
+    }
+
     Value::Object(obj)
 }
 
@@ -571,7 +422,7 @@ fn span_to_value(span: &FinishedSpan) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, MutexGuard};
+    use std::sync::MutexGuard;
     use std::thread::sleep;
     use std::time::Duration;
 
@@ -593,6 +444,7 @@ mod tests {
 
     fn install() -> Arc<Mutex<Vec<FinishedSpan>>> {
         let store = Arc::new(Mutex::new(Vec::new()));
+        set_sampler(Sampler::default());
         set_exporter(Box::new(VecExporter(store.clone())));
         store
     }
@@ -759,8 +611,6 @@ mod tests {
             name: "req".to_string(),
             trace_id: "0".repeat(32),
             span_id: "1".repeat(16),
-            parent_id: None,
-            level: Level::Info,
             start_unix_nanos: 1_000,
             duration_nanos: 42,
             fields: vec![("count".to_string(), Value::Int(9))],
@@ -770,6 +620,7 @@ mod tests {
                 fields: vec![],
                 unix_nanos: 1_500,
             }],
+            ..FinishedSpan::default()
         };
         let rendered = json::to_string(&span_to_value(&span));
         assert!(rendered.contains(r#""name":"req""#));
@@ -778,6 +629,29 @@ mod tests {
         assert!(rendered.contains(r#""duration_nanos":42"#));
         assert!(rendered.contains(r#""parent_id":null"#));
         assert!(rendered.contains(r#""message":"hi""#));
+        assert!(rendered.contains(r#""kind":"internal""#));
+        assert!(rendered.contains(r#""status":"unset""#));
+        assert!(!rendered.contains("links") && !rendered.contains("status_message"));
+
+        let failed = FinishedSpan {
+            kind: SpanKind::Server,
+            status: Status::error("boom"),
+            trace_state: Some("k=v".into()),
+            parent_remote: true,
+            links: vec![Link {
+                trace_id: "a".repeat(32),
+                span_id: "b".repeat(16),
+                trace_state: None,
+                fields: vec![("why".to_string(), Value::Str("batch".into()))],
+            }],
+            ..span
+        };
+        let rendered = json::to_string(&span_to_value(&failed));
+        assert!(rendered.contains(r#""kind":"server""#));
+        assert!(rendered.contains(r#""status":"error","status_message":"boom""#));
+        assert!(rendered.contains(r#""links":[{"trace_id":"aaaa"#));
+        assert!(rendered.contains(r#""trace_state":"k=v""#));
+        assert!(rendered.contains(r#""parent_remote":true"#));
     }
 
     #[test]

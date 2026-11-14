@@ -1,11 +1,23 @@
-//! Streaming, dependency-free cryptographic hashes.
+//! Dependency-free hashing, MACs, key derivation, encodings and randomness.
 //!
-//! Public building blocks for content-addressing, integrity checks, and
-//! caching. Every hasher is **incremental** — feed bytes with
-//! [`update`](Sha256::update) as they arrive (a download, a large file read)
-//! and call [`finalize`](Sha256::finalize) once, without buffering the whole
-//! input in memory. One-shot [`sha256`], [`sha1`], and [`hmac_sha256`]
-//! convenience functions cover the common case.
+//! Public building blocks for content-addressing, integrity checks, request
+//! signing and token handling:
+//!
+//! | Area | Items |
+//! |---|---|
+//! | Cryptographic hashes | [`Sha256`], [`Sha384`], [`Sha512`] (and legacy [`Sha1`]) |
+//! | Checksums (**not** cryptographic) | [`Md5`], [`Crc32`] |
+//! | Message authentication | [`Hmac`] ([`HmacSha256`], [`HmacSha384`], [`HmacSha512`], [`HmacSha1`]) |
+//! | Key derivation | [`kdf`]: HKDF, PBKDF2 |
+//! | Encodings | [`base64`], [`hex`] |
+//! | Comparison | [`ct_eq`], [`Digest::ct_eq`] |
+//! | Secrets | [`Secret`] (redacting, wiped on drop) |
+//! | Randomness | [`random`] (OS CSPRNG; Unix only) |
+//!
+//! Every hasher is **incremental** — feed bytes with `update` as they arrive
+//! (a download, a large file read) and call `finalize` once, without buffering
+//! the whole input in memory. One-shot functions ([`sha256`], [`sha512`],
+//! [`hmac_sha256`], …) cover the common case.
 //!
 //! ```
 //! use ferroly::hash::Sha256;
@@ -19,12 +31,93 @@
 //! assert_eq!(ferroly::hash::sha256(b"abc").to_hex().len(), 64);
 //! ```
 //!
-//! All algorithms are implemented in-house (FIPS 180-4 SHA-256, FIPS 180-1
-//! SHA-1, RFC 2104 HMAC) with no external crypto dependency.
+//! # Hand-rolled, not FIPS-validated
+//!
+//! All algorithms are implemented in-house in safe Rust (FIPS 180-4 SHA-2,
+//! FIPS 180-1 SHA-1, RFC 1321 MD5, RFC 2104 HMAC, RFC 5869 HKDF, RFC 8018
+//! PBKDF2, RFC 4648 base64) with no external crypto dependency. They are
+//! checked against the published test vectors, but they are **not**
+//! FIPS 140 validated, have had no independent audit, use no hardware
+//! acceleration, and — apart from the explicit constant-time comparisons —
+//! make no side-channel guarantees. If your environment mandates validated
+//! cryptography, do not use this module for that purpose.
 
 #![deny(missing_docs)]
 
 use std::fmt;
+
+pub mod base64;
+mod block;
+mod crc32;
+pub mod hex;
+mod hmac;
+pub mod kdf;
+mod md5;
+pub mod random;
+mod secret;
+mod sha512;
+
+pub use crc32::{crc32, Crc32};
+pub use hmac::{
+    hmac, hmac_sha1, hmac_sha256, hmac_sha384, hmac_sha512, Hmac, HmacMd5, HmacSha1, HmacSha256,
+    HmacSha384, HmacSha512,
+};
+pub use md5::{md5, Md5};
+pub use secret::Secret;
+pub use sha512::{sha384, sha512, Sha384, Sha512};
+
+/// Compares two byte slices in constant time with respect to their contents.
+///
+/// Use this — never `==` — to compare a MAC, signature, token or password
+/// hash against an untrusted value: `==` returns at the first differing byte,
+/// which lets an attacker recover the expected value byte by byte from
+/// response timing.
+///
+/// Slices of different lengths compare unequal immediately, so the *length*
+/// of the inputs is not hidden (it rarely is secret; hash both sides first if
+/// it is).
+///
+/// ```
+/// use ferroly::hash::{ct_eq, hmac_sha256};
+///
+/// let expected = hmac_sha256(b"key", b"body");
+/// let received: &[u8] = expected.as_bytes(); // e.g. decoded from a header
+/// assert!(ct_eq(expected.as_bytes(), received));
+/// assert!(!ct_eq(b"abc", b"abd"));
+/// assert!(!ct_eq(b"abc", b"abcd"));
+/// ```
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    // `black_box` keeps the optimiser from turning the fold into an early exit.
+    std::hint::black_box(diff) == 0
+}
+
+/// A hash function usable with the generic [`Hmac`] and [`kdf`] constructions.
+///
+/// Implemented by [`Sha256`], [`Sha384`], [`Sha512`], [`Sha1`] and [`Md5`].
+/// The inherent `new` / `update` / `finalize` methods on those types do the
+/// same thing without importing this trait.
+pub trait HashAlgorithm: Clone {
+    /// The internal block size in bytes (64 for SHA-256, 128 for SHA-512).
+    const BLOCK_LEN: usize;
+    /// The digest size in bytes. Must not exceed [`BLOCK_LEN`](Self::BLOCK_LEN).
+    const OUTPUT_LEN: usize;
+    /// The digest type, a [`Digest`] of [`OUTPUT_LEN`](Self::OUTPUT_LEN) bytes.
+    type Output: AsRef<[u8]>;
+
+    /// Creates a fresh hasher.
+    fn new() -> Self;
+    /// Absorbs more input.
+    fn update(&mut self, data: &[u8]);
+    /// Finishes the hash and returns the digest.
+    fn finalize(self) -> Self::Output;
+}
 
 /// A fixed-size hash output.
 ///
@@ -52,23 +145,30 @@ impl<const N: usize> Digest<N> {
 
     /// The digest as a lowercase hex string (`2 * N` characters).
     pub fn to_hex(&self) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut s = String::with_capacity(N * 2);
-        for &b in &self.0 {
-            s.push(HEX[(b >> 4) as usize] as char);
-            s.push(HEX[(b & 0x0f) as usize] as char);
-        }
-        s
+        hex::encode(&self.0)
+    }
+
+    /// Parses a digest from its hex form (either case, exactly `2 * N`
+    /// characters) — e.g. an expected checksum from a manifest.
+    ///
+    /// ```
+    /// use ferroly::hash::{sha256, Digest};
+    ///
+    /// let expected: Digest<32> = Digest::from_hex(
+    ///     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    /// ).unwrap();
+    /// assert!(sha256(b"abc").ct_eq(&expected));
+    /// ```
+    pub fn from_hex(text: &str) -> Result<Self, hex::DecodeError> {
+        let mut bytes = [0u8; N];
+        hex::decode_to_slice(text, &mut bytes)?;
+        Ok(Digest(bytes))
     }
 
     /// Constant-time equality with another digest, resistant to timing attacks
     /// (does not short-circuit on the first differing byte).
     pub fn ct_eq(&self, other: &Digest<N>) -> bool {
-        let mut diff = 0u8;
-        for i in 0..N {
-            diff |= self.0[i] ^ other.0[i];
-        }
-        diff == 0
+        ct_eq(&self.0, &other.0)
     }
 }
 
@@ -187,6 +287,22 @@ impl Sha256 {
     }
 }
 
+impl HashAlgorithm for Sha256 {
+    const BLOCK_LEN: usize = BLOCK;
+    const OUTPUT_LEN: usize = 32;
+    type Output = Digest<32>;
+
+    fn new() -> Self {
+        Sha256::new()
+    }
+    fn update(&mut self, data: &[u8]) {
+        Sha256::update(self, data);
+    }
+    fn finalize(self) -> Digest<32> {
+        Sha256::finalize(self)
+    }
+}
+
 fn sha256_compress(h: &mut [u32; 8], block: &[u8; BLOCK]) {
     let mut w = [0u32; 64];
     for (i, word) in w.iter_mut().enumerate().take(16) {
@@ -231,58 +347,6 @@ fn sha256_compress(h: &mut [u32; 8], block: &[u8; BLOCK]) {
 pub fn sha256(data: &[u8]) -> Digest<32> {
     let mut h = Sha256::new();
     h.update(data);
-    h.finalize()
-}
-
-// ---- HMAC-SHA256 ---------------------------------------------------------
-
-/// An incremental HMAC-SHA256 (RFC 2104) keyed hasher.
-#[derive(Clone)]
-pub struct HmacSha256 {
-    inner: Sha256,
-    o_key: [u8; BLOCK],
-}
-
-impl HmacSha256 {
-    /// Creates a keyed hasher. Keys longer than the 64-byte block are hashed
-    /// first; shorter keys are zero-padded.
-    pub fn new(key: &[u8]) -> Self {
-        let mut k = [0u8; BLOCK];
-        if key.len() > BLOCK {
-            k[..32].copy_from_slice(sha256(key).as_bytes());
-        } else {
-            k[..key.len()].copy_from_slice(key);
-        }
-        let mut i_key = [0x36u8; BLOCK];
-        let mut o_key = [0x5cu8; BLOCK];
-        for i in 0..BLOCK {
-            i_key[i] ^= k[i];
-            o_key[i] ^= k[i];
-        }
-        let mut inner = Sha256::new();
-        inner.update(&i_key);
-        HmacSha256 { inner, o_key }
-    }
-
-    /// Absorbs more message input.
-    pub fn update(&mut self, data: &[u8]) {
-        self.inner.update(data);
-    }
-
-    /// Finishes the MAC and returns the 32-byte tag.
-    pub fn finalize(self) -> Digest<32> {
-        let inner = self.inner.finalize();
-        let mut outer = Sha256::new();
-        outer.update(&self.o_key);
-        outer.update(inner.as_bytes());
-        outer.finalize()
-    }
-}
-
-/// Computes HMAC-SHA256 of `msg` under `key` in one call.
-pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> Digest<32> {
-    let mut h = HmacSha256::new(key);
-    h.update(msg);
     h.finalize()
 }
 
@@ -370,6 +434,22 @@ impl Sha1 {
     }
 }
 
+impl HashAlgorithm for Sha1 {
+    const BLOCK_LEN: usize = BLOCK;
+    const OUTPUT_LEN: usize = 20;
+    type Output = Digest<20>;
+
+    fn new() -> Self {
+        Sha1::new()
+    }
+    fn update(&mut self, data: &[u8]) {
+        Sha1::update(self, data);
+    }
+    fn finalize(self) -> Digest<20> {
+        Sha1::finalize(self)
+    }
+}
+
 fn sha1_compress(h: &mut [u32; 5], block: &[u8; BLOCK]) {
     let mut w = [0u32; 80];
     for (i, word) in w.iter_mut().enumerate().take(16) {
@@ -412,81 +492,4 @@ pub fn sha1(data: &[u8]) -> Digest<20> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sha256_known_vectors() {
-        assert_eq!(
-            sha256(b"").to_hex(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            sha256(b"abc").to_hex(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn sha256_streaming_matches_one_shot() {
-        // A message spanning several 64-byte blocks, fed in awkward chunks.
-        let data: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
-        let mut h = Sha256::new();
-        for chunk in data.chunks(7) {
-            h.update(chunk);
-        }
-        assert_eq!(h.finalize(), sha256(&data));
-    }
-
-    #[test]
-    fn sha256_block_boundary() {
-        // Exactly one block, and one byte under/over, exercise the padding paths.
-        for n in [55usize, 56, 63, 64, 65, 119, 120] {
-            let data = vec![0xABu8; n];
-            let mut h = Sha256::new();
-            h.update(&data);
-            let streamed = h.finalize();
-            assert_eq!(streamed, sha256(&data), "n={n}");
-        }
-    }
-
-    #[test]
-    fn hmac_sha256_rfc4231_case2() {
-        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
-        assert_eq!(
-            mac.to_hex(),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-    }
-
-    #[test]
-    fn hmac_streaming_matches_one_shot() {
-        let key = b"a-very-long-key-that-exceeds-the-sha256-block-size-of-64-bytes!!";
-        let mut h = HmacSha256::new(key);
-        h.update(b"hello ");
-        h.update(b"world");
-        assert_eq!(h.finalize(), hmac_sha256(key, b"hello world"));
-    }
-
-    #[test]
-    fn sha1_known_vectors() {
-        assert_eq!(
-            sha1(b"").to_hex(),
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
-        );
-        assert_eq!(
-            sha1(b"abc").to_hex(),
-            "a9993e364706816aba3e25717850c26c9cd0d89d"
-        );
-    }
-
-    #[test]
-    fn digest_ct_eq_and_display() {
-        let a = sha256(b"x");
-        let b = sha256(b"x");
-        let c = sha256(b"y");
-        assert!(a.ct_eq(&b));
-        assert!(!a.ct_eq(&c));
-        assert_eq!(format!("{a}"), a.to_hex());
-    }
-}
+mod tests;

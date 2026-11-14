@@ -1,4 +1,6 @@
-//! The in-memory data model that all codecs (de)encode through.
+//! The in-memory data model that all codecs encode and decode through.
+
+use std::collections::HashMap;
 
 /// A format-agnostic data value — the intermediate all codecs operate on.
 ///
@@ -106,6 +108,158 @@ impl Value {
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
+
+    /// Returns the object entries mutably if this is a [`Value::Object`].
+    pub fn as_object_mut(&mut self) -> Option<&mut Vec<(String, Value)>> {
+        match self {
+            Value::Object(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// Returns the array elements mutably if this is a [`Value::Array`].
+    pub fn as_array_mut(&mut self) -> Option<&mut Vec<Value>> {
+        match self {
+            Value::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Looks up a key in an object value, mutably. Like [`get`](Self::get), the
+    /// **last** occurrence of a duplicated key wins.
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        self.as_object_mut()?
+            .iter_mut()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    /// Indexes into an array value, mutably.
+    pub fn get_index_mut(&mut self, i: usize) -> Option<&mut Value> {
+        self.as_array_mut()?.get_mut(i)
+    }
+
+    /// Replaces this value with [`Value::Null`] and returns the original.
+    pub fn take(&mut self) -> Value {
+        std::mem::take(self)
+    }
+
+    /// Looks up a nested value by JSON Pointer (RFC 6901).
+    ///
+    /// The empty pointer `""` is the value itself; otherwise the pointer is a
+    /// sequence of `/`-prefixed tokens, each an object key or an array index.
+    /// Inside a token `~1` stands for `/` and `~0` for `~`.
+    ///
+    /// ```
+    /// use ferroly::codec::{json, Value};
+    ///
+    /// let v = json::from_str(r#"{"a":{"b":[10,20]},"x/y":1}"#).unwrap();
+    /// assert_eq!(v.pointer("/a/b/1").and_then(Value::as_i64), Some(20));
+    /// assert_eq!(v.pointer("/x~1y").and_then(Value::as_i64), Some(1));
+    /// assert!(v.pointer("/a/missing").is_none());
+    /// ```
+    pub fn pointer(&self, pointer: &str) -> Option<&Value> {
+        if pointer.is_empty() {
+            return Some(self);
+        }
+        let mut cur = self;
+        for token in pointer.strip_prefix('/')?.split('/') {
+            cur = match cur {
+                Value::Object(o) => find(o, &unescape_pointer_token(token))?,
+                Value::Array(a) => a.get(pointer_index(token)?)?,
+                _ => return None,
+            };
+        }
+        Some(cur)
+    }
+
+    /// The mutable form of [`pointer`](Self::pointer).
+    pub fn pointer_mut(&mut self, pointer: &str) -> Option<&mut Value> {
+        if pointer.is_empty() {
+            return Some(self);
+        }
+        let mut cur = self;
+        for token in pointer.strip_prefix('/')?.split('/') {
+            cur = match cur {
+                Value::Object(_) => cur.get_mut(&unescape_pointer_token(token))?,
+                Value::Array(a) => a.get_mut(pointer_index(token)?)?,
+                _ => return None,
+            };
+        }
+        Some(cur)
+    }
+
+    /// Deep-merges `other` into `self`.
+    ///
+    /// When both sides are objects their members are merged key by key
+    /// (recursively); keys only in `other` are appended in order. In every
+    /// other case — scalars, arrays, mismatched kinds, and `Null` — `other`
+    /// replaces `self`.
+    ///
+    /// ```
+    /// use ferroly::codec::json;
+    ///
+    /// let mut base = json::from_str(r#"{"db":{"host":"a","port":1},"tags":[1]}"#).unwrap();
+    /// base.merge(json::from_str(r#"{"db":{"port":2},"tags":[9],"new":true}"#).unwrap());
+    /// assert_eq!(
+    ///     json::to_string(&base),
+    ///     r#"{"db":{"host":"a","port":2},"tags":[9],"new":true}"#
+    /// );
+    /// ```
+    pub fn merge(&mut self, other: Value) {
+        match (self, other) {
+            (Value::Object(base), Value::Object(overlay)) => {
+                // Index large objects so a wide merge stays linear.
+                let mut index: Option<HashMap<String, usize>> = if base.len() > 16 {
+                    Some(
+                        base.iter()
+                            .enumerate()
+                            .map(|(i, (k, _))| (k.clone(), i))
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+                for (key, value) in overlay {
+                    let pos = match &index {
+                        Some(map) => map.get(&key).copied(),
+                        None => base.iter().rposition(|(k, _)| *k == key),
+                    };
+                    match pos {
+                        Some(i) => base[i].1.merge(value),
+                        None => {
+                            if let Some(map) = &mut index {
+                                map.insert(key.clone(), base.len());
+                            }
+                            base.push((key, value));
+                        }
+                    }
+                }
+            }
+            (slot, other) => *slot = other,
+        }
+    }
+}
+
+/// Decodes the `~1` / `~0` escapes of one JSON Pointer reference token.
+fn unescape_pointer_token(token: &str) -> std::borrow::Cow<'_, str> {
+    if token.contains('~') {
+        std::borrow::Cow::Owned(token.replace("~1", "/").replace("~0", "~"))
+    } else {
+        std::borrow::Cow::Borrowed(token)
+    }
+}
+
+/// Parses a JSON Pointer array index: decimal digits with no leading zero.
+fn pointer_index(token: &str) -> Option<usize> {
+    if token.is_empty() || (token.len() > 1 && token.starts_with('0')) {
+        return None;
+    }
+    if !token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    token.parse().ok()
 }
 
 /// Finds a key's value in an object's entry slice. On duplicate keys the **last**

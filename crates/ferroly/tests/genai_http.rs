@@ -81,7 +81,7 @@ mod openai {
         let mut stream = provider(base).complete_stream(request()).await.unwrap();
         let mut out = String::new();
         while let Some(chunk) = stream.recv().await {
-            out.push_str(&chunk.unwrap().delta);
+            out.push_str(chunk.unwrap().text());
         }
         assert_eq!(out, "Hello");
     }
@@ -90,7 +90,8 @@ mod openai {
     async fn error_status() {
         let base = error_401("nope").await;
         let err = provider(base).complete(request()).await.unwrap_err();
-        assert!(matches!(err, GenAiError::Api { status: 401, .. }));
+        assert!(matches!(err, GenAiError::Auth { status: 401, .. }));
+        assert_eq!(err.status(), Some(401));
     }
 
     #[tokio::test]
@@ -154,7 +155,7 @@ mod claude {
         let mut stream = provider(base).complete_stream(request()).await.unwrap();
         let mut out = String::new();
         while let Some(chunk) = stream.recv().await {
-            out.push_str(&chunk.unwrap().delta);
+            out.push_str(chunk.unwrap().text());
         }
         assert_eq!(out, "Hello");
     }
@@ -188,7 +189,7 @@ mod ollama {
         .await;
         let resp = provider(base).complete(request()).await.unwrap();
         assert_eq!(resp.text(), "hello");
-        assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(resp.raw_finish_reason.as_deref(), Some("stop"));
     }
 
     #[tokio::test]
@@ -200,7 +201,7 @@ mod ollama {
         let mut stream = provider(base).complete_stream(request()).await.unwrap();
         let mut out = String::new();
         while let Some(chunk) = stream.recv().await {
-            out.push_str(&chunk.unwrap().delta);
+            out.push_str(chunk.unwrap().text());
         }
         assert_eq!(out, "Hello");
     }

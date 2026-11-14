@@ -24,6 +24,32 @@
 //! JSON is full-fidelity; the [`xml`], [`yaml`], and [`toml`] codecs cover the
 //! common struct/config subset (see their module docs for what is and isn't
 //! modeled).
+//!
+//! # Untrusted input
+//!
+//! Every parser enforces one shared [`Limits`] budget — nesting depth, input
+//! size, and entry count — and reports malformed input as a [`CodecError`]
+//! (with line and column), never a panic. The plain entry points use
+//! [`Limits::default`]; each has a `*_with` twin that takes an explicit budget:
+//!
+//! ```
+//! use ferroly::codec::{json, CodecError, Limits};
+//!
+//! let limits = Limits::new().with_max_input_bytes(1 << 20).with_max_depth(32);
+//! let deep = "[".repeat(100);
+//! assert!(matches!(
+//!     json::from_str_with(&deep, limits),
+//!     Err(CodecError::LimitExceeded(_))
+//! ));
+//! ```
+//!
+//! # Strict and lenient decoding
+//!
+//! JSON and TOML are typed, so they decode **strictly**: the string `"42"` is
+//! not a number. XML carries only text and YAML is loosely typed, so they (and
+//! the `config` module's environment/properties sources) decode **leniently**
+//! through [`Decode::decode`]. See [`Decode`] for the exact rules and
+//! [`from_value_strict`] to decode a [`Value`] strictly.
 
 #![deny(missing_docs)]
 
@@ -32,6 +58,7 @@
 mod error;
 mod fmt;
 pub mod json;
+mod limits;
 mod registry;
 pub mod schema;
 pub mod toml;
@@ -41,8 +68,9 @@ pub mod xml;
 pub mod yaml;
 
 pub use error::CodecError;
-pub use registry::{decode, encode, resolve, Format};
-pub use traits::{emit_value, Decode, Decoder, Encode, Encoder};
+pub use limits::Limits;
+pub use registry::{decode, decode_with, encode, resolve, try_encode, Format};
+pub use traits::{emit_value, from_value_strict, Decode, Decoder, Encode, Encoder, ValueDecoder};
 pub use value::{find, Value};
 
 // Re-export the derives so `use ferroly::codec::{Encode, Decode};` brings

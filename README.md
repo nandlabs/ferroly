@@ -4,10 +4,10 @@
 
 <p align="center">
   <a href="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml"><img src="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.3.2-B22222" alt="version 0.3.2">
+  <img src="https://img.shields.io/badge/version-0.4.0-B22222" alt="version 0.4.0">
   <img src="https://img.shields.io/badge/rust-1.75%2B-B7410E" alt="MSRV 1.75+">
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="license: Apache-2.0 OR MIT"></a>
-  <img src="https://img.shields.io/badge/unsafe-1%20audited%20block-9cbf3b" alt="unsafe: 1 audited block">
+  <img src="https://img.shields.io/badge/unsafe-1%20audited%20module-9cbf3b" alt="unsafe: 1 audited module">
 </p>
 
 **A self-contained, dependency-minimal Rust toolkit of enterprise utilities.**
@@ -33,59 +33,76 @@ hand-rolls the whole stack rather than pulling in an ecosystem of crates.
   provide).
 - **`rustls` / `tokio-rustls` / `rustls-pki-types` / `webpki-roots`** — TLS for HTTPS/WSS. This
   is the single crypto exception (TLS cannot be safely hand-rolled), and it is isolated behind
-  an internal transport boundary so it never leaks into Ferroly's public API.
+  an internal transport boundary so it never leaks into Ferroly's public API. The same crypto
+  provider verifies RS256 / ES256 JWT signatures.
 - **`ferroly-derive`** — Ferroly's own derive macros (`proc-macro2` / `syn` / `quote`,
   build-time only).
 
 Everything else is implemented from scratch: JSON/XML/YAML/TOML encoding and a `#[derive]`-based
 `Encode`/`Decode`, layered configuration, a prompt-template engine, MIME detection,
-error/derive macros, an HTTP/1.1 client and server, a router, and a WebSocket implementation
-(RFC 6455 framing with a from-scratch SHA-1 handshake).
+error/derive macros, SHA-2/HMAC/HKDF/PBKDF2, an HTTP/1.1 client and server, a router, a
+WebSocket implementation (RFC 6455), resilience policies, and the GenAI provider clients.
+
+The rule is enforced: CI fails if either crate gains a direct dependency outside this list.
+
+Hand-rolling the stack moves the security surface into this repository. The parsers are
+fuzzed, limits and timeouts are on by default, and the hand-written cryptography is not
+FIPS-validated — see [Security posture](crates/ferroly/README.md#security-posture).
 
 ## Structure
 
 Ferroly is a single crate (`ferroly`) whose areas are **feature-gated modules**, plus the
-companion `ferroly-derive` proc-macro crate. Cloud integrations live in separate crates
-(`ferroly-aws`, `ferroly-gcp`, `ferroly-vault` — planned).
+companion `ferroly-derive` proc-macro crate. Each feature enables only the `tokio` features
+it needs. Cloud integrations will live in separate crates (`ferroly-aws`, `ferroly-gcp`,
+`ferroly-vault` — planned).
 
 ## Installation
 
 ```toml
 [dependencies]
-ferroly = { version = "0.3", features = ["genai", "openai", "codec"] }
+ferroly = { version = "0.4", features = ["genai", "openai", "codec"] }
 ```
 
 Enable only what you need — unused modules and their dependencies are never compiled.
 
 ## Modules & features
 
-| Feature | Module | Purpose |
-|---|---|---|
-| `errutils` | `ferroly::errutils` | `MultiError` aggregation + the `#[derive(FerrolyError)]` typed-error macro |
-| `codec` | `ferroly::codec` | `Value` model, `Encode`/`Decode` (+ derives), JSON/XML/YAML/TOML, content-type registry |
-| `hash` | `ferroly::hash` | Streaming SHA-256/SHA-1/HMAC-SHA256 + hex `Digest` |
-| `cli` | `ferroly::cli` | Command-line parser (subcommands, typed flags, env fallback, `--help`) |
-| `config` | `ferroly::config` | Layered environment + file configuration |
-| `fsutils` | `ferroly::fsutils` | Content-type detection (extension table + magic-byte sniffing) + read-only memory-mapped files (`Mmap`) |
-| `lifecycle` | `ferroly::lifecycle` | Component start/stop orchestration with dependency ordering |
-| `rt` | `ferroly::rt` | Async runtime surface (tokio spawn/channels/sync/time/TCP + signals/runtime/test re-exported) |
-| `http` | `ferroly::http` | In-house HTTP/1.1 client + server (streaming, chunked, SSE, range/resumable downloads, TLS) |
-| `clients` | `ferroly::clients` | Retry, circuit breaker, and auth providers |
-| `genai` | `ferroly::genai` | Provider-agnostic LLM interface + prompt templates + a **model router** (capability/cost routing with fallback) |
-| `openai` / `claude` / `ollama` | — | GenAI provider implementations |
-| `turbo` | `ferroly::turbo` | First-class HTTP router + serving |
-| `rest` | `ferroly::rest` | HTTP client + server framework (codec-aware, lifecycle-integrated) |
-| `ws` | `ferroly::ws` | WebSocket client + server (RFC 6455, hand-rolled) |
-| `obs` | `ferroly::obs` | Distributed span/event tracing + exporters (JSON, OTLP/HTTP) |
-| `full` | — | Everything |
+| Feature | Module | What it provides | Pulls in |
+|---|---|---|---|
+| `codec` *(default)* | `ferroly::codec` | `Value` model, `Encode` / `Decode` traits and derives, JSON, XML, YAML and TOML, content-type dispatch, shared parser limits, a JSON-Schema subset validator | — |
+| `errutils` *(default)* | `ferroly::errutils` | `MultiError`, `.context()`, error classification (`Classify` / `ErrorKind`); `#[derive(FerrolyError)]` | — |
+| `config` | `ferroly::config` | Layered configuration from files, environment and CLI; profiles, `${VAR}` interpolation, secrets from files, validation | `codec` |
+| `cli` | `ferroly::cli` | Command-line parser: subcommands, typed and repeated flags, groups, help, shell completion | — |
+| `hash` | `ferroly::hash` | SHA-256/384/512, SHA-1, HMAC, HKDF, PBKDF2, base64, hex, `Secret`, random bytes; MD5 and CRC-32 checksums | — |
+| `fsutils` | `ferroly::fsutils` | Content-type detection, atomic writes, temp files, lock files, memory-mapped reads | — |
+| `auth` | `ferroly::auth` | JWT: HS256/384/512 mint and verify with a `Validation` policy; RS256 / ES256 verification from JWKS (with `http`); scopes | `codec`, `hash` |
+| `lifecycle` | `ferroly::lifecycle` | Component start/stop ordering, rollback, supervision, health and readiness probes, graceful shutdown | tokio |
+| `rt` | `ferroly::rt` | The async runtime surface: tasks, channels, time, I/O, signals, `#[ferroly::rt::main]` / `#[ferroly::rt::test]`, `CancellationToken`, `TaskTracker` | tokio (full) |
+| `http` | `ferroly::http` | HTTP/1.1 client and server: strict parsing, limits and timeouts, TLS and mutual TLS, proxies, redirects, SSE, resumable downloads | tokio, rustls |
+| `clients` | `ferroly::clients` | Retry with jitter and budgets, circuit breaker, bulkhead, rate limiter, a composable `Policy`, auth providers including OAuth 2.0 client credentials | `http`, `hash`, `codec` |
+| `turbo` | `ferroly::turbo` | Router and middleware: groups, async auth, CORS, security headers, rate limiting, JWT, cookies, forms, multipart, static files, problem+json | `http`, `codec` |
+| `rest` | `ferroly::rest` | REST client (retries, breakers, pagination) and a lifecycle-managed REST server with health endpoints | `turbo`, `clients`, `lifecycle` |
+| `ws` | `ferroly::ws` | WebSocket client and server (RFC 6455): async handlers, hub and rooms, origin policy, upgrade hook, keepalive, reconnect | `http`, `lifecycle`, `hash` |
+| `genai` | `ferroly::genai` | Provider-agnostic LLM interface: chat, typed streaming, tools, structured output, embeddings, prompt templates, a model router with budgets and fallback, a mock provider | `codec`, `clients`, `http` |
+| `openai` / `claude` / `ollama` | — | Provider implementations (`all-providers` enables all three) | `genai` |
+| `vectorstore` | `ferroly::vectorstore` | `VectorStore` trait, in-memory store with metadata filters, namespaces and snapshots, text chunking | `codec` |
+| `messaging` | `ferroly::messaging` | In-process queues and topics: ack / retry / dead-letter, backoff, TTL, request-reply, graceful drain | `codec`, `lifecycle` |
+| `vfs` | `ferroly::vfs` | Virtual filesystem trait; rooted local backend, in-memory backend, scheme registry, atomic and streaming writes | tokio |
+| `log` | `ferroly::log` | Structured logging: JSON or text, multiple sinks, file rotation, redaction, per-target levels | `codec` |
+| `metrics` | `ferroly::metrics` | Counters, gauges, histograms; Prometheus and OpenMetrics text; cardinality guard | — |
+| `obs` | `ferroly::obs` | Tracing: spans, W3C trace context, sampling, OTLP/HTTP export | `codec` (+ `http` for OTLP) |
+| `rt-test-util` | `ferroly::rt::time` | The paused test clock (`pause`, `advance`, `resume`) — for `[dev-dependencies]` | `rt` |
+| `full` | — | Everything above except `rt-test-util` | |
 
 Default features: `codec`, `errutils`.
 
 ## Documentation
 
-- **Per-module guides** live in [`docs/`](docs/README.md) — one detailed page per module
-  (codec, hash, genai, http, turbo, rest, ws, obs, config, lifecycle, clients, cli,
-  errutils, fsutils, rt, derive), with architecture notes and cross-links.
+- **Per-module guides** live in [`docs/`](docs/README.md) — one detailed page per module,
+  with architecture notes, security notes and cross-links.
+- **Crate READMEs**: [`crates/ferroly`](crates/ferroly/README.md) (a tour of every module,
+  security posture and known limits — the page shown on crates.io) and
+  [`crates/ferroly-derive`](crates/ferroly-derive/README.md) (every derive shape and attribute).
 - **API reference**: `cargo doc -p ferroly --features full --open`.
 
 ## Examples
@@ -136,7 +153,7 @@ router.serve("127.0.0.1:8080").await?;
 use ferroly::ws::{WsClient, WsOptions, Message};
 
 let mut client = WsClient::dial("wss://echo.example/ws", WsOptions::default()).await?;
-client.send(Message::text("hello"))?;
+client.send(Message::text("hello")).await?;
 if let Some(reply) = client.recv().await {
     println!("{reply:?}");
 }
@@ -161,17 +178,22 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --features ferroly/full -- -D warnings
 ```
 
+The full pre-PR checklist (per-feature lints, the dependency budget, fuzzing) is in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Minimum supported Rust version
 
 Ferroly targets a recent stable Rust toolchain (MSRV `1.75`).
 
 ## Status
 
-The foundation, GenAI, and the full HTTP/WebSocket stack are implemented and tested, along
-with hashing, an async-runtime surface, a CLI parser, memory-mapped files, and distributed
-tracing. Further utilities (`scheduler`, `secrets`, `collections`, `pool`, `uuid`, `semver`,
-and more), signature verification, HTTP/2 + gRPC, and the cloud extension crates are tracked
-in the roadmap/issues and not yet built.
+Every module listed above is implemented, documented and tested; 0.4.0 is a hardening
+release whose changes are listed in the [changelog](CHANGELOG.md). What Ferroly
+deliberately does **not** provide — HTTP/2, durable messaging and vector backends,
+object storage, OIDC flows, hosted-LLM platforms beyond OpenAI / Anthropic / Ollama —
+is listed under "What is not here" in the [crate README](crates/ferroly/README.md#what-is-not-here).
+The cloud extension crates (`ferroly-aws`, `ferroly-gcp`, `ferroly-vault`) are planned
+and not yet built.
 
 ## Contributing
 

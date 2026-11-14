@@ -38,7 +38,8 @@ async fn starts_dependencies_first_and_stops_in_reverse() {
         mgr.register(Arc::new(Recorder {
             id: id.into(),
             log: log.clone(),
-        }));
+        }))
+        .unwrap();
     }
     mgr.add_dependency("api", "db").unwrap();
     mgr.add_dependency("api", "cache").unwrap();
@@ -65,12 +66,14 @@ async fn detects_cyclic_dependency() {
         "a",
         || Box::pin(async { Ok(()) }),
         || Box::pin(async { Ok(()) }),
-    )));
+    )))
+    .unwrap();
     mgr.register(Arc::new(SimpleComponent::new(
         "b",
         || Box::pin(async { Ok(()) }),
         || Box::pin(async { Ok(()) }),
-    )));
+    )))
+    .unwrap();
     mgr.add_dependency("a", "b").unwrap();
     let err = mgr.add_dependency("b", "a").unwrap_err();
     assert!(matches!(err, LifecycleError::CyclicDependency(_)));
@@ -83,7 +86,8 @@ async fn tracks_state_and_publishes_to_watch() {
         "svc",
         || Box::pin(async { Ok(()) }),
         || Box::pin(async { Ok(()) }),
-    )));
+    )))
+    .unwrap();
 
     // A watch subscriber sees the current state immediately and each publish.
     let mut rx = mgr.watch("svc").unwrap();
@@ -108,7 +112,8 @@ async fn double_start_errors() {
         "once",
         || Box::pin(async { Ok(()) }),
         || Box::pin(async { Ok(()) }),
-    )));
+    )))
+    .unwrap();
     mgr.start("once").await.unwrap();
     let err = mgr.start("once").await.unwrap_err();
     assert!(matches!(err, LifecycleError::ComponentAlreadyStarted(_)));
@@ -125,16 +130,21 @@ fn ok_component(id: &str) -> Arc<SimpleComponent> {
 #[tokio::test]
 async fn unregister_list_and_missing() {
     let mgr = ComponentManager::new();
-    mgr.register(ok_component("a"));
-    mgr.register(ok_component("b"));
+    mgr.register(ok_component("a")).unwrap();
+    mgr.register(ok_component("b")).unwrap();
 
     let mut ids = mgr.list();
     ids.sort();
     assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
     assert_eq!(mgr.get_state("a"), Some(ComponentState::Unknown));
 
-    mgr.unregister("a");
+    mgr.unregister("a").unwrap();
     assert_eq!(mgr.get_state("a"), None);
+    // Unregistering an unknown id is an error, not a silent no-op.
+    assert!(matches!(
+        mgr.unregister("a"),
+        Err(LifecycleError::ComponentNotFound(_))
+    ));
 
     assert!(matches!(
         mgr.start("ghost").await,
@@ -160,7 +170,8 @@ async fn start_failure_sets_error_state() {
             })
         },
         || Box::pin(async { Ok(()) }),
-    )));
+    )))
+    .unwrap();
     assert!(mgr.start("bad").await.is_err());
     assert_eq!(mgr.get_state("bad"), Some(ComponentState::Error));
 }
@@ -172,6 +183,14 @@ fn error_display_and_state_predicates() {
         LifecycleError::ComponentAlreadyStarted("a".into()),
         LifecycleError::CyclicDependency("a".into()),
         LifecycleError::Timeout("a".into()),
+        LifecycleError::DuplicateComponent("a".into()),
+        LifecycleError::ComponentActive("a".into()),
+        LifecycleError::StartFailed("a".into()),
+        LifecycleError::StopFailed("a".into()),
+        LifecycleError::ComponentPanicked {
+            id: "a".into(),
+            message: "boom".into(),
+        },
         LifecycleError::failure("a", std::io::Error::other("boom")),
     ];
     for e in &errors {
@@ -184,13 +203,17 @@ fn error_display_and_state_predicates() {
     assert!(ComponentState::Running.is_running());
     assert!(!ComponentState::Stopped.is_running());
     assert!(!ComponentState::Starting.is_running());
+    assert!(ComponentState::Starting.is_transitional());
+    assert!(ComponentState::Stopping.is_transitional());
+    assert!(!ComponentState::Running.is_transitional());
+    assert_eq!(ComponentState::Error.as_str(), "error");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn start_all_with_timeout_ok_and_elapsed() {
     use std::time::Duration;
     let mgr = ComponentManager::new();
-    mgr.register(ok_component("g"));
+    mgr.register(ok_component("g")).unwrap();
     mgr.start_all_with_timeout(Duration::from_secs(5))
         .await
         .unwrap();
@@ -206,15 +229,18 @@ async fn start_all_with_timeout_ok_and_elapsed() {
             })
         },
         || Box::pin(async { Ok(()) }),
-    )));
+    )))
+    .unwrap();
     let err = slow
         .start_all_with_timeout(Duration::from_millis(20))
         .await
         .unwrap_err();
     assert!(matches!(err, LifecycleError::Timeout(_)));
+    // The cancelled start is settled as Error, never left in Starting.
+    assert_eq!(slow.get_state("slow"), Some(ComponentState::Error));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stop_all_with_timeout_bounds_a_hung_stop() {
     use std::time::Duration;
 
@@ -229,9 +255,10 @@ async fn stop_all_with_timeout_bounds_a_hung_stop() {
                 Ok(())
             })
         },
-    )));
+    )))
+    .unwrap();
     // A well-behaved component should still be stopped by the sweep.
-    mgr.register(ok_component("clean"));
+    mgr.register(ok_component("clean")).unwrap();
 
     mgr.start_all().await.unwrap();
 

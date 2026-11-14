@@ -43,13 +43,13 @@
 
 #![deny(missing_docs)]
 
+mod budget;
 mod capability;
 mod config;
 mod default_router;
 mod embedding_router;
 mod error;
 mod execute;
-mod observe;
 mod provider_set;
 mod registry;
 mod route;
@@ -58,14 +58,20 @@ mod strategy_capability;
 mod strategy_composite;
 mod task;
 
-pub use capability::{parse_capability, ModelInfo};
-pub use config::{CostOverride, CustomModel, DisabledCaps, ModelRef, RoutingConfig, RuleConfig};
+pub use budget::{Budget, BudgetStore, InMemoryBudgetStore};
+pub use capability::{parse_capability, AsOf, ModelInfo};
+pub use config::{
+    CostOverride, CustomModel, DisabledCaps, ModelRef, RankOverride, RoutingConfig, RuleConfig,
+    DEFAULT_COST_STALENESS_DAYS,
+};
 pub use default_router::{DefaultRouter, ModelRouter, RouterBuilder};
 pub use embedding_router::EmbeddingRouter;
 pub use error::RouterError;
 pub use provider_set::ProviderSet;
-pub use registry::{build_registry, ModelRegistry};
-pub use route::{Candidate, Exclusion, Ranking, Route, RouteDecision};
+pub use registry::{build_registry, stale_cost_models, stale_cost_warnings, ModelRegistry};
+pub use route::{
+    AttemptOutcome, Candidate, Exclusion, Ranking, Route, RouteAttempt, RouteDecision, RouteReport,
+};
 pub use strategy::{default_output_estimate, satisfies, RoutingStrategy, RuleBasedStrategy};
 pub use strategy_capability::CapabilityStrategy;
 pub use strategy_composite::CompositeStrategy;

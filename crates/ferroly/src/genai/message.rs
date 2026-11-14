@@ -29,6 +29,9 @@ impl Role {
 
 /// A single piece of a [`Message`]. Messages may combine several parts (e.g.
 /// text plus an image, or a tool call plus its result).
+///
+/// `#[non_exhaustive]`: keep a wildcard arm when matching.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum MessagePart {
     /// Plain text.
@@ -60,8 +63,19 @@ pub enum MessagePart {
     ToolResult {
         /// The id of the call this result answers.
         call_id: String,
-        /// The result payload as a structured value.
+        /// The result payload as a structured value. A string is sent to the
+        /// model as is; any other value is sent as its JSON encoding.
         result: Value,
+    },
+    /// A provider-specific content block with no normalized form — for
+    /// example a Claude thinking block and its signature. Providers return it
+    /// so that a multi-turn conversation can send it back **unchanged**; it is
+    /// re-sent only to the provider named here and skipped by every other.
+    ProviderData {
+        /// The provider that produced (and understands) the block.
+        provider: String,
+        /// The block, verbatim.
+        data: Value,
     },
 }
 
@@ -142,6 +156,86 @@ impl Message {
             id: None,
             parts: vec![MessagePart::Text(text.into())],
         }
+    }
+
+    /// Convenience: an assistant text message with no id.
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            id: None,
+            parts: vec![MessagePart::Text(text.into())],
+        }
+    }
+
+    /// An assistant message requesting one tool call. Chain
+    /// [`add_tool_call`](Message::add_tool_call) for parallel calls.
+    pub fn tool_call(id: impl Into<String>, name: impl Into<String>, arguments: Value) -> Self {
+        Self {
+            role: Role::Assistant,
+            id: None,
+            parts: vec![MessagePart::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments,
+            }],
+        }
+    }
+
+    /// A [`Role::Tool`] message answering the tool call `call_id`. Chain
+    /// [`add_tool_result`](Message::add_tool_result) to answer several
+    /// parallel calls in one message.
+    pub fn tool_result(call_id: impl Into<String>, result: impl Into<Value>) -> Self {
+        Self {
+            role: Role::Tool,
+            id: None,
+            parts: vec![MessagePart::ToolResult {
+                call_id: call_id.into(),
+                result: result.into(),
+            }],
+        }
+    }
+
+    /// Appends a tool-call part.
+    pub fn add_tool_call(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: Value,
+    ) -> &mut Self {
+        self.parts.push(MessagePart::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        });
+        self
+    }
+
+    /// Appends a tool-result part.
+    pub fn add_tool_result(
+        &mut self,
+        call_id: impl Into<String>,
+        result: impl Into<Value>,
+    ) -> &mut Self {
+        self.parts.push(MessagePart::ToolResult {
+            call_id: call_id.into(),
+            result: result.into(),
+        });
+        self
+    }
+
+    /// The tool calls in this message, as `(id, name, arguments)`.
+    pub fn tool_calls(&self) -> Vec<(&str, &str, &Value)> {
+        self.parts
+            .iter()
+            .filter_map(|p| match p {
+                MessagePart::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.as_str(), name.as_str(), arguments)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Appends a text part.

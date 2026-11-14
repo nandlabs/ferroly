@@ -6,16 +6,20 @@ name: Version guard
 #   2. That version must not already be published as a `v<version>` git tag —
 #      otherwise the version needs bumping before merge.
 #   3. CHANGELOG.md must have a `## [<version>]` entry for that version.
+# PRs that change nothing under `crates/` are exempt (nothing is released).
 on:
   pull_request:
     branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   version-guard:
     name: Version consistency & unused tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0     # need full history + tags
           fetch-tags: true
@@ -23,6 +27,15 @@ jobs:
       - name: Check versions and tag
         run: |
           set -euo pipefail
+
+          # Only changes to the published crates are releases. A PR that touches
+          # nothing under `crates/` (CI, docs, the lockfile, Dependabot bumps)
+          # ships no new crate contents, so it needs no version bump.
+          BASE="origin/${{ github.base_ref }}"
+          if ! git diff --name-only "$BASE...HEAD" | grep -q '^crates/'; then
+            echo "No changes under crates/ — version guard skipped."
+            exit 0
+          fi
 
           # Crate version from [workspace.package] in the root Cargo.toml.
           CARGO_VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"

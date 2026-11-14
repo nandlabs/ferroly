@@ -23,6 +23,12 @@ pub enum CodecError {
     OutOfRange(&'static str),
     /// A general message.
     Message(String),
+    /// The input exceeded a configured [`Limits`](super::Limits) budget
+    /// (nesting depth, input size, or entry count).
+    LimitExceeded(String),
+    /// A value cannot be represented in the target format (raised by the
+    /// fallible `try_encode` entry points).
+    Unrepresentable(String),
 }
 
 impl CodecError {
@@ -46,6 +52,10 @@ impl CodecError {
     pub fn out_of_range(ty: &'static str) -> Self {
         CodecError::OutOfRange(ty)
     }
+    /// A value the target format cannot represent.
+    pub fn unrepresentable(msg: impl Into<String>) -> Self {
+        CodecError::Unrepresentable(msg.into())
+    }
 }
 
 impl fmt::Display for CodecError {
@@ -60,6 +70,8 @@ impl fmt::Display for CodecError {
             CodecError::UnknownVariant(n) => write!(f, "unknown variant: {n}"),
             CodecError::OutOfRange(t) => write!(f, "value out of range for {t}"),
             CodecError::Message(m) => write!(f, "{m}"),
+            CodecError::LimitExceeded(m) => write!(f, "limit exceeded: {m}"),
+            CodecError::Unrepresentable(m) => write!(f, "cannot encode: {m}"),
         }
     }
 }

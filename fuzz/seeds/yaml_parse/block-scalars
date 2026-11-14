@@ -1,0 +1,8 @@
+---
+a: |
+  text
+  more
+b: >-
+  folded
+  line
+...

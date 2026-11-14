@@ -1,34 +1,59 @@
-//! Ollama provider (local `/api/chat`).
+//! Ollama provider (`/api/chat`, `/api/embed`).
+
+use std::fmt;
 
 use ferroly::codec::{json, Value};
-use ferroly::http::{Client, Method, Request};
+use ferroly::hash::base64;
 
-use super::sse::pump;
+use super::common::{
+    f32_num, merge_custom, num_f32, obj, s, stream_failure, tool_result_text, u32_field, ErrorHint,
+    HttpCore, ProviderFailure,
+};
+use super::sse::{Framing, StreamParser};
 use super::ProviderOptions;
+use ferroly::genai::embedder::embed_in_batches;
+use ferroly::genai::observe::Operation;
 use ferroly::genai::provider::{BoxFuture, ChunkStream, GenAiProvider};
 use ferroly::genai::{
     Capability, CompletionChunk, CompletionRequest, CompletionResponse, EmbedRequest,
-    EmbedResponse, Embedder, GenAiError, Message, MessagePart, ModelInfo, ResponseFormat, Role,
-    Usage,
+    EmbedResponse, Embedder, FinishReason, GenAiError, Message, MessagePart, ModelInfo,
+    ResponseFormat, Role, ToolCallDelta, Usage,
 };
 
+const PROVIDER: &str = "ollama";
 const DEFAULT_BASE: &str = "http://localhost:11434";
+const DEFAULT_EMBED_BATCH: usize = 128;
+/// Body keys the provider builds itself; `Options::custom` may not set them.
+const OWNED_KEYS: &[&str] = &["model", "messages", "stream"];
 
 /// A [`GenAiProvider`] backed by a local (or remote) Ollama server.
+///
+/// Ollama needs no credentials by default; for a server behind an
+/// authenticating proxy, set [`ProviderOptions::auth`].
 pub struct OllamaProvider {
-    client: Client,
+    core: HttpCore,
     base_url: String,
+}
+
+impl fmt::Debug for OllamaProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OllamaProvider")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OllamaProvider {
     /// Creates a provider pointing at `http://localhost:11434` by default.
     pub fn new(opts: Option<ProviderOptions>) -> Self {
+        let opts = opts.unwrap_or_default();
         let base_url = opts
-            .and_then(|o| o.base_url)
+            .base_url
+            .clone()
             .unwrap_or_else(|| DEFAULT_BASE.to_string());
         Self {
-            client: Client::new(),
-            base_url,
+            core: HttpCore::new(PROVIDER, &opts, None, None),
+            base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
 
@@ -36,18 +61,44 @@ impl OllamaProvider {
         format!("{}/api/chat", self.base_url)
     }
 
-    fn request(&self, body: &Value) -> Result<Request, GenAiError> {
-        Ok(Request::builder(Method::Post, &self.endpoint())
-            .map_err(|e| GenAiError::Config(e.to_string()))?
-            .header("content-type", "application/json")
-            .body(json::to_string(body).into_bytes())
-            .build())
+    async fn embed_once(&self, request: EmbedRequest) -> Result<EmbedResponse, GenAiError> {
+        let mut call = self.core.begin(&request.model, Operation::Embed, || {
+            self.model_info_for(&request.model)
+        });
+        let result = async {
+            // POST /api/embed { model, input: [..] } -> { model, embeddings }.
+            let mut fields = vec![
+                ("model".to_string(), s(&request.model)),
+                (
+                    "input".to_string(),
+                    Value::Array(request.input.iter().map(|t| s(t)).collect()),
+                ),
+            ];
+            if let Some(d) = request.dimensions {
+                fields.push(("dimensions".to_string(), d.into()));
+            }
+            let resp = self
+                .core
+                .post(
+                    &format!("{}/api/embed", self.base_url),
+                    &Value::Object(fields),
+                    &[],
+                    &call,
+                    parse_error,
+                )
+                .await?;
+            let value = self.core.read_json(resp, &call).await?;
+            parse_embeddings(&request.model, &value)
+        }
+        .await;
+        call.end_embed(&result);
+        result
     }
 }
 
 impl GenAiProvider for OllamaProvider {
     fn name(&self) -> &str {
-        "ollama"
+        PROVIDER
     }
 
     fn description(&self) -> &str {
@@ -55,19 +106,31 @@ impl GenAiProvider for OllamaProvider {
     }
 
     fn supports(&self, capability: Capability) -> bool {
-        matches!(capability, Capability::Streaming | Capability::JsonMode)
+        matches!(
+            capability,
+            Capability::Text
+                | Capability::Chat
+                | Capability::Streaming
+                | Capability::JsonMode
+                | Capability::ToolUse
+                | Capability::Vision
+                | Capability::Embeddings
+        )
     }
 
     fn model_catalog(&self) -> Vec<ModelInfo> {
         use Capability::{Chat, Embeddings, JsonMode, Streaming, Text};
-        // Local models: zero marginal cost. Limits are typical defaults.
+        // Local models: zero marginal cost. Which models exist depends on what
+        // the server has pulled, so these two entries are placeholders to
+        // override; limits are typical defaults.
         vec![
-            ModelInfo::new("ollama", "llama3")
+            ModelInfo::new(PROVIDER, "llama3")
                 .display_name("Llama 3 (local)")
                 .capabilities([Text, Chat, Streaming, JsonMode])
                 .limits(8_192, 4_096)
-                .cost(0.0, 0.0),
-            ModelInfo::new("ollama", "nomic-embed-text")
+                .cost(0.0, 0.0)
+                .ranks(30, 50),
+            ModelInfo::new(PROVIDER, "nomic-embed-text")
                 .display_name("nomic-embed-text (local)")
                 .capabilities([Embeddings])
                 .limits(8_192, 0)
@@ -80,27 +143,21 @@ impl GenAiProvider for OllamaProvider {
         request: CompletionRequest,
     ) -> BoxFuture<'_, Result<CompletionResponse, GenAiError>> {
         Box::pin(async move {
-            let body = build_body(&request, false);
-            let req = self.request(&body)?;
-            let resp = self
-                .client
-                .send(req)
-                .await
-                .map_err(|e| GenAiError::Transport(e.to_string()))?;
-            let status = resp.status();
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| GenAiError::Transport(e.to_string()))?;
-            if !status.is_success() {
-                return Err(GenAiError::Api {
-                    status: status.as_u16(),
-                    message: text,
-                });
+            let mut call = self.core.begin(&request.model, Operation::Chat, || {
+                self.model_info_for(&request.model)
+            });
+            let result = async {
+                let body = build_body(&request, false)?;
+                let resp = self
+                    .core
+                    .post(&self.endpoint(), &body, &[], &call, parse_error)
+                    .await?;
+                let value = self.core.read_json(resp, &call).await?;
+                parse_response(&value)
             }
-            let value =
-                json::from_str(&text).map_err(|e| GenAiError::ResponseParse(e.to_string()))?;
-            parse_response(&value)
+            .await;
+            call.end_response(&result);
+            result
         })
     }
 
@@ -109,83 +166,57 @@ impl GenAiProvider for OllamaProvider {
         request: CompletionRequest,
     ) -> BoxFuture<'_, Result<ChunkStream, GenAiError>> {
         Box::pin(async move {
-            let body = build_body(&request, true);
-            let req = self.request(&body)?;
-            let resp = self
-                .client
-                .send(req)
-                .await
-                .map_err(|e| GenAiError::Transport(e.to_string()))?;
-            let status = resp.status();
-            if !status.is_success() {
-                let message = resp.text().await.unwrap_or_default();
-                return Err(GenAiError::Api {
-                    status: status.as_u16(),
-                    message,
-                });
+            let mut call = self.core.begin(&request.model, Operation::ChatStream, || {
+                self.model_info_for(&request.model)
+            });
+            let established = async {
+                let body = build_body(&request, true)?;
+                self.core
+                    .post(&self.endpoint(), &body, &[], &call, parse_error)
+                    .await
             }
-            let (tx, rx) = tokio::sync::mpsc::channel(64);
-            // Ollama streams newline-delimited JSON objects (not SSE).
-            tokio::spawn(pump(resp, tx, |line| {
-                if line.trim().is_empty() {
-                    None
-                } else {
-                    Some(parse_ndjson_line(line))
+            .await;
+            match established {
+                // Ollama streams newline-delimited JSON objects (not SSE).
+                Ok(resp) => {
+                    Ok(self
+                        .core
+                        .spawn_stream(resp, OllamaStream::default(), Framing::NdJson, call))
                 }
-            }));
-            Ok(rx)
+                Err(e) => {
+                    call.end_err(&e);
+                    Err(e)
+                }
+            }
         })
     }
 }
 
 impl Embedder for OllamaProvider {
     fn embed(&self, request: EmbedRequest) -> BoxFuture<'_, Result<EmbedResponse, GenAiError>> {
-        Box::pin(async move {
-            // Ollama's batch embeddings API: POST /api/embed { model, input:[..] }
-            // -> { model, embeddings: [[..], ..] }.
-            let body = Value::Object(vec![
-                ("model".into(), request.model.clone().into()),
-                (
-                    "input".into(),
-                    Value::Array(
-                        request
-                            .input
-                            .iter()
-                            .map(|s| Value::Str(s.clone()))
-                            .collect(),
-                    ),
-                ),
-            ]);
-            let endpoint = format!("{}/api/embed", self.base_url);
-            let req = Request::builder(Method::Post, &endpoint)
-                .map_err(|e| GenAiError::Config(e.to_string()))?
-                .header("content-type", "application/json")
-                .body(json::to_string(&body).into_bytes())
-                .build();
-            let resp = self
-                .client
-                .send(req)
-                .await
-                .map_err(|e| GenAiError::Transport(e.to_string()))?;
-            let status = resp.status();
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| GenAiError::Transport(e.to_string()))?;
-            if !status.is_success() {
-                return Err(GenAiError::Api {
-                    status: status.as_u16(),
-                    message: text,
-                });
-            }
-            let value =
-                json::from_str(&text).map_err(|e| GenAiError::ResponseParse(e.to_string()))?;
-            parse_embeddings(&request.model, &value)
-        })
+        let batch = self.core.embed_batch_size.unwrap_or(DEFAULT_EMBED_BATCH);
+        Box::pin(embed_in_batches(request, batch, move |part| {
+            Box::pin(self.embed_once(part))
+        }))
     }
 }
 
-/// Parses Ollama's `{ model, embeddings: [[..], ..] }` response.
+/// Parses Ollama's error body: `{"error": "message"}`.
+fn parse_error(status: u16, body: &str) -> ProviderFailure {
+    let message = json::from_str(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| body.to_string());
+    ProviderFailure {
+        status,
+        hint: ErrorHint::None,
+        error_type: None,
+        message,
+    }
+}
+
+/// Parses Ollama's `{ model, embeddings: [[..], ..], prompt_eval_count }`
+/// response.
 fn parse_embeddings(model: &str, value: &Value) -> Result<EmbedResponse, GenAiError> {
     let rows = value
         .get("embeddings")
@@ -202,6 +233,11 @@ fn parse_embeddings(model: &str, value: &Value) -> Result<EmbedResponse, GenAiEr
             .ok_or_else(|| GenAiError::ResponseParse("non-numeric embedding value".into()))?;
         embeddings.push(vec);
     }
+    let usage = u32_field(value, "prompt_eval_count").map(|n| Usage {
+        prompt_tokens: Some(n),
+        total_tokens: Some(n),
+        ..Usage::default()
+    });
     Ok(EmbedResponse {
         model: value
             .get("model")
@@ -209,125 +245,378 @@ fn parse_embeddings(model: &str, value: &Value) -> Result<EmbedResponse, GenAiEr
             .unwrap_or(model)
             .to_string(),
         embeddings,
-        usage: None,
+        usage,
     })
 }
 
-/// Coerces a JSON number (float or int) to `f32`.
-fn num_f32(v: &Value) -> Option<f32> {
-    v.as_f64()
-        .or_else(|| v.as_i64().map(|i| i as f64))
-        .or_else(|| v.as_u64().map(|u| u as f64))
-        .map(|f| f as f32)
-}
-
-/// Builds the JSON request body as a [`Value`]. Pure and unit-tested.
-fn build_body(request: &CompletionRequest, stream: bool) -> Value {
+/// Builds the JSON request body. Pure and unit-tested.
+fn build_body(request: &CompletionRequest, stream: bool) -> Result<Value, GenAiError> {
     let mut messages: Vec<Value> = Vec::new();
     if let Some(sys) = &request.options.system_instructions {
-        messages.push(Value::Object(vec![
-            ("role".into(), "system".into()),
-            ("content".into(), sys.clone().into()),
-        ]));
+        messages.push(obj([("role", s("system")), ("content", s(sys))]));
     }
-    messages.extend(request.messages.iter().map(encode_message));
+    for (position, message) in request.messages.iter().enumerate() {
+        encode_message(message, &request.messages[..position], &mut messages);
+    }
 
+    let o = &request.options;
     let mut fields: Vec<(String, Value)> = vec![
-        ("model".into(), request.model.clone().into()),
+        ("model".into(), s(&request.model)),
         ("messages".into(), Value::Array(messages)),
         ("stream".into(), stream.into()),
     ];
+    if !request.tools.is_empty() {
+        let tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                obj([
+                    ("type", s("function")),
+                    (
+                        "function",
+                        obj([
+                            ("name", s(&t.name)),
+                            ("description", s(&t.description)),
+                            ("parameters", t.parameters.clone()),
+                        ]),
+                    ),
+                ])
+            })
+            .collect();
+        fields.push(("tools".into(), Value::Array(tools)));
+    }
+    match &request.response_format {
+        Some(ResponseFormat::Json) => fields.push(("format".into(), s("json"))),
+        Some(format) => {
+            if let Some((_name, _description, schema, _strict)) = format.schema_parts() {
+                fields.push(("format".into(), schema.clone()));
+            }
+        }
+        None => {}
+    }
 
     let mut options: Vec<(String, Value)> = Vec::new();
-    if let Some(t) = request.options.temperature {
-        options.push(("temperature".into(), (t as f64).into()));
+    if let Some(t) = o.temperature {
+        options.push(("temperature".into(), f32_num(t)));
     }
-    if let Some(p) = request.options.top_p {
-        options.push(("top_p".into(), (p as f64).into()));
+    if let Some(p) = o.top_p {
+        options.push(("top_p".into(), f32_num(p)));
     }
-    if let Some(m) = request.options.max_tokens {
+    if let Some(k) = o.top_k {
+        options.push(("top_k".into(), k.into()));
+    }
+    if let Some(m) = o.max_tokens {
         options.push(("num_predict".into(), m.into()));
+    }
+    if let Some(seed) = o.seed {
+        options.push(("seed".into(), seed.into()));
+    }
+    if !o.stop.is_empty() {
+        options.push((
+            "stop".into(),
+            Value::Array(o.stop.iter().map(|t| s(t)).collect()),
+        ));
+    }
+    if let Some(p) = o.presence_penalty {
+        options.push(("presence_penalty".into(), f32_num(p)));
+    }
+    if let Some(p) = o.frequency_penalty {
+        options.push(("frequency_penalty".into(), f32_num(p)));
     }
     if !options.is_empty() {
         fields.push(("options".into(), Value::Object(options)));
     }
-    if matches!(request.response_format, Some(ResponseFormat::Json)) {
-        fields.push(("format".into(), "json".into()));
-    }
-    Value::Object(fields)
+    merge_custom(&mut fields, &o.custom, OWNED_KEYS, PROVIDER)?;
+    Ok(Value::Object(fields))
 }
 
-fn encode_message(msg: &Message) -> Value {
-    Value::Object(vec![
-        ("role".into(), msg.role.as_str().into()),
-        ("content".into(), msg.text_content().into()),
-    ])
+/// The name of the tool that call `call_id` invoked, looked up in the
+/// conversation so far. Ollama matches a tool result to its call by name.
+fn tool_name_for<'a>(call_id: &str, earlier: &'a [Message]) -> Option<&'a str> {
+    earlier.iter().rev().find_map(|m| {
+        m.parts.iter().find_map(|p| match p {
+            MessagePart::ToolCall { id, name, .. } if id == call_id => Some(name.as_str()),
+            _ => None,
+        })
+    })
+}
+
+/// Encodes one message in Ollama's chat shape:
+///
+/// - every tool result becomes `{role: "tool", content, tool_name}`;
+/// - an assistant message with tool calls carries
+///   `tool_calls: [{function: {name, arguments: <object>}}]`;
+/// - images go in `images` as base64 strings.
+fn encode_message(msg: &Message, earlier: &[Message], out: &mut Vec<Value>) {
+    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut images: Vec<Value> = Vec::new();
+    let mut has_result = false;
+    for part in &msg.parts {
+        match part {
+            MessagePart::Image { data, .. } => images.push(s(&base64::encode(data))),
+            MessagePart::ToolCall {
+                name, arguments, ..
+            } => {
+                let arguments = match arguments {
+                    Value::Object(_) => arguments.clone(),
+                    _ => Value::Object(Vec::new()),
+                };
+                tool_calls.push(obj([(
+                    "function",
+                    obj([("name", s(name)), ("arguments", arguments)]),
+                )]));
+            }
+            MessagePart::ToolResult { call_id, result } => {
+                has_result = true;
+                let mut fields = vec![
+                    ("role".to_string(), s("tool")),
+                    ("content".to_string(), s(&tool_result_text(result))),
+                ];
+                if let Some(name) = tool_name_for(call_id, earlier) {
+                    fields.push(("tool_name".to_string(), s(name)));
+                }
+                out.push(Value::Object(fields));
+            }
+            _ => {}
+        }
+    }
+    let text = msg.text_content();
+    if has_result && text.is_empty() && tool_calls.is_empty() && images.is_empty() {
+        return;
+    }
+    let role = if has_result && msg.role == Role::Tool {
+        "user"
+    } else {
+        msg.role.as_str()
+    };
+    let mut fields = vec![
+        ("role".to_string(), s(role)),
+        ("content".to_string(), s(&text)),
+    ];
+    if !images.is_empty() {
+        fields.push(("images".to_string(), Value::Array(images)));
+    }
+    if !tool_calls.is_empty() {
+        fields.push(("tool_calls".to_string(), Value::Array(tool_calls)));
+    }
+    out.push(Value::Object(fields));
+}
+
+/// Reads the tool calls of an Ollama message as `(id, name, arguments)`.
+/// Ollama may not assign ids; `call_<n>` (counting from `offset`) is used
+/// then, so results can still be matched to calls.
+fn tool_calls_of(message: Option<&Value>, offset: u32) -> Vec<(String, String, Value)> {
+    let Some(calls) = message
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .enumerate()
+        .map(|(i, call)| {
+            let func = call.get("function");
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_{}", offset + i as u32));
+            let name = func
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let arguments = match func.and_then(|f| f.get("arguments")) {
+                Some(Value::Object(o)) => Value::Object(o.clone()),
+                // Tolerate servers that send the arguments as a JSON string.
+                Some(Value::Str(text)) => {
+                    json::from_str(text).unwrap_or_else(|_| Value::Object(Vec::new()))
+                }
+                _ => Value::Object(Vec::new()),
+            };
+            (id, name, arguments)
+        })
+        .collect()
+}
+
+fn parse_usage(value: &Value) -> Option<Usage> {
+    let prompt = u32_field(value, "prompt_eval_count");
+    let completion = u32_field(value, "eval_count");
+    if prompt.is_none() && completion.is_none() {
+        return None;
+    }
+    let mut usage = Usage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        ..Usage::default()
+    };
+    usage.fill_total();
+    Some(usage)
+}
+
+/// The normalized and raw finish reason of a final (`done: true`) object.
+fn finish_of(value: &Value, has_tool_calls: bool) -> Option<(FinishReason, String)> {
+    let done = value.get("done").and_then(Value::as_bool).unwrap_or(false);
+    let raw = value.get("done_reason").and_then(Value::as_str);
+    if !done && raw.is_none() {
+        return None;
+    }
+    let raw = raw.unwrap_or("stop").to_string();
+    // Ollama reports "stop" for a turn that ends in tool calls.
+    let reason = if has_tool_calls && raw == "stop" {
+        FinishReason::ToolCalls
+    } else {
+        FinishReason::from_provider(&raw)
+    };
+    Some((reason, raw))
 }
 
 /// Parses a non-streaming response body. Pure and unit-tested.
 fn parse_response(value: &Value) -> Result<CompletionResponse, GenAiError> {
-    let model = value
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let content = value
-        .get("message")
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        return Err(stream_failure(ProviderFailure {
+            status: 500,
+            hint: ErrorHint::None,
+            error_type: None,
+            message: error.to_string(),
+        }));
+    }
+    let message = value.get("message");
+    let mut parts: Vec<MessagePart> = Vec::new();
+    let content = message
         .and_then(|m| m.get("content"))
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    let message = Message {
-        role: Role::Assistant,
-        id: None,
-        parts: vec![MessagePart::Text(content)],
-    };
-    let finish_reason = value
-        .get("done_reason")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            if value.get("done").and_then(Value::as_bool).unwrap_or(false) {
-                Some("stop".to_string())
-            } else {
-                None
-            }
+        .unwrap_or("");
+    let calls = tool_calls_of(message, 0);
+    if !content.is_empty() || calls.is_empty() {
+        parts.push(MessagePart::Text(content.to_string()));
+    }
+    let has_calls = !calls.is_empty();
+    for (id, name, arguments) in calls {
+        parts.push(MessagePart::ToolCall {
+            id,
+            name,
+            arguments,
         });
-    let usage = Usage {
-        prompt_tokens: value
-            .get("prompt_eval_count")
-            .and_then(Value::as_u64)
-            .map(|v| v as u32),
-        completion_tokens: value
-            .get("eval_count")
-            .and_then(Value::as_u64)
-            .map(|v| v as u32),
-        total_tokens: None,
-    };
-    Ok(CompletionResponse {
-        model,
-        message,
-        finish_reason,
-        usage: Some(usage),
-    })
+    }
+    let mut response = CompletionResponse::new(
+        value.get("model").and_then(Value::as_str).unwrap_or(""),
+        Message {
+            role: Role::Assistant,
+            id: None,
+            parts,
+        },
+    );
+    if let Some((reason, raw)) = finish_of(value, has_calls) {
+        response.finish_reason = Some(reason);
+        response.raw_finish_reason = Some(raw);
+    }
+    response.usage = parse_usage(value);
+    response.reasoning = message
+        .and_then(|m| m.get("thinking"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    Ok(response)
 }
 
-/// Parses one NDJSON stream line into a chunk. Pure and unit-tested.
-fn parse_ndjson_line(line: &str) -> Result<CompletionChunk, GenAiError> {
-    let value = json::from_str(line).map_err(|e| GenAiError::ResponseParse(e.to_string()))?;
-    let delta = value
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let done = value.get("done").and_then(Value::as_bool).unwrap_or(false);
-    Ok(CompletionChunk {
-        delta,
-        finish_reason: if done { Some("stop".into()) } else { None },
-        usage: None,
-    })
+/// Stateful decoder of Ollama's NDJSON chat stream.
+#[derive(Default)]
+struct OllamaStream {
+    started: bool,
+    tool_calls: u32,
+    done: bool,
+}
+
+impl StreamParser for OllamaStream {
+    fn on_data(
+        &mut self,
+        _event: Option<&str>,
+        data: &str,
+        out: &mut Vec<Result<CompletionChunk, GenAiError>>,
+    ) {
+        let value = match json::from_str(data) {
+            Ok(v) => v,
+            Err(e) => {
+                out.push(Err(GenAiError::ResponseParse(format!(
+                    "stream line is not JSON: {e}"
+                ))));
+                return;
+            }
+        };
+        // A failure after the stream started arrives as `{"error": "..."}`.
+        if let Some(error) = value.get("error") {
+            let message = error
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| json::to_string(error));
+            out.push(Err(stream_failure(ProviderFailure {
+                status: 500,
+                hint: ErrorHint::None,
+                error_type: None,
+                message,
+            })));
+            return;
+        }
+        if !self.started {
+            self.started = true;
+            if let Some(model) = value.get("model").and_then(Value::as_str) {
+                out.push(Ok(CompletionChunk::Start {
+                    id: None,
+                    model: Some(model.to_string()),
+                }));
+            }
+        }
+        let message = value.get("message");
+        if let Some(thinking) = message
+            .and_then(|m| m.get("thinking"))
+            .and_then(Value::as_str)
+        {
+            if !thinking.is_empty() {
+                out.push(Ok(CompletionChunk::ReasoningDelta(thinking.to_string())));
+            }
+        }
+        if let Some(text) = message
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+        {
+            if !text.is_empty() {
+                out.push(Ok(CompletionChunk::TextDelta(text.to_string())));
+            }
+        }
+        // Tool calls arrive whole, not as fragments.
+        for (id, name, arguments) in tool_calls_of(message, self.tool_calls) {
+            out.push(Ok(CompletionChunk::ToolCallDelta(ToolCallDelta {
+                index: self.tool_calls,
+                id: Some(id),
+                name: Some(name),
+                arguments: json::to_string(&arguments),
+            })));
+            self.tool_calls += 1;
+        }
+        if value.get("done").and_then(Value::as_bool).unwrap_or(false) {
+            self.done = true;
+            if let Some(usage) = parse_usage(&value) {
+                out.push(Ok(CompletionChunk::Usage(usage)));
+            }
+            if let Some((finish_reason, raw)) = finish_of(&value, self.tool_calls > 0) {
+                out.push(Ok(CompletionChunk::Done {
+                    finish_reason,
+                    raw_finish_reason: Some(raw),
+                }));
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.done
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.done
+    }
 }
 
 #[cfg(test)]
@@ -345,42 +634,55 @@ mod tests {
             response_format: None,
             options: Options::builder().temperature(0.5).max_tokens(64).build(),
         };
-        let body = build_body(&req, true);
-        assert_eq!(body.get("model").unwrap().as_str(), Some("llama3"));
-        assert_eq!(body.get("stream").unwrap().as_bool(), Some(true));
-        let options = body.get("options").unwrap();
-        assert_eq!(options.get("temperature").unwrap().as_f64(), Some(0.5));
-        assert_eq!(options.get("num_predict").unwrap().as_u64(), Some(64));
+        let body = build_body(&req, true).unwrap();
         assert_eq!(
-            body.get("messages")
-                .unwrap()
-                .get_index(0)
-                .unwrap()
-                .get("content")
-                .unwrap()
-                .as_str(),
-            Some("hi")
+            json::to_string(&body),
+            r#"{"model":"llama3","messages":[{"role":"user","content":"hi"}],"stream":true,"options":{"temperature":0.5,"num_predict":64}}"#
         );
     }
 
     #[test]
     fn parses_response() {
         let value = json::from_str(
-            r#"{"model":"llama3","message":{"role":"assistant","content":"hello"},"done":true,"prompt_eval_count":8,"eval_count":3}"#,
+            r#"{"model":"llama3","message":{"role":"assistant","content":"hello"},"done":true,"done_reason":"length","prompt_eval_count":8,"eval_count":3}"#,
         )
         .unwrap();
         let resp = parse_response(&value).unwrap();
         assert_eq!(resp.text(), "hello");
-        assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
-        assert_eq!(resp.usage.unwrap().prompt_tokens, Some(8));
+        assert_eq!(resp.finish_reason, Some(FinishReason::Length));
+        assert_eq!(resp.raw_finish_reason.as_deref(), Some("length"));
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(8));
+        assert_eq!(usage.total_tokens, Some(11));
     }
 
     #[test]
-    fn parses_ndjson_stream_line() {
-        let chunk = parse_ndjson_line("{\"message\":{\"content\":\"He\"},\"done\":false}").unwrap();
-        assert_eq!(chunk.delta, "He");
-        assert!(chunk.finish_reason.is_none());
-        let last = parse_ndjson_line("{\"message\":{\"content\":\"\"},\"done\":true}").unwrap();
-        assert_eq!(last.finish_reason.as_deref(), Some("stop"));
+    fn stream_lines_carry_text_error_and_done() {
+        let mut p = OllamaStream::default();
+        let mut out = Vec::new();
+        p.on_data(
+            None,
+            "{\"model\":\"llama3\",\"message\":{\"content\":\"He\"},\"done\":false}",
+            &mut out,
+        );
+        assert!(!p.is_complete());
+        p.on_data(
+            None,
+            "{\"message\":{\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"eval_count\":2}",
+            &mut out,
+        );
+        assert!(p.is_complete());
+        let chunks: Vec<CompletionChunk> = out.into_iter().map(Result::unwrap).collect();
+        assert_eq!(chunks[1].text(), "He");
+        assert_eq!(
+            chunks.last().unwrap().finish_reason(),
+            Some(FinishReason::Stop)
+        );
+
+        let mut out = Vec::new();
+        OllamaStream::default().on_data(None, "{\"error\":\"model crashed\"}", &mut out);
+        assert!(
+            matches!(&out[0], Err(GenAiError::Api { status: 500, message }) if message == "model crashed")
+        );
     }
 }
