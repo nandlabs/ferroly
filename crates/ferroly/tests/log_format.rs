@@ -753,9 +753,11 @@ fn caller_capture_is_opt_in() {
     let log = Logger::new().to_writer(buf.clone()).with_caller(true);
     let line = line!() + 1;
     log.info("evt", &[]);
+    // On Windows the path has backslashes, so the text format quotes it.
     assert!(
         buf.text()
             .trim_end()
+            .trim_end_matches('"')
             .ends_with(&format!("log_format.rs:{line}")),
         "{}",
         buf.text()
