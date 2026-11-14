@@ -745,6 +745,15 @@ async fn csrf_double_submit() {
     assert!(router.validate().is_ok());
     let addr = spawn(router).await;
 
+    // Without an OS randomness source (anything but Unix) no token can be
+    // issued, so the layer fails closed instead of handing out a weak one.
+    if !ferroly::hash::random::is_supported() {
+        let form = get(addr, "/form").await;
+        assert_eq!(form.status, 500, "{:?}", form.body);
+        assert!(form.header("set-cookie").is_none());
+        return;
+    }
+
     // A safe request issues the token, in the page and in a cookie.
     let form = get(addr, "/form").await;
     let token = form.body.clone();

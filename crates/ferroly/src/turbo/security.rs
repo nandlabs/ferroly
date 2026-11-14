@@ -709,6 +709,10 @@ mod csrf {
     ///
     /// - On a *safe* request (`GET`, `HEAD`, `OPTIONS`, `TRACE`) without a
     ///   token cookie, a random 256-bit token is issued in a cookie.
+    /// - Where the OS randomness source is unavailable (see
+    ///   [`ferroly::hash::random`](crate::hash::random#platform-support); this
+    ///   includes Windows), no token can be issued and such a request is
+    ///   answered `500` rather than given a predictable token.
     /// - An *unsafe* request (`POST`, `PUT`, `PATCH`, `DELETE`, …) must send
     ///   the same token twice: in the cookie and in a request header
     ///   (`X-CSRF-Token` by default). The two are compared in constant time;
