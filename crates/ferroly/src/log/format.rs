@@ -340,8 +340,9 @@ mod tests {
 
     #[test]
     fn timestamp_precision_and_offset() {
-        // 2026-07-05T12:34:56.789012345Z
-        let t = UNIX_EPOCH + Duration::new(1_783_254_896, 789_012_345);
+        // 2026-07-05T12:34:56.789012300Z. The sub-second part is a multiple
+        // of 100 ns because Windows `SystemTime` cannot hold finer values.
+        let t = UNIX_EPOCH + Duration::new(1_783_254_896, 789_012_300);
         assert_eq!(rfc3339(t, Precision::Seconds, 0), "2026-07-05T12:34:56Z");
         assert_eq!(rfc3339(t, Precision::Millis, 0), "2026-07-05T12:34:56.789Z");
         assert_eq!(
@@ -350,7 +351,7 @@ mod tests {
         );
         assert_eq!(
             rfc3339(t, Precision::Nanos, 0),
-            "2026-07-05T12:34:56.789012345Z"
+            "2026-07-05T12:34:56.789012300Z"
         );
         assert_eq!(
             rfc3339(t, Precision::Millis, 5 * 3600 + 30 * 60),
