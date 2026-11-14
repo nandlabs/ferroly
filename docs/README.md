@@ -54,8 +54,8 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 ### Infrastructure & ops
 | Module | Feature | What it does |
 |---|---|---|
-| [`messaging`](messaging.md) | `messaging` | Provider-agnostic messaging + an in-process bus: queues and topics, ack / retry with backoff / DLQ, TTL, request-reply, graceful drain |
-| [`vfs`](vfs.md) | `vfs` | Virtual filesystem trait; rooted local and in-memory backends, scheme registry, atomic and streaming writes, glob |
+| [`messaging`](messaging.md) | `messaging` | Provider-agnostic messaging + an in-process bus: queues and topics, typed attributes, subscription filters, delivery context and deferred acks, priority, scheduling, ack / retry / DLQ with reasons, request-reply, graceful drain |
+| [`vfs`](vfs.md) | `vfs` | Virtual filesystem trait; rooted local and in-memory backends, scheme registry, atomic and streaming writes with abort, write preconditions, etags, glob |
 | [`log`](log.md) | `log` | Structured logger: JSON / text, multiple sinks, rotation, redaction, per-target levels, sampling, trace correlation |
 | [`metrics`](metrics.md) | `metrics` | Counters, gauges, histograms (int and float); Prometheus and OpenMetrics text; cardinality guard; RED middleware for `turbo` |
 | [`obs`](obs.md) | `obs` | Tracing: async-safe spans, W3C trace context, sampling, exporters (JSON, OTLP/HTTP) |
@@ -98,9 +98,9 @@ Enable only what you use — unused modules and their dependencies never compile
 ```toml
 [dependencies]
 # just what you need
-ferroly = { version = "0.4", default-features = false, features = ["genai", "openai", "vectorstore"] }
+ferroly = { version = "0.5", default-features = false, features = ["genai", "openai", "vectorstore"] }
 # or everything
-ferroly = { version = "0.4", features = ["full"] }
+ferroly = { version = "0.5", features = ["full"] }
 ```
 
 ---

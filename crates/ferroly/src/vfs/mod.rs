@@ -40,7 +40,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ferroly_derive::FerrolyError;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -54,7 +54,7 @@ mod registry;
 pub use glob::{glob, glob_match};
 pub use local::LocalFs;
 pub use memory::MemoryFs;
-pub use path::scheme_of;
+pub use path::{scheme_of, strip_scheme};
 pub use registry::VfsRegistry;
 
 /// A boxed, `Send` future — the object-safe async desugaring.
@@ -89,6 +89,23 @@ pub enum VfsError {
         /// Why it was rejected.
         reason: String,
     },
+    /// The path already exists and the operation required that it did not.
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
+    /// A write precondition did not hold (the contents changed, or the
+    /// expected version was not found).
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
+    /// The backend refused the request for now: it is throttling or
+    /// temporarily unavailable. Trying again later may succeed.
+    #[error("backend unavailable: {0}")]
+    Unavailable(String),
+    /// The backend did not answer in time.
+    #[error("timed out: {0}")]
+    Timeout(String),
+    /// The backend did not accept the credentials.
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
     /// A lower-level I/O error.
     #[error("io error at {path}: {source}")]
     Io {
@@ -116,6 +133,12 @@ impl VfsError {
             },
         }
     }
+
+    /// Whether the same operation may succeed if it is tried again later:
+    /// `true` for [`Unavailable`](Self::Unavailable) and [`Timeout`](Self::Timeout).
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, VfsError::Unavailable(_) | VfsError::Timeout(_))
+    }
 }
 
 /// Metadata about a filesystem node.
@@ -141,6 +164,16 @@ pub struct Metadata {
     pub readonly: bool,
     /// Unix permission bits (`0o7777` mask), where they exist.
     pub mode: Option<u32>,
+    /// An opaque tag that changes whenever the contents change, if the backend
+    /// has one (an object store's ETag).
+    pub etag: Option<String>,
+    /// The backend's version or generation identifier for the contents.
+    pub version: Option<String>,
+    /// The media type stored with the file, if the backend stores one.
+    pub content_type: Option<String>,
+    /// Caller-defined metadata stored with the file, as name/value pairs in
+    /// the order the backend returns them.
+    pub user_metadata: Vec<(String, String)>,
 }
 
 impl Metadata {
@@ -194,6 +227,39 @@ impl Metadata {
         self.is_symlink = is_symlink;
         self
     }
+
+    /// Sets the entity tag (see [`etag`](Metadata::etag)).
+    pub fn with_etag(mut self, etag: impl Into<String>) -> Self {
+        self.etag = Some(etag.into());
+        self
+    }
+
+    /// Sets the version or generation identifier.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Sets the stored media type.
+    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    /// Adds one caller-defined metadata pair (after any already present).
+    pub fn with_user_metadata(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.user_metadata.push((name.into(), value.into()));
+        self
+    }
+
+    /// The value of the first [`user_metadata`](Metadata::user_metadata) pair
+    /// named `name`, if any.
+    pub fn user(&self, name: &str) -> Option<&str> {
+        self.user_metadata
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// A directory entry produced by [`Vfs::list`] / [`Vfs::walk`].
@@ -212,10 +278,12 @@ pub struct Entry {
 /// One page of a directory listing, from [`Vfs::list_page`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ListPage {
-    /// The entries on this page, ordered by name.
+    /// The entries on this page, in the backend's listing order.
     pub entries: Vec<Entry>,
-    /// The cursor to pass as `after` for the next page, or `None` if this was
-    /// the last one.
+    /// An **opaque cursor** for the next page, or `None` if this was the last
+    /// one. Pass it back unchanged as `after`; do not parse it or build one
+    /// yourself. For the bundled backends it happens to be the last entry's
+    /// name.
     pub next: Option<String>,
 }
 
@@ -288,8 +356,14 @@ impl AsyncRead for Vfile {
 ///
 /// Implement this to give a custom [`Vfs`] backend a streaming
 /// [`create`](Vfs::create). Nothing may become visible at the destination
-/// before [`finish`](WriteSink::finish); dropping the sink without finishing
-/// must discard what was written.
+/// before [`finish`](WriteSink::finish).
+///
+/// There are two ways to give up on a write. Dropping the sink without
+/// finishing must still discard what was written, but `Drop` cannot wait or
+/// report failure, so that cleanup is best effort. [`abort`](WriteSink::abort)
+/// is the reliable way: it waits for the cleanup (removing a temporary file,
+/// cancelling a multipart upload) and reports whether it worked. A backend
+/// that holds anything outside the process should override it.
 pub trait WriteSink: Send {
     /// Appends `data` to the pending file.
     fn write_all<'s>(&'s mut self, data: &'s [u8]) -> BoxFuture<'s, Result<(), VfsError>>;
@@ -298,14 +372,32 @@ pub trait WriteSink: Send {
     fn finish<'s>(self: Box<Self>) -> BoxFuture<'s, Result<(), VfsError>>
     where
         Self: 's;
+
+    /// Discards everything written so far and releases whatever the backend
+    /// holds for the pending file (a temporary file, an unfinished multipart
+    /// upload). Unlike dropping the sink, this waits for the cleanup and
+    /// reports whether it worked.
+    ///
+    /// The default just drops the sink.
+    fn abort<'s>(self: Box<Self>) -> BoxFuture<'s, Result<(), VfsError>>
+    where
+        Self: 's,
+    {
+        Box::pin(async move {
+            drop(self);
+            Ok(())
+        })
+    }
 }
 
 /// A streaming writer returned by [`Vfs::create`].
 ///
 /// Write the contents in as many pieces as you like, then call
 /// [`finish`](VfsWriter::finish): only then does the file appear (or change)
-/// at its path, in one step. Dropping the writer without finishing discards
-/// everything and leaves any existing file untouched.
+/// at its path, in one step. To give up, call [`abort`](VfsWriter::abort),
+/// which waits for the backend to clean up and reports whether it did.
+/// Dropping the writer without finishing also discards everything and leaves
+/// any existing file untouched, but its cleanup is best effort.
 pub struct VfsWriter<'a> {
     sink: Box<dyn WriteSink + 'a>,
     written: u64,
@@ -337,14 +429,106 @@ impl<'a> VfsWriter<'a> {
         self.sink.finish().await?;
         Ok(self.written)
     }
+
+    /// Discards the pending file; see [`WriteSink::abort`]. Nothing appears
+    /// at the destination.
+    pub async fn abort(self) -> Result<(), VfsError> {
+        self.sink.abort().await
+    }
+}
+
+/// A condition that must hold for a write to happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Precondition {
+    /// Write only if nothing exists at the path.
+    IfAbsent,
+    /// Write only if the file's current [`Metadata::etag`] equals this value.
+    IfMatch(String),
+}
+
+/// Options for [`Vfs::write_with`] and [`Vfs::create_with`].
+///
+/// The struct is `#[non_exhaustive]`: build it with [`WriteOptions::new`] and
+/// the builder methods.
+///
+/// ```
+/// use ferroly::vfs::{Precondition, WriteOptions};
+///
+/// let opts = WriteOptions::new()
+///     .content_type("text/csv")
+///     .user_metadata("owner", "reports")
+///     .if_absent();
+/// assert_eq!(opts.precondition, Some(Precondition::IfAbsent));
+/// assert!(!opts.is_plain());
+/// assert!(WriteOptions::new().is_plain());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WriteOptions {
+    /// The media type to store with the file.
+    pub content_type: Option<String>,
+    /// Caller-defined metadata to store with the file.
+    pub user_metadata: Vec<(String, String)>,
+    /// A condition that must hold for the write to happen.
+    pub precondition: Option<Precondition>,
+}
+
+impl WriteOptions {
+    /// Plain options: no content type, no user metadata, no precondition.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the media type to store with the file.
+    pub fn content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    /// Adds one caller-defined metadata pair (after any already present).
+    pub fn user_metadata(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.user_metadata.push((name.into(), value.into()));
+        self
+    }
+
+    /// Writes only if nothing exists at the path ([`Precondition::IfAbsent`]).
+    pub fn if_absent(mut self) -> Self {
+        self.precondition = Some(Precondition::IfAbsent);
+        self
+    }
+
+    /// Writes only if the file's current etag equals `etag`
+    /// ([`Precondition::IfMatch`]).
+    pub fn if_match(mut self, etag: impl Into<String>) -> Self {
+        self.precondition = Some(Precondition::IfMatch(etag.into()));
+        self
+    }
+
+    /// Whether nothing is set: no content type, no user metadata and no
+    /// precondition.
+    pub fn is_plain(&self) -> bool {
+        self.content_type.is_none() && self.user_metadata.is_empty() && self.precondition.is_none()
+    }
+}
+
+/// What a signed URL allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SignedUrlMethod {
+    /// Download the file.
+    Get,
+    /// Upload (create or replace) the file.
+    Put,
 }
 
 /// The default [`WriteSink`]: buffers in memory and hands the whole buffer to
-/// [`Vfs::write`] on finish.
+/// [`Vfs::write_with`] on finish.
 struct BufferSink<'a, T: ?Sized> {
     fs: &'a T,
     path: String,
     buf: Vec<u8>,
+    opts: WriteOptions,
 }
 
 impl<T: Vfs + ?Sized> WriteSink for BufferSink<'_, T> {
@@ -364,7 +548,7 @@ impl<T: Vfs + ?Sized> WriteSink for BufferSink<'_, T> {
         Self: 's,
     {
         let this = *self;
-        Box::pin(async move { this.fs.write(&this.path, this.buf).await })
+        Box::pin(async move { this.fs.write_with(&this.path, this.buf, this.opts).await })
     }
 }
 
@@ -373,12 +557,15 @@ impl<T: Vfs + ?Sized> WriteSink for BufferSink<'_, T> {
 /// This trait is the extension point for other storage systems. The required
 /// methods are the core operations; the provided ones
 /// ([`append`](Vfs::append), [`create`](Vfs::create),
-/// [`list_page`](Vfs::list_page)) have correct-but-simple defaults built on
-/// them, which a backend overrides when it can do better. To write a backend:
+/// [`list_page`](Vfs::list_page), [`write_with`](Vfs::write_with),
+/// [`create_with`](Vfs::create_with), [`try_exists`](Vfs::try_exists),
+/// [`signed_url`](Vfs::signed_url), [`as_any`](Vfs::as_any)) have
+/// correct-but-simple defaults built on them, which a backend overrides when
+/// it can do better. To write a backend: strip your own schemes with
+/// [`strip_scheme`] (which rejects any other with [`VfsError::InvalidPath`]),
 /// return [`Vfile::new`] from `open`, build [`Metadata`] with
-/// [`Metadata::file`] / [`Metadata::dir`], map errors with
-/// [`VfsError::from_io`], and reject URL schemes that are not yours with
-/// [`VfsError::InvalidPath`].
+/// [`Metadata::file`] / [`Metadata::dir`] and the `with_*` methods, and map
+/// errors with [`VfsError::from_io`] or the typed variants.
 pub trait Vfs: Send + Sync {
     /// The URL schemes this backend handles (e.g. `["file"]`). A
     /// [`VfsRegistry`] uses them to route paths.
@@ -458,19 +645,28 @@ pub trait Vfs: Send + Sync {
                 fs: self,
                 path,
                 buf: Vec::new(),
+                opts: WriteOptions::default(),
             }))
         })
     }
 
-    /// Lists one directory level a page at a time, ordered by entry name.
+    /// Lists one directory level a page at a time.
     ///
-    /// Returns up to `limit` entries (at least one is always allowed) whose
-    /// names sort after `after`; pass the returned [`ListPage::next`] as
-    /// `after` to continue, until it is `None`. Paging is by name, so entries
-    /// created or removed between calls are picked up or skipped according to
-    /// where they sort — it is not a snapshot.
+    /// Returns up to `limit` entries (at least one is always allowed) that
+    /// come after the cursor `after`; pass the returned [`ListPage::next`]
+    /// back as `after` to continue, until it is `None`. `after` must be a
+    /// cursor previously returned by the same backend for the same path, or
+    /// `None` to start from the beginning.
     ///
-    /// The default calls [`list`](Vfs::list) and slices the result.
+    /// The order is **backend-defined but stable** between calls. The bundled
+    /// backends order by entry name and use the last name on the page as the
+    /// cursor, so entries created or removed between calls are picked up or
+    /// skipped according to where they sort — it is not a snapshot. An object
+    /// store orders by key and may return its own continuation token as the
+    /// cursor.
+    ///
+    /// The default calls [`list`](Vfs::list), sorts by name and slices the
+    /// result.
     fn list_page(
         &self,
         path: &str,
@@ -483,6 +679,89 @@ pub trait Vfs: Send + Sync {
             entries.sort_by(|a, b| a.name.cmp(&b.name));
             Ok(page_of(entries, after.as_deref(), limit))
         })
+    }
+
+    /// Writes a whole file with [`WriteOptions`].
+    ///
+    /// The default handles plain options by calling [`write`](Vfs::write). If
+    /// a [`precondition`](WriteOptions::precondition) is set it returns
+    /// [`VfsError::Unsupported`] — a precondition is never silently ignored.
+    /// The content type and user metadata are hints: a backend that cannot
+    /// store them (and this default) drops them.
+    fn write_with(
+        &self,
+        path: &str,
+        data: Vec<u8>,
+        opts: WriteOptions,
+    ) -> BoxFuture<'_, Result<(), VfsError>> {
+        let path = path.to_string();
+        Box::pin(async move {
+            if opts.precondition.is_some() {
+                return Err(VfsError::Unsupported(format!(
+                    "write preconditions are not supported by this backend: {path}"
+                )));
+            }
+            self.write(&path, data).await
+        })
+    }
+
+    /// Starts a streaming write with [`WriteOptions`]. The options are applied
+    /// when the writer is finished.
+    ///
+    /// The default buffers in memory and calls [`write_with`](Vfs::write_with)
+    /// on finish.
+    fn create_with(
+        &self,
+        path: &str,
+        opts: WriteOptions,
+    ) -> BoxFuture<'_, Result<VfsWriter<'_>, VfsError>> {
+        let path = path.to_string();
+        Box::pin(async move {
+            Ok(VfsWriter::new(BufferSink {
+                fs: self,
+                path,
+                buf: Vec::new(),
+                opts,
+            }))
+        })
+    }
+
+    /// Whether the path exists, reporting failures instead of hiding them:
+    /// `Ok(false)` only when the backend says the path is absent. Unlike
+    /// [`exists`](Vfs::exists), a permission error or an unreachable backend
+    /// is an `Err`.
+    ///
+    /// The default calls [`metadata`](Vfs::metadata).
+    fn try_exists(&self, path: &str) -> BoxFuture<'_, Result<bool, VfsError>> {
+        let path = path.to_string();
+        Box::pin(async move {
+            match self.metadata(&path).await {
+                Ok(_) => Ok(true),
+                Err(VfsError::NotFound(_)) => Ok(false),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    /// A URL that grants `method` access to `path` for `expires_in`, without
+    /// further credentials. The default returns [`VfsError::Unsupported`];
+    /// object-store backends override it.
+    fn signed_url(
+        &self,
+        path: &str,
+        method: SignedUrlMethod,
+        expires_in: Duration,
+    ) -> BoxFuture<'_, Result<String, VfsError>> {
+        let _ = (method, expires_in);
+        let path = path.to_string();
+        Box::pin(async move { Err(VfsError::Unsupported(format!("signed_url({path})"))) })
+    }
+
+    /// This backend as [`Any`](std::any::Any), for downcasting an
+    /// `Arc<dyn Vfs>` back to its concrete type. The default returns `None`;
+    /// a backend that wants to be reachable returns `Some(self)`.
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
     }
 }
 
@@ -508,8 +787,11 @@ const COPY_CHUNK: usize = 64 * 1024;
 /// whose `open` and `create` stream).
 ///
 /// The two may be different backends — that is the point — or the same one.
-/// The destination appears only once the copy has completed; on error nothing
-/// is left there. Returns the number of bytes copied.
+/// The destination appears only once the copy has completed. If reading or
+/// writing fails part-way, the destination writer is
+/// [aborted](VfsWriter::abort) before the error is returned, so nothing is
+/// left there (not even an unfinished upload). Returns the number of bytes
+/// copied.
 ///
 /// ```
 /// use ferroly::vfs::{copy_between, MemoryFs, Vfs};
@@ -532,18 +814,30 @@ pub async fn copy_between(
 ) -> Result<u64, VfsError> {
     let mut reader = src.open(src_path).await?;
     let mut writer = dst.create(dst_path).await?;
-    let mut chunk = vec![0u8; COPY_CHUNK];
-    loop {
-        let n = reader
-            .read(&mut chunk)
-            .await
-            .map_err(|e| VfsError::from_io(src_path, e))?;
-        if n == 0 {
-            break;
+    // The loop borrows the writer, so it is still owned here to be aborted.
+    let copied = async {
+        let mut chunk = vec![0u8; COPY_CHUNK];
+        loop {
+            let n = reader
+                .read(&mut chunk)
+                .await
+                .map_err(|e| VfsError::from_io(src_path, e))?;
+            if n == 0 {
+                return Ok(());
+            }
+            writer.write_all(&chunk[..n]).await?;
         }
-        writer.write_all(&chunk[..n]).await?;
     }
-    writer.finish().await
+    .await;
+    match copied {
+        Ok(()) => writer.finish().await,
+        Err(e) => {
+            // The original error is what the caller needs; a failed cleanup
+            // is secondary.
+            let _ = writer.abort().await;
+            Err(e)
+        }
+    }
 }
 
 /// Computes the SHA-256 digest of a file's contents, streaming it in chunks.

@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
 use super::path::strip_scheme;
-use super::{BoxFuture, Entry, Metadata, Vfile, Vfs, VfsError, WalkAction, WalkFn};
+use super::{
+    BoxFuture, Entry, Metadata, Precondition, Vfile, Vfs, VfsError, WalkAction, WalkFn,
+    WriteOptions,
+};
 
 /// A [`Vfs`] that keeps everything in memory — a stand-in for [`LocalFs`] in
 /// tests, and a scratch filesystem that leaves nothing behind.
@@ -18,6 +21,10 @@ use super::{BoxFuture, Entry, Metadata, Vfile, Vfs, VfsError, WalkAction, WalkFn
 /// Paths are `/`-separated and always resolved from the root: `"a/b"`,
 /// `"/a/b"` and `"mem://a/b"` are the same file. `.` components are ignored
 /// and `..` is rejected. Entries report absolute paths (`/a/b`).
+///
+/// Every stored file gets a fresh [`Metadata::etag`] (also reported as its
+/// `version`), and [`write_with`](Vfs::write_with) supports every
+/// [`Precondition`] and stores the content type and user metadata.
 ///
 /// Cloning yields another handle to the **same** tree. All data lives until
 /// the last handle is dropped; nothing is ever persisted.
@@ -47,6 +54,10 @@ enum Node {
         data: Arc<Vec<u8>>,
         created: SystemTime,
         modified: SystemTime,
+        /// `g{generation}` of the store that produced these contents.
+        etag: String,
+        content_type: Option<String>,
+        user_metadata: Vec<(String, String)>,
     },
     Dir {
         created: SystemTime,
@@ -64,9 +75,23 @@ impl Node {
                 data,
                 created,
                 modified,
-            } => Metadata::file(data.len() as u64)
-                .with_created(*created)
-                .with_modified(*modified),
+                etag,
+                content_type,
+                user_metadata,
+            } => {
+                let mut meta = Metadata::file(data.len() as u64)
+                    .with_created(*created)
+                    .with_modified(*modified)
+                    .with_etag(etag.clone())
+                    .with_version(etag.clone());
+                if let Some(content_type) = content_type {
+                    meta = meta.with_content_type(content_type.clone());
+                }
+                for (name, value) in user_metadata {
+                    meta = meta.with_user_metadata(name.clone(), value.clone());
+                }
+                meta
+            }
             Node::Dir { created } => Metadata::dir()
                 .with_created(*created)
                 .with_modified(*created),
@@ -79,6 +104,15 @@ impl Node {
 #[derive(Debug, Default)]
 struct Tree {
     nodes: BTreeMap<String, Node>,
+    /// Bumped every time a file's contents are stored; the source of etags.
+    generation: u64,
+}
+
+/// What is stored with a file besides its bytes.
+#[derive(Debug, Default)]
+struct Extras {
+    content_type: Option<String>,
+    user_metadata: Vec<(String, String)>,
 }
 
 const ROOT: &str = "/";
@@ -181,20 +215,40 @@ impl Tree {
         }
     }
 
-    /// Stores `data` at `key`, keeping the creation time of a replaced file.
-    fn put(&mut self, key: &str, data: Arc<Vec<u8>>) -> Result<(), VfsError> {
+    /// The content type and user metadata of the file at `key`, if it is one.
+    fn extras(&self, key: &str) -> Extras {
+        match self.nodes.get(key) {
+            Some(Node::File {
+                content_type,
+                user_metadata,
+                ..
+            }) => Extras {
+                content_type: content_type.clone(),
+                user_metadata: user_metadata.clone(),
+            },
+            _ => Extras::default(),
+        }
+    }
+
+    /// Stores `data` (with `extras`) at `key`, keeping the creation time of a
+    /// replaced file and giving the contents a fresh etag.
+    fn put(&mut self, key: &str, data: Arc<Vec<u8>>, extras: Extras) -> Result<(), VfsError> {
         self.check_file_slot(key)?;
         let now = SystemTime::now();
         let created = match self.nodes.get(key) {
             Some(Node::File { created, .. }) => *created,
             _ => now,
         };
+        self.generation += 1;
         self.nodes.insert(
             key.to_string(),
             Node::File {
                 data,
                 created,
                 modified: now,
+                etag: format!("g{}", self.generation),
+                content_type: extras.content_type,
+                user_metadata: extras.user_metadata,
             },
         );
         Ok(())
@@ -294,7 +348,10 @@ impl Vfs for MemoryFs {
     }
 
     fn write(&self, path: &str, data: Vec<u8>) -> BoxFuture<'_, Result<(), VfsError>> {
-        self.with(path, move |tree, key| tree.put(key, Arc::new(data)))
+        // A plain write replaces the file, so its stored extras go too.
+        self.with(path, move |tree, key| {
+            tree.put(key, Arc::new(data), Extras::default())
+        })
     }
 
     fn open(&self, path: &str) -> BoxFuture<'_, Result<Vfile, VfsError>> {
@@ -375,7 +432,8 @@ impl Vfs for MemoryFs {
         self.with(src, move |tree, from| {
             let to = dst?;
             let data = tree.file(from)?.clone();
-            tree.put(&to, data)
+            let extras = tree.extras(from);
+            tree.put(&to, data, extras)
         })
     }
 
@@ -476,8 +534,42 @@ impl Vfs for MemoryFs {
                 _ => Vec::new(),
             };
             contents.extend_from_slice(&data);
-            tree.put(key, Arc::new(contents))
+            let extras = tree.extras(key);
+            tree.put(key, Arc::new(contents), extras)
         })
+    }
+
+    fn write_with(
+        &self,
+        path: &str,
+        data: Vec<u8>,
+        opts: WriteOptions,
+    ) -> BoxFuture<'_, Result<(), VfsError>> {
+        // The check and the store happen under one lock acquisition, so two
+        // concurrent `IfAbsent` writers cannot both succeed.
+        self.with(path, move |tree, key| {
+            match &opts.precondition {
+                None => {}
+                Some(Precondition::IfAbsent) => {
+                    if tree.exists(key) {
+                        return Err(VfsError::AlreadyExists(key.to_string()));
+                    }
+                }
+                Some(Precondition::IfMatch(expected)) => match tree.nodes.get(key) {
+                    Some(Node::File { etag, .. }) if etag == expected => {}
+                    _ => return Err(VfsError::PreconditionFailed(key.to_string())),
+                },
+            }
+            let extras = Extras {
+                content_type: opts.content_type,
+                user_metadata: opts.user_metadata,
+            };
+            tree.put(key, Arc::new(data), extras)
+        })
+    }
+
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(self)
     }
 }
 

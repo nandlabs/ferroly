@@ -5,7 +5,124 @@ All notable changes to this project are documented here. The format is based on
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
 
-## [Unreleased]
+## [0.5.0]
+
+Extension-readiness release for `messaging` and `vfs`: typed message
+attributes and properties, subscription filters, a delivery context, per-entry
+batch errors, receipts and capabilities for providers; write options,
+richer metadata, typed errors and async abort for storage backends. Several
+messaging types changed shape — see "Changed" and the migration table in
+`docs/messaging.md`.
+
+### Added
+
+- **messaging**: typed message attributes — `AttrValue` (`Str` / `Int` / `Float` /
+  `Bool` / `Bytes`) and the ordered multi-map `Attributes` (`insert`, `append`,
+  `get`, `get_all`, typed getters, `remove`, `iter`, `keys`, `FromIterator` /
+  `Extend` / `IntoIterator`).
+- **messaging**: `Properties` — system metadata with new fields `content_type`,
+  `content_encoding`, `subject`, `event_type`, `source`, `user_id`, `dedup_key`
+  and `priority`, with `with_*` / getter pairs on `Message`; new `headers`
+  wire-name constants, including `DEAD_LETTER_*` and `PROPERTY_NAMES`.
+- **messaging**: wire helpers `Message::to_wire_attributes`, `Message::from_wire`
+  and `Message::lookup`, for adapters to brokers with a flat attribute map.
+- **messaging**: `MessagingError::Refused` (hands the refused message back) and the
+  constructors `backend_transient`, `refused` and `refused_transient`;
+  `MessagingError::is_retryable`; `MessagingError::take_message` is now public.
+- **messaging**: `BatchEntryFailure` and the per-entry `BatchFailure` API (`new`,
+  `first_error`, `into_messages`, `failed`).
+- **messaging**: `Receipt` and `Producer::send_with_receipt`; `Capabilities` and
+  `Provider::capabilities` (`LocalProvider` reports its features).
+- **messaging**: `SendOptions::deliver_at`, `SendOptions::extensions` (builder
+  `extension`) and `SendOptions::unsupported_by`.
+- **messaging**: `Provider::set_observer` and the observer hooks `on_published` /
+  `on_send_failed` (also logged by `LogObserver`).
+- **messaging**: `ProviderRegistry::providers`, `capabilities_for`, `setup_all`,
+  `close_all` and `set_observer`; the registry forwards `send_with_receipt` and
+  `add_delivery_listener`.
+- **messaging**: attribute filters on topic subscriptions — `Filter` and
+  `ListenerOptions::filter` — plus `DropReason::Filtered`.
+- **messaging**: `Ack::RetryAfter`, `Ack::DeadLetter` and `Ack::Pending`.
+- **messaging**: the delivery context — `Delivery`, `DeliveryInfo`, `Acker`,
+  `DeliveryControl`, `DeliveryHandler`, `delivery_handler` and
+  `Receiver::add_delivery_listener`. `LocalProvider` implements it;
+  `Delivery::extend` is a no-op there.
+- **messaging**: dead-lettered messages carry `dead-letter-reason`
+  (`max-delivery-attempts` / `rejected` / `expired`), `dead-letter-source`,
+  `dead-letter-attempts` and, when there is one, `dead-letter-description` (a
+  handler's text or the panic message).
+- **messaging**: message priority (`Message::with_priority`); `LocalProvider`
+  delivers higher-priority buffered messages first.
+- **messaging**: de-duplication by `Properties::dedup_key`, falling back to the
+  message id; scheduled delivery at an absolute time with `SendOptions::deliver_at`.
+- **messaging**: `Message::encode_as(content_type, &value)` for any content type
+  the codec registry knows.
+- **vfs**: `Metadata` gains `etag`, `version`, `content_type` and
+  `user_metadata`, with builders `with_etag`, `with_version`, `with_content_type`,
+  `with_user_metadata` and the lookup `user(name)`; `MemoryFs` reports a fresh
+  etag (also as `version`) every time a file's contents are stored.
+- **vfs**: typed backend errors `VfsError::AlreadyExists`, `PreconditionFailed`,
+  `Unavailable`, `Timeout` and `Unauthenticated`, plus `VfsError::is_retryable()`;
+  with `errutils` the root `Error` classifies them as `Conflict` / `Conflict` /
+  `Unavailable` / `Timeout` / `Unauthenticated`.
+- **vfs**: `WriteSink::abort` (provided; the default drops the sink) and
+  `VfsWriter::abort`, which discard a pending streaming write and wait for the
+  backend's cleanup; `LocalFs` removes its temporary file.
+- **vfs**: `WriteOptions` (content type, user metadata, precondition) and
+  `Precondition::{IfAbsent, IfMatch}`, with provided methods `Vfs::write_with` and
+  `Vfs::create_with`; the default refuses any precondition with `Unsupported`.
+  `MemoryFs` supports every precondition atomically and stores the content type
+  and user metadata; `LocalFs` returns `Unsupported` for any precondition.
+- **vfs**: `Vfs::try_exists`, which tells "absent" (`Ok(false)`) from "could not
+  check" (`Err`).
+- **vfs**: `Vfs::signed_url` with `SignedUrlMethod::{Get, Put}` (default
+  `Unsupported`), and `Vfs::as_any` for downcasting an `Arc<dyn Vfs>`; `LocalFs`
+  and `MemoryFs` return `Some(self)`.
+- **vfs**: `VfsRegistry::resolve_path` (now public) and the forwarders
+  `read_range`, `append`, `create`, `write_with`, `create_with`, `list_page`,
+  `walk`, `try_exists` and `signed_url`.
+- **vfs**: `strip_scheme` is now public, for external backends.
+
+### Changed
+
+- **messaging (breaking)**: `Message::headers` and `with_header` / `set_header` /
+  `header` / `header_str` are replaced by `Message::attributes` and
+  `with_attribute` / `set_attribute` / `attribute` / `attribute_str`; system
+  metadata lives in `Message::properties`. `Message` is `#[non_exhaustive]`.
+- **messaging (breaking)**: `MessagingError::Backend` has a `transient` field
+  (match it with `{ source, .. }`).
+- **messaging (breaking)**: `MessagingError::Batch` is renamed `PartialBatch`;
+  `BatchFailure` reports `sent`, per-entry `failures` and the never-tried
+  `unsent`, and is `#[non_exhaustive]`.
+- **messaging (breaking)**: `Ack` is `#[non_exhaustive]` with three new variants —
+  a `match` on it needs a wildcard arm.
+- **messaging**: a provider must refuse `delay` / `deliver_at` / `ttl` it cannot
+  honour (`InvalidOptions`) instead of ignoring them.
+- **messaging**: `Receiver::add_listener` and `Provider::setup` have default
+  bodies (`Unsupported` and `Ok(())`), so a publish-only provider writes
+  `impl Receiver for P {}`.
+- **messaging**: `Message::json` sets the content type to `application/json`, and
+  `Message::decode` uses the message's content type when the codec knows it, else
+  JSON.
+- **messaging**: with the `errutils` feature, `ferroly::Error` classifies every
+  `MessagingError` variant, not only `BufferFull`.
+- **vfs**: `ListPage::next` is documented as an opaque cursor; `copy_between`
+  aborts the destination when the copy fails.
+- **build**: `Cargo.lock` moves to syn 3.0.10 (build-time only, for
+  `ferroly-derive`) and rustls-pki-types 1.16.0. Both still support Rust 1.75.
+- **ci**: CodeQL actions 4.39.3, and `actions/upload-artifact` v7.0.2 in the
+  fuzz workflow.
+- **ci**: Dependabot no longer proposes tokio 1.54 or later, which requires
+  Rust 1.85; tokio stays on 1.53.x while the MSRV is 1.75.
+
+### Fixed
+
+- **messaging**: a provider can now hand a refused message back, and a native
+  batch can report each failed entry instead of only the first.
+- **vfs**: `LocalFs`'s streaming writer waits for an in-flight write before
+  removing its temporary file on abort (Windows cannot remove an open file).
+- **docs**: the complete example in the messaging guide did not compile (the
+  `Order` type lacked `Encode`).
 
 ## [0.4.0]
 

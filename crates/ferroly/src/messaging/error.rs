@@ -49,29 +49,92 @@ impl fmt::Display for Rejected {
     }
 }
 
-/// The detail of a [`MessagingError::Batch`]: how far a batch got, why it
-/// stopped, and the messages that were not sent.
+/// One message of a batch that was not accepted.
 #[derive(Debug)]
+#[non_exhaustive]
+pub struct BatchEntryFailure {
+    /// The position of the message in the batch that was passed in (0-based).
+    pub index: usize,
+    /// Why it failed.
+    pub error: MessagingError,
+    /// The message, handed back when the failing operation still had it.
+    pub message: Option<Message>,
+}
+
+impl BatchEntryFailure {
+    /// A failure for the message at `index`. If `error` carries the rejected
+    /// message, it is moved into [`message`](Self::message).
+    pub fn new(index: usize, mut error: MessagingError) -> Self {
+        let message = error.take_message();
+        Self {
+            index,
+            error,
+            message,
+        }
+    }
+
+    /// A failure for the message at `index`, with the message supplied.
+    pub fn with_message(index: usize, error: MessagingError, message: Message) -> Self {
+        Self {
+            index,
+            error,
+            message: Some(message),
+        }
+    }
+}
+
+/// The detail of a [`MessagingError::PartialBatch`].
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct BatchFailure {
-    /// How many messages were accepted before the failure.
+    /// How many messages were accepted.
     pub sent: usize,
-    /// The error that stopped the batch. Its own rejected message (if any) has
-    /// been moved to the front of [`unsent`](Self::unsent).
-    pub error: Box<MessagingError>,
-    /// The messages that were not sent, in their original order, starting with
-    /// the one that failed.
+    /// The messages that were tried and failed, in ascending `index` order.
+    pub failures: Vec<BatchEntryFailure>,
+    /// The messages that were never tried (a sequential send stops at the
+    /// first failure), in their original order.
     pub unsent: Vec<Message>,
+}
+
+impl BatchFailure {
+    /// A batch result. `failures` are sorted by index.
+    pub fn new(sent: usize, mut failures: Vec<BatchEntryFailure>, unsent: Vec<Message>) -> Self {
+        failures.sort_by_key(|f| f.index);
+        Self {
+            sent,
+            failures,
+            unsent,
+        }
+    }
+
+    /// The error of the first failed entry.
+    pub fn first_error(&self) -> Option<&MessagingError> {
+        self.failures.first().map(|f| &f.error)
+    }
+
+    /// Every message that was not accepted: the failed ones that were handed
+    /// back (in index order) followed by the ones never tried.
+    pub fn into_messages(self) -> Vec<Message> {
+        self.failures
+            .into_iter()
+            .filter_map(|f| f.message)
+            .chain(self.unsent)
+            .collect()
+    }
+
+    /// How many messages were not accepted (`failures.len() + unsent.len()`).
+    pub fn failed(&self) -> usize {
+        self.failures.len() + self.unsent.len()
+    }
 }
 
 impl fmt::Display for BatchFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} sent, {} unsent: {}",
-            self.sent,
-            self.unsent.len(),
-            self.error
-        )
+        write!(f, "{} sent, {} failed", self.sent, self.failed())?;
+        if let Some(error) = self.first_error() {
+            write!(f, ": {error}")?;
+        }
+        Ok(())
     }
 }
 
@@ -79,8 +142,10 @@ impl fmt::Display for BatchFailure {
 ///
 /// The send-side variants ([`NoListeners`](Self::NoListeners),
 /// [`BufferFull`](Self::BufferFull), [`Closed`](Self::Closed),
-/// [`SendTimeout`](Self::SendTimeout)) hand the rejected message back: recover
-/// it with [`into_message`](Self::into_message).
+/// [`SendTimeout`](Self::SendTimeout)) and a backend's
+/// [`Refused`](Self::Refused) hand the rejected message back: recover it with
+/// [`into_message`](Self::into_message). Whether trying again may help is
+/// [`is_retryable`](Self::is_retryable).
 #[derive(Debug, FerrolyError)]
 #[non_exhaustive]
 pub enum MessagingError {
@@ -105,7 +170,8 @@ pub enum MessagingError {
     /// is not valid for the operation.
     #[error("invalid address: {0}")]
     InvalidAddress(String),
-    /// The supplied options are not valid (for example `buffer_size: 0`).
+    /// The supplied options are not valid (for example `buffer_size: 0`), or
+    /// ask for something the provider cannot honour.
     #[error("invalid options: {0}")]
     InvalidOptions(String),
     /// The provider does not implement the operation.
@@ -115,28 +181,100 @@ pub enum MessagingError {
     /// is the number of such messages.
     #[error("{0} message(s) could not be delivered before shutdown")]
     Undelivered(usize),
-    /// A batch stopped part-way; see [`BatchFailure`].
-    #[error("batch send failed: {0}")]
-    Batch(BatchFailure),
+    /// Some messages of a batch were not accepted; see [`BatchFailure`].
+    #[error("batch partly failed: {0}")]
+    PartialBatch(BatchFailure),
     /// A failure reported by an external backend (connection, protocol,
-    /// authorization, …). Build one with [`MessagingError::backend`].
+    /// authorization, …). Build one with [`MessagingError::backend`] or
+    /// [`MessagingError::backend_transient`].
     #[error("backend error: {source}")]
     Backend {
         /// The backend's own error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
+        /// Whether trying again later may succeed (throttling, an outage, a
+        /// timeout) as opposed to a failure that will repeat.
+        transient: bool,
+    },
+    /// A backend refused one message — it was throttled, too large, or not
+    /// acceptable — and hands it back. Build one with
+    /// [`MessagingError::refused`] or [`MessagingError::refused_transient`].
+    #[error("backend refused the message for {rejected}: {source}")]
+    Refused {
+        /// Why the backend refused it.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+        /// The destination and the message, handed back.
+        rejected: Rejected,
+        /// Whether sending the same message again later may succeed.
+        transient: bool,
     },
 }
 
 impl MessagingError {
-    /// Wraps a backend's error. This is the variant an adapter for an external
-    /// broker returns for its transport and protocol failures.
+    /// Wraps a backend's error as a permanent failure. This is the variant an
+    /// adapter for an external broker returns for its transport and protocol
+    /// failures.
     pub fn backend<E>(source: E) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         Self::Backend {
             source: source.into(),
+            transient: false,
+        }
+    }
+
+    /// Wraps a backend's error as a transient failure (throttling, an outage,
+    /// a timeout): trying again later may succeed.
+    pub fn backend_transient<E>(source: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Self::Backend {
+            source: source.into(),
+            transient: true,
+        }
+    }
+
+    /// A backend refused `message` for `destination` and will refuse it again
+    /// (too large, not acceptable). The message is handed back.
+    pub fn refused<E>(source: E, destination: impl Into<String>, message: Message) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Self::Refused {
+            source: source.into(),
+            rejected: Rejected::new(destination, message),
+            transient: false,
+        }
+    }
+
+    /// A backend refused `message` for `destination` for now (throttled);
+    /// sending it again later may succeed. The message is handed back.
+    pub fn refused_transient<E>(source: E, destination: impl Into<String>, message: Message) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Self::Refused {
+            source: source.into(),
+            rejected: Rejected::new(destination, message),
+            transient: true,
+        }
+    }
+
+    /// Whether the same operation may succeed if it is tried again later.
+    ///
+    /// `true` for [`BufferFull`](Self::BufferFull), [`SendTimeout`](Self::SendTimeout),
+    /// and for [`Backend`](Self::Backend) / [`Refused`](Self::Refused) marked
+    /// transient. `true` for [`PartialBatch`](Self::PartialBatch) when at least
+    /// one of its failures is retryable. `false` for everything else.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::BufferFull(_) | Self::SendTimeout(_) => true,
+            Self::Backend { transient, .. } | Self::Refused { transient, .. } => *transient,
+            Self::PartialBatch(batch) => batch.failures.iter().any(|f| f.error.is_retryable()),
+            _ => false,
         }
     }
 
@@ -145,6 +283,7 @@ impl MessagingError {
             Self::NoListeners(r) | Self::BufferFull(r) | Self::Closed(r) | Self::SendTimeout(r) => {
                 Some(r)
             }
+            Self::Refused { rejected, .. } => Some(rejected),
             _ => None,
         }
     }
@@ -160,11 +299,12 @@ impl MessagingError {
     }
 
     /// Detaches the rejected message (if any), leaving the error in place.
-    pub(crate) fn take_message(&mut self) -> Option<Message> {
+    pub fn take_message(&mut self) -> Option<Message> {
         match self {
             Self::NoListeners(r) | Self::BufferFull(r) | Self::Closed(r) | Self::SendTimeout(r) => {
                 r.message.take().map(|m| *m)
             }
+            Self::Refused { rejected, .. } => rejected.message.take().map(|m| *m),
             _ => None,
         }
     }

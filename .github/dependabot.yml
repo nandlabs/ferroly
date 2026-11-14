@@ -17,6 +17,9 @@ updates:
       - dependency-name: "zeroize"
       - dependency-name: "cc"
       - dependency-name: "find-msvc-tools"
+      # tokio 1.54 requires Rust 1.85. Patch releases of 1.53 still arrive.
+      - dependency-name: "tokio"
+        versions: [">=1.54"]
 
   - package-ecosystem: github-actions
     directory: /

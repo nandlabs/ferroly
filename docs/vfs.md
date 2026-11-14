@@ -11,7 +11,8 @@ and helpers that work across backends.
 
 Key pieces:
 
-- [`Vfs`](#vfs) — the trait: `read` / `read_range` / `write` / `append` / `create` / `open` / `delete` / `exists` / `metadata` / `list` / `list_page` / `mkdir_all` / `copy` / `rename` / `walk`, all async, all taking `&str` paths.
+- [`Vfs`](#vfs) — the trait: `read` / `read_range` / `write` / `write_with` / `append` / `create` / `create_with` / `open` / `delete` / `exists` / `try_exists` / `metadata` / `list` / `list_page` / `mkdir_all` / `copy` / `rename` / `walk` / `signed_url`, all async, all taking `&str` paths.
+- [`WriteOptions`](#writeoptions) / [`Precondition`](#writeoptions) — content type, user metadata and conditional writes (`IfAbsent`, `IfMatch(etag)`).
 - [`LocalFs`](#localfs) — the local disk. **`LocalFs::rooted(dir)` confines every path to one directory; `LocalFs::new()` is unconfined.**
 - [`MemoryFs`](#memoryfs) — an in-memory tree with the same behavior; a test double.
 - [`VfsRegistry`](#vfsregistry) — routes a URL to a backend by its scheme.
@@ -53,7 +54,7 @@ ferroly = { version = "*", features = ["vfs"] }
 
 ## Quick start
 
-```rust
+```rust,no_run
 use ferroly::vfs::{LocalFs, Vfs};
 
 #[tokio::main]
@@ -80,17 +81,21 @@ async fn main() -> Result<(), ferroly::vfs::VfsError> {
 | [`VfsRegistry`](#vfsregistry) | struct | Scheme → backend dispatcher |
 | [`Vfile`](#vfile) | struct | An open file: `AsyncRead` + read-all helpers |
 | [`VfsWriter`](#vfswriter) | struct | A streaming writer, atomic on `finish` |
-| [`WriteSink`](#vfswriter) | trait | The backend half of a `VfsWriter` |
-| [`Metadata`](#metadata) | struct | Kind, size, times, permissions |
+| [`WriteSink`](#vfswriter) | trait | The backend half of a `VfsWriter` (`write_all` / `finish` / `abort`) |
+| [`WriteOptions`](#writeoptions) | struct | Content type, user metadata and a precondition for `write_with` / `create_with` |
+| [`Precondition`](#writeoptions) | enum | `IfAbsent` / `IfMatch(etag)` |
+| [`SignedUrlMethod`](#vfs) | enum | `Get` / `Put` — what a `signed_url` allows |
+| [`Metadata`](#metadata) | struct | Kind, size, times, permissions, etag / version, content type, user metadata |
 | [`Entry`](#entry) | struct | `path`, `name`, `is_dir`, `len` |
 | [`ListPage`](#listpage) | struct | One page of a listing |
 | [`WalkAction`](#walkaction) | enum | `Continue` / `SkipDir` / `Stop` |
 | [`WalkFn`](#walkfn) | type alias | `Box<dyn FnMut(&Entry) -> WalkAction + Send>` |
-| [`VfsError`](#error-handling) | enum | `NotFound` / `Permission` / `NotDir` / `IsDir` / `Unsupported` / `InvalidPath` / `Io` |
+| [`VfsError`](#error-handling) | enum | `NotFound` / `Permission` / `NotDir` / `IsDir` / `Unsupported` / `InvalidPath` / `AlreadyExists` / `PreconditionFailed` / `Unavailable` / `Timeout` / `Unauthenticated` / `Io` |
 | [`copy_between`](#cross-backend-copy) | fn | Streamed copy from one backend to another |
 | [`glob`](#glob), [`glob_match`](#glob) | fn | `*` / `**` / `?` matching over a tree |
 | [`checksum_sha256`](#checksum) | fn | Streamed SHA-256 of a file (feature `hash`) |
 | `scheme_of` | fn | The URL scheme of an address, if any |
+| [`strip_scheme`](#writing-a-backend) | fn | Removes a backend's own scheme; rejects any other with `InvalidPath` |
 | [`BoxFuture`](#boxfuture) | type alias | `Pin<Box<dyn Future<Output = T> + Send + 'a>>` |
 
 ### BoxFuture
@@ -124,8 +129,30 @@ pub trait Vfs: Send + Sync {
     fn append(&self, path: &str, data: Vec<u8>) -> BoxFuture<'_, Result<(), VfsError>>;
     fn create(&self, path: &str) -> BoxFuture<'_, Result<VfsWriter<'_>, VfsError>>;
     fn list_page(&self, path: &str, after: Option<String>, limit: usize) -> BoxFuture<'_, Result<ListPage, VfsError>>;
+    fn write_with(&self, path: &str, data: Vec<u8>, opts: WriteOptions) -> BoxFuture<'_, Result<(), VfsError>>;
+    fn create_with(&self, path: &str, opts: WriteOptions) -> BoxFuture<'_, Result<VfsWriter<'_>, VfsError>>;
+    fn try_exists(&self, path: &str) -> BoxFuture<'_, Result<bool, VfsError>>;
+    fn signed_url(&self, path: &str, method: SignedUrlMethod, expires_in: Duration) -> BoxFuture<'_, Result<String, VfsError>>;
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)>;
 }
+
+#[non_exhaustive]
+pub enum SignedUrlMethod { Get, Put }
 ```
+
+Every provided method has a default, so a backend written against an earlier
+version keeps compiling. The provided methods, and who overrides them:
+
+| Provided method | Default | `LocalFs` | `MemoryFs` |
+| --- | --- | --- | --- |
+| `append` | read + write the whole file | native append | in place under the lock |
+| `create` | buffer in memory, `write_with` on finish | streams to a temporary file | default |
+| `list_page` | `list`, sort by name, slice | stats only the page | default |
+| `write_with` | plain options → `write`; any precondition → `Unsupported`; content type / user metadata dropped | default (preconditions `Unsupported`) | full: preconditions checked atomically, content type and user metadata stored |
+| `create_with` | buffer in memory, `write_with` on finish | precondition → `Unsupported` at once; otherwise streams like `create` | default (reaches its `write_with`) |
+| `try_exists` | `metadata`: `Ok` → `true`, `NotFound` → `false`, any other error → `Err` | default | default |
+| `signed_url` | `Unsupported` | default | default |
+| `as_any` | `None` | `Some(self)` | `Some(self)` |
 
 | Method | Behaviour |
 | --- | --- |
@@ -138,9 +165,14 @@ pub trait Vfs: Send + Sync {
 | `open(path)` | Open a file as a streaming [`Vfile`](#vfile) reader. |
 | `delete(path)` | Delete a file, or a directory and all its contents. A symbolic link is removed as a link. |
 | `exists(path)` | `bool` — whether the path exists. Never errors: a path that cannot be examined, or is not acceptable to the backend, reports `false`. |
+| `try_exists(path)` | Whether the path exists, **reporting failures**: `Ok(false)` only when the backend says the path is absent; a permission error, an invalid path or an unreachable backend is an `Err`. |
 | `metadata(path)` | [`Metadata`](#metadata) for the path (following a symbolic link, and saying so). |
 | `list(path)` | One directory level as a `Vec<`[`Entry`](#entry)`>`. |
-| `list_page(path, after, limit)` | One directory level, a [page](#listpage) at a time, ordered by name. |
+| `list_page(path, after, limit)` | One directory level, a [page](#listpage) at a time, in a backend-defined but stable order (by name for the bundled backends). |
+| `write_with(path, data, opts)` | `write` with [`WriteOptions`](#writeoptions): a content type, user metadata, and an optional precondition. A precondition the backend cannot honour is `Unsupported`, never ignored. |
+| `create_with(path, opts)` | `create` with [`WriteOptions`](#writeoptions), applied when the writer is finished. |
+| `signed_url(path, method, expires_in)` | A URL granting `SignedUrlMethod::Get` (download) or `Put` (upload) access for `expires_in`, without further credentials. `Unsupported` unless the backend (an object store) overrides it. |
+| `as_any()` | The backend as `&dyn Any`, for downcasting an `Arc<dyn Vfs>` back to its concrete type; `None` unless the backend opts in. |
 | `mkdir_all(path)` | Create a directory and all missing parents. |
 | `copy(src, dst)` | Copy a file within this backend. |
 | `rename(src, dst)` | Rename / move a path. |
@@ -158,6 +190,10 @@ pub struct Metadata {
     pub created: Option<SystemTime>,    // where the platform records it
     pub readonly: bool,
     pub mode: Option<u32>,              // Unix permission bits (0o7777 mask)
+    pub etag: Option<String>,           // changes whenever the contents change
+    pub version: Option<String>,        // the backend's version / generation id
+    pub content_type: Option<String>,   // media type stored with the file
+    pub user_metadata: Vec<(String, String)>, // caller-defined name/value pairs
 }
 
 impl Metadata {
@@ -169,15 +205,45 @@ impl Metadata {
     pub fn with_readonly(self, readonly: bool) -> Self;
     pub fn with_mode(self, mode: u32) -> Self;
     pub fn with_symlink(self, is_symlink: bool) -> Self;
+    pub fn with_etag(self, etag: impl Into<String>) -> Self;
+    pub fn with_version(self, version: impl Into<String>) -> Self;
+    pub fn with_content_type(self, content_type: impl Into<String>) -> Self;
+    pub fn with_user_metadata(self, name: impl Into<String>, value: impl Into<String>) -> Self; // pushes one pair
+    pub fn user(&self, name: &str) -> Option<&str>;   // first pair with that name
 }
 ```
 
 Returned by [`Vfs::metadata`](#vfs) and available on an open [`Vfile`](#vfile).
 `Clone`, `PartialEq`, `Eq`, `Default`. Fields a backend cannot supply are
-`None` / `false` (`MemoryFs` has no `mode`; `created` is `None` on filesystems
-that do not record it). When `is_symlink` is true the other fields describe
-the link's target. The struct is `#[non_exhaustive]`: read the fields freely,
-but build one with `Metadata::file` / `Metadata::dir` and the `with_*` methods.
+`None` / `false` / empty (`MemoryFs` has no `mode`; `created` is `None` on
+filesystems that do not record it). When `is_symlink` is true the other fields
+describe the link's target. The struct is `#[non_exhaustive]`: read the fields
+freely, but build one with `Metadata::file` / `Metadata::dir` and the `with_*`
+methods.
+
+The object-store fields — who fills what:
+
+| Field | `LocalFs` | `MemoryFs` | An object-store backend |
+| --- | --- | --- | --- |
+| `etag` | `None` | `Some` — a fresh tag each time the contents are stored (`write`, `append`, the destination of `copy`); `rename` keeps it | the store's ETag |
+| `version` | `None` | the same value as `etag` | the object's version / generation id |
+| `content_type` | `None` | what [`write_with`](#writeoptions) stored; cleared by a plain `write`, kept by `append`, copied by `copy` | the stored `Content-Type` |
+| `user_metadata` | empty | what `write_with` stored; same lifetime as `content_type` | the object's user metadata, in the store's order |
+
+An `etag` is opaque: compare it for equality (or hand it to
+[`WriteOptions::if_match`](#writeoptions)), never parse it.
+
+```rust
+use ferroly::vfs::{MemoryFs, Vfs};
+
+# async fn ex() -> Result<(), ferroly::vfs::VfsError> {
+let fs = MemoryFs::new();
+fs.write("/a.txt", b"one".to_vec()).await?;
+let before = fs.metadata("/a.txt").await?.etag;
+fs.write("/a.txt", b"two".to_vec()).await?;
+assert_ne!(fs.metadata("/a.txt").await?.etag, before);
+# Ok(()) }
+```
 
 ```rust
 use ferroly::vfs::{LocalFs, Vfs};
@@ -213,10 +279,17 @@ into), with the link's own size.
 
 ```rust
 pub struct ListPage {
-    pub entries: Vec<Entry>,     // ordered by name
-    pub next: Option<String>,    // pass as `after` for the next page; None at the end
+    pub entries: Vec<Entry>,     // in the backend's listing order
+    pub next: Option<String>,    // opaque cursor: pass back unchanged as `after`; None at the end
 }
 ```
+
+`next` is an **opaque cursor**. Pass it back unchanged as `after` on the next
+call for the same path to the same backend; do not parse it, compare it with
+entry names, or build one yourself. For the bundled backends it happens to be
+the last entry's name, but an object-store backend may return its own
+continuation token. The order of entries is backend-defined but stable between
+calls: the bundled backends order by entry name, an object store by key.
 
 ```rust
 use ferroly::vfs::{MemoryFs, Vfs};
@@ -235,8 +308,9 @@ loop {
 # Ok(()) }
 ```
 
-Paging is by name, not a snapshot: entries created or removed between calls are
-picked up or skipped according to where they sort. A `limit` of 0 is treated
+For the bundled backends paging is by name, not a snapshot: entries created or
+removed between calls are picked up or skipped according to where they sort.
+A `limit` of 0 is treated
 as 1. `LocalFs` reads the directory's names to order them but only stats the
 entries on the requested page. To process a huge directory without building
 any list at all, use [`walk`](#walkaction) and return `SkipDir` for every
@@ -291,18 +365,40 @@ impl<'a> VfsWriter<'a> {
     pub async fn write_all(&mut self, data: &[u8]) -> Result<(), VfsError>;
     pub fn bytes_written(&self) -> u64;
     pub async fn finish(self) -> Result<u64, VfsError>;    // total bytes written
+    pub async fn abort(self) -> Result<(), VfsError>;      // discard, and wait for the cleanup
 }
 
 pub trait WriteSink: Send {
     fn write_all<'s>(&'s mut self, data: &'s [u8]) -> BoxFuture<'s, Result<(), VfsError>>;
     fn finish<'s>(self: Box<Self>) -> BoxFuture<'s, Result<(), VfsError>> where Self: 's;
+    // provided: the default just drops the sink
+    fn abort<'s>(self: Box<Self>) -> BoxFuture<'s, Result<(), VfsError>> where Self: 's;
 }
 ```
 
-Returned by [`Vfs::create`](#vfs). Write the contents in as many pieces as you
-like, then call `finish`: **only then does the file appear (or change) at its
-path, in one step.** Dropping the writer without finishing discards everything
-and leaves any existing file untouched.
+Returned by [`Vfs::create`](#vfs) and [`Vfs::create_with`](#writeoptions).
+Write the contents in as many pieces as you like, then call `finish`: **only
+then does the file appear (or change) at its path, in one step.**
+
+To give up on a write, call **`abort`**: nothing appears at the destination,
+any existing file is left untouched, and the call waits for the backend to
+release what it holds for the pending file (`LocalFs` removes its temporary
+file; an object store would cancel its multipart upload) and reports whether
+that worked. Dropping the writer without finishing still discards everything,
+but `Drop` cannot wait or report errors, so that cleanup is best effort.
+[`copy_between`](#cross-backend-copy) aborts its destination writer on failure.
+
+```rust
+use ferroly::vfs::{MemoryFs, Vfs};
+
+# async fn ex() -> Result<(), ferroly::vfs::VfsError> {
+let fs = MemoryFs::new();
+let mut out = fs.create("/upload.bin").await?;
+out.write_all(b"half of it").await?;
+out.abort().await?;                  // changed our mind
+assert!(!fs.exists("/upload.bin").await);
+# Ok(()) }
+```
 
 ```rust
 use ferroly::vfs::{LocalFs, Vfs};
@@ -321,8 +417,85 @@ let bytes = out.finish().await?;     // published atomically here
 `LocalFs` streams to a temporary sibling file and renames it on finish, so
 memory use is constant. The trait's default (used by `MemoryFs` and by any
 backend that does not override `create`) buffers the whole file in memory and
-hands it to `write` on finish — atomic, but not bounded. `WriteSink` is what a
-backend implements to provide its own streaming writer.
+hands it to `write_with` on finish — atomic, but not bounded. `WriteSink` is
+what a backend implements to provide its own streaming writer; a backend that
+holds anything outside the process for a pending write should override
+`abort` to release it.
+
+## WriteOptions
+
+```rust
+#[non_exhaustive]
+pub enum Precondition {
+    IfAbsent,          // write only if nothing exists at the path
+    IfMatch(String),   // write only if the file's current etag equals this
+}
+
+#[non_exhaustive]
+pub struct WriteOptions {
+    pub content_type: Option<String>,
+    pub user_metadata: Vec<(String, String)>,
+    pub precondition: Option<Precondition>,
+}
+
+impl WriteOptions {
+    pub fn new() -> Self;
+    pub fn content_type(self, content_type: impl Into<String>) -> Self;
+    pub fn user_metadata(self, name: impl Into<String>, value: impl Into<String>) -> Self; // pushes
+    pub fn if_absent(self) -> Self;
+    pub fn if_match(self, etag: impl Into<String>) -> Self;
+    pub fn is_plain(&self) -> bool;   // nothing set
+}
+```
+
+Options for [`Vfs::write_with`](#vfs) and [`Vfs::create_with`](#vfs). Both
+structs are `#[non_exhaustive]`: build options with `WriteOptions::new()` and
+the builder methods.
+
+- **The content type and user metadata are hints.** A backend that can store
+  them does, and reports them back in [`Metadata`](#metadata); one that cannot
+  drops them.
+- **A precondition is never silently ignored.** A backend that cannot check it
+  returns `VfsError::Unsupported`, and nothing is written. When the check
+  fails the write does not happen: `IfAbsent` fails with
+  `VfsError::AlreadyExists`, `IfMatch` (including on a missing path) with
+  `VfsError::PreconditionFailed`.
+- With `create_with`, the options are applied when the writer is
+  **finished**, so a failed precondition is reported by `finish()` (except on
+  `LocalFs`, which refuses any precondition up front).
+
+What each backend supports:
+
+| | `MemoryFs` | `LocalFs` | An external backend |
+| --- | --- | --- | --- |
+| `IfAbsent` / `IfMatch` | full — the check and the store happen under one lock, so of several concurrent `IfAbsent` writers exactly one succeeds | none: returns `Unsupported` | per backend; the trait default returns `Unsupported` |
+| `content_type`, `user_metadata` | stored; cleared by a plain `write` | dropped | per backend; the trait default drops them |
+
+```rust
+use ferroly::vfs::{MemoryFs, Vfs, VfsError, WriteOptions};
+
+# async fn ex() -> Result<(), VfsError> {
+let fs = MemoryFs::new();
+
+// Create-if-absent: the second writer loses.
+fs.write_with("/lock", b"me".to_vec(), WriteOptions::new().if_absent()).await?;
+assert!(matches!(
+    fs.write_with("/lock", b"you".to_vec(), WriteOptions::new().if_absent()).await,
+    Err(VfsError::AlreadyExists(_))
+));
+
+// Optimistic concurrency: replace only what we read.
+let etag = fs.metadata("/lock").await?.etag.unwrap();
+fs.write_with("/lock", b"me again".to_vec(), WriteOptions::new().if_match(etag)).await?;
+
+// Stored hints come back in the metadata.
+fs.write_with("/r.csv", b"a,b\n".to_vec(),
+    WriteOptions::new().content_type("text/csv").user_metadata("owner", "reports")).await?;
+let meta = fs.metadata("/r.csv").await?;
+assert_eq!(meta.content_type.as_deref(), Some("text/csv"));
+assert_eq!(meta.user("owner"), Some("reports"));
+# Ok(()) }
+```
 
 ## WalkAction
 
@@ -442,7 +615,12 @@ Consequences:
 - A symbolic link at the destination is followed, so the link's *target* is
   replaced and the link kept.
 - A temporary file is briefly visible in listings while a write is in flight,
-  and can be left behind if the process is killed mid-write.
+  and can be left behind if the process is killed mid-write. `VfsWriter::abort`
+  removes it and reports a failure to do so; dropping the writer removes it on
+  a best-effort basis.
+- Write preconditions are not supported: `write_with` / `create_with` with
+  `IfAbsent` or `IfMatch` return `Unsupported` (see [WriteOptions](#writeoptions)).
+  The content type and user metadata are dropped.
 - Every write costs an `fsync`. `append` writes in place and is **not** atomic.
 
 ### Other implementation notes
@@ -515,8 +693,9 @@ tests, and a scratch filesystem that leaves nothing behind. `schemes()` returns
 - Paths are `/`-separated and always resolved from the root: `"a/b"`, `"/a/b"`
   and `"mem://a/b"` are the same file. `.` is ignored; `..` and foreign schemes
   are `InvalidPath`. Entries report absolute paths (`/a/b`) in name order.
-- `Metadata` carries `created` / `modified` times; there are no permissions or
-  links.
+- `Metadata` carries `created` / `modified` times and, for files, an `etag`
+  (also reported as `version`) that changes on every store, plus any stored
+  content type and user metadata; there are no permissions or links.
 - Cloning yields another handle to the **same** tree. Nothing is persisted.
 - Operations complete immediately (no I/O) under a mutex; the `walk` callback
   runs on a snapshot, so it may call back into the filesystem.
@@ -549,22 +728,35 @@ impl VfsRegistry {
     pub fn get(&self, scheme: &str) -> Option<&Arc<dyn Vfs>>;
     pub fn schemes(&self) -> Vec<&str>;
     pub fn resolve(&self, url: &str) -> Result<&Arc<dyn Vfs>, VfsError>;
+    pub fn resolve_path<'a, 'u>(&'a self, url: &'u str) -> Result<(&'a Arc<dyn Vfs>, &'u str), VfsError>;
 
     pub async fn read(&self, url: &str) -> Result<Vec<u8>, VfsError>;
+    pub async fn read_range(&self, url: &str, offset: u64, len: u64) -> Result<Vec<u8>, VfsError>;
     pub async fn write(&self, url: &str, data: Vec<u8>) -> Result<(), VfsError>;
+    pub async fn write_with(&self, url: &str, data: Vec<u8>, opts: WriteOptions) -> Result<(), VfsError>;
+    pub async fn append(&self, url: &str, data: Vec<u8>) -> Result<(), VfsError>;
+    pub async fn create(&self, url: &str) -> Result<VfsWriter<'_>, VfsError>;
+    pub async fn create_with(&self, url: &str, opts: WriteOptions) -> Result<VfsWriter<'_>, VfsError>;
     pub async fn open(&self, url: &str) -> Result<Vfile, VfsError>;
     pub async fn exists(&self, url: &str) -> bool;
+    pub async fn try_exists(&self, url: &str) -> Result<bool, VfsError>;
     pub async fn metadata(&self, url: &str) -> Result<Metadata, VfsError>;
     pub async fn list(&self, url: &str) -> Result<Vec<Entry>, VfsError>;
+    pub async fn list_page(&self, url: &str, after: Option<String>, limit: usize) -> Result<ListPage, VfsError>;
+    pub async fn walk(&self, url: &str, f: WalkFn) -> Result<(), VfsError>;
     pub async fn mkdir_all(&self, url: &str) -> Result<(), VfsError>;
     pub async fn delete(&self, url: &str) -> Result<(), VfsError>;
     pub async fn copy(&self, src: &str, dst: &str) -> Result<(), VfsError>;
     pub async fn rename(&self, src: &str, dst: &str) -> Result<(), VfsError>;
+    pub async fn signed_url(&self, url: &str, method: SignedUrlMethod, expires_in: Duration) -> Result<String, VfsError>;
 }
 ```
 
 Routes a URL to the backend registered for its scheme (matched ignoring ASCII
-case).
+case). Every per-path method resolves the URL and forwards to that backend's
+[`Vfs`](#vfs) method of the same name, so a backend's overrides (its own
+streaming `create`, its `write_with` preconditions, its `signed_url`) are
+reached through the registry too.
 
 - `register(backend)` records the backend under every scheme its
   [`schemes()`](#vfs) reports.
@@ -576,10 +768,16 @@ case).
   `set_default`; with no default they are refused (`Unsupported`), not guessed
   at. `with_local(local)` registers `local` for `file://` and makes it the
   default — pass a `LocalFs::rooted(..)` to keep scheme-less paths confined.
-- An unregistered scheme is `VfsError::Unsupported`.
+- An unregistered scheme is `VfsError::Unsupported`. `exists` reports `false`
+  for it; `try_exists` returns that routing error.
+- `resolve(url)` returns the backend; `resolve_path(url)` returns the backend
+  **and** the path it is handed — the URL unchanged for a backend's own
+  scheme, the URL with the alias removed for a `register_scheme` mount.
 - `copy` and `rename` work **across** backends by streaming
   ([`copy_between`](#cross-backend-copy)). A cross-backend `rename` is a copy
   followed by a delete of the source: not atomic, and single files only.
+- A `list_page` cursor belongs to the backend that produced it: pass it back
+  with the same URL.
 
 ```rust
 use std::sync::Arc;
@@ -596,6 +794,36 @@ assert!(registry.read("s3://bucket/key").await.is_err());        // nothing regi
 # Ok(()) }
 ```
 
+### One scheme per backend
+
+The registry routes **by scheme only** — never by host, bucket or path
+prefix. So:
+
+- Give each store its own scheme: an S3 backend claims `s3://`, a GCS backend
+  `gs://`, an Azure backend `az://`, and each is registered once with
+  `register`.
+- To use two instances of the same backend type (two buckets with different
+  credentials, a cache and an archive), mount each under its own scheme with
+  `register_scheme("cache", …)` / `register_scheme("archive", …)`. The alias
+  is stripped before the backend sees the path.
+- A backend for `https://` URLs receives every `https://` URL, so it has to
+  route by host itself if it fronts more than one service.
+- Use `resolve_path(url)` to see which backend, and which path, a URL maps
+  to.
+
+```rust
+use std::sync::Arc;
+use ferroly::vfs::{MemoryFs, VfsRegistry};
+
+let mut registry = VfsRegistry::new();
+registry.register(Arc::new(MemoryFs::new()));                    // mem://
+registry.register_scheme("cache", Arc::new(MemoryFs::new()));    // a second tree
+let (_backend, path) = registry.resolve_path("cache://tmp/x").unwrap();
+assert_eq!(path, "tmp/x");                                       // alias removed
+let (_backend, path) = registry.resolve_path("mem://tmp/x").unwrap();
+assert_eq!(path, "mem://tmp/x");                                 // native: unchanged
+```
+
 ## Cross-backend copy
 
 ```rust
@@ -605,7 +833,10 @@ pub async fn copy_between(src: &dyn Vfs, src_path: &str, dst: &dyn Vfs, dst_path
 Copies one file from one backend to another (or within one), reading with
 `open` and writing with `create` in 64 KiB chunks, so the file is not held in
 memory whole when both backends stream. The destination appears only when the
-copy has completed; on error nothing is left there. Returns the bytes copied.
+copy has completed. If reading or writing fails part-way, the destination
+writer is **aborted** ([`VfsWriter::abort`](#vfswriter)) before the original
+error is returned, so nothing is left there — not even an unfinished upload on
+a backend that overrides `abort`. Returns the bytes copied.
 
 ## Glob
 
@@ -668,13 +899,47 @@ pub enum VfsError {
     IsDir(String),                                          // a directory where a file is needed
     Unsupported(String),                                    // backend doesn't support it
     InvalidPath { path: String, reason: String },           // foreign scheme, or an escape from a root
+    AlreadyExists(String),                                  // the path exists and must not
+    PreconditionFailed(String),                             // a write precondition did not hold
+    Unavailable(String),                                    // throttled / temporarily unavailable
+    Timeout(String),                                        // the backend did not answer in time
+    Unauthenticated(String),                                // credentials not accepted
     Io { path: String, source: std::io::Error },            // other lower-level I/O error
+}
+
+impl VfsError {
+    pub fn from_io(path: &str, e: std::io::Error) -> Self;
+    pub fn is_retryable(&self) -> bool;   // true for Unavailable and Timeout
 }
 ```
 
 `VfsError` implements `std::error::Error` (with `source()` chaining through the
 `Io` variant) and `Display`. `VfsError::from_io(path, err)` is public so other
-backends map errors the same way.
+backends map errors the same way; it maps only `NotFound` and
+`PermissionDenied` to typed variants and wraps everything else in `Io`.
+
+`is_retryable()` says whether the same operation may succeed if tried again
+later: `true` for `Unavailable` and `Timeout`, `false` for everything else.
+
+When a backend should use each of the typed backend variants (the HTTP status
+an object store typically answers with is given as a guide):
+
+| Variant | Use it when | Typical status |
+| --- | --- | --- |
+| `AlreadyExists` | the operation required the path to be absent and it is not — e.g. an [`IfAbsent`](#writeoptions) write | 409 |
+| `PreconditionFailed` | a write precondition did not hold: the etag changed, or the expected version is gone | 412 |
+| `Unavailable` | the backend is throttling or temporarily down; retrying later may succeed | 429, 503 |
+| `Timeout` | the backend did not answer in time | 408, 504, a client-side deadline |
+| `Unauthenticated` | the credentials were missing, expired or rejected | 401 |
+| `Permission` | the credentials were accepted but do not allow the operation | 403 |
+| `NotFound` | the object or bucket does not exist | 404 |
+
+The bundled backends never return `Unavailable`, `Timeout` or
+`Unauthenticated`; `MemoryFs` returns `AlreadyExists` and `PreconditionFailed`
+for failed [write preconditions](#writeoptions). With the `errutils` feature,
+the crate's root `Error` classifies `AlreadyExists` and `PreconditionFailed` as
+`Conflict`, `Unavailable` as `Unavailable`, `Timeout` as `Timeout` and
+`Unauthenticated` as `Unauthenticated`.
 
 How `LocalFs` classifies failures:
 
@@ -713,23 +978,71 @@ The [`Vfile`](#vfile) read-all helpers return raw `std::io::Error`, not `VfsErro
 
 ## Writing a backend
 
-Implement the required [`Vfs`](#vfs) methods; the provided ones (`append`,
-`create`, `list_page`) work on top of them and can be overridden when the
-storage system can do better.
+Implement the required [`Vfs`](#vfs) methods; every provided method has a
+working default built on them, to be overridden when the storage system can do
+better. A checklist, in roughly the order a backend meets each item:
 
-- Return `Vfile::new(reader, meta)` (or `Vfile::from_bytes`) from `open`.
-- Build `Metadata` with `Metadata::file(len)` / `Metadata::dir()` and the
-  `with_*` methods.
-- Map I/O errors with `VfsError::from_io`, and reject URL schemes that are not
-  yours with `VfsError::InvalidPath` (use `scheme_of` to find the scheme).
-- Never size a buffer by `read_range`'s `len`; make `write` replace atomically
-  if the storage system allows.
-- For a streaming `create`, implement `WriteSink` and wrap it in
-  `VfsWriter::new`; nothing may become visible before `finish`.
+1. **Schemes.** Return your schemes from `schemes()` (`["s3"]`) — one scheme
+   per store; see [One scheme per backend](#one-scheme-per-backend).
+2. **Paths.** Start every method with
+   `strip_scheme(path, &["s3"], "S3Fs")?`: it removes your own scheme
+   (ignoring ASCII case), passes a bare path through, and rejects any other
+   scheme with `VfsError::InvalidPath`, so `gs://…` is never mistaken for one
+   of your keys.
+
+   ```rust
+   use ferroly::vfs::{strip_scheme, VfsError};
+
+   assert_eq!(strip_scheme("s3://bucket/key", &["s3"], "S3Fs").unwrap(), "bucket/key");
+   assert!(matches!(strip_scheme("gs://b/k", &["s3"], "S3Fs"), Err(VfsError::InvalidPath { .. })));
+   ```
+3. **Reads.** Return `Vfile::new(reader, meta)` (or `Vfile::from_bytes`) from
+   `open`. Never size a buffer by `read_range`'s `len`.
+4. **Metadata.** Build it with `Metadata::file(len)` / `Metadata::dir()` and
+   the `with_*` methods — including `with_etag`, `with_version`,
+   `with_content_type` and `with_user_metadata` when the store has them.
+5. **Writes.** Make `write` replace atomically if the storage system allows.
+6. **Streaming writes.** For a streaming `create`, implement `WriteSink` and
+   wrap it in `VfsWriter::new`; nothing may become visible before `finish`.
+   Override **`abort`** to release what a pending write holds (cancel the
+   multipart upload), and make `Drop` do the same on a best-effort basis.
+7. **Write options.** Override `write_with` if the store supports conditional
+   writes (`If-None-Match: *` for `IfAbsent`, `If-Match` for `IfMatch`) and
+   can store a content type and user metadata. Never ignore a precondition:
+   if you cannot honour one, return `Unsupported` (the default does). Override
+   `create_with` too if your streaming `create` can carry the options.
+8. **Errors.** Map I/O errors with `VfsError::from_io`, and the store's
+   answers onto the typed variants: 404 → `NotFound`, 403 → `Permission`,
+   401 → `Unauthenticated`, 409 → `AlreadyExists`, 412 →
+   `PreconditionFailed`, 429 / 503 → `Unavailable`, a timeout → `Timeout`
+   (see [Error handling](#error-handling)). Callers use `is_retryable()` to
+   decide whether to try again.
+9. **`try_exists`.** The default (via `metadata`) is right as long as
+   `metadata` returns `NotFound` only for a genuinely absent path; override
+   it if the store has a cheaper existence check.
+10. **`signed_url`.** Override it if the store can presign URLs for
+    `SignedUrlMethod::Get` / `Put`.
+11. **`as_any`.** Return `Some(self)` so callers holding an `Arc<dyn Vfs>` can
+    downcast to your type for backend-specific operations.
+12. **`list_page`.** Override it if the store pages natively; the cursor you
+    return in `ListPage::next` is opaque to callers, so a continuation token
+    is fine. Keep the order stable between calls.
 
 The backend then works with [`VfsRegistry`](#vfsregistry),
 [`copy_between`](#cross-backend-copy), [`glob`](#glob) and
 [`checksum_sha256`](#checksum).
+
+## Migrating from 0.4
+
+Every 0.4 `Vfs` implementation keeps compiling: each new trait method has a
+default. What changes for callers:
+
+| 0.4 | 0.5 |
+|---|---|
+| dropping a `VfsWriter` to cancel | still works; `writer.abort().await` waits and reports |
+| `ListPage::next` is a file name | an opaque cursor — pass it back unchanged |
+| `exists()` to test for presence | unchanged; use `try_exists()` to tell "absent" from "could not check" |
+| a backend reports HTTP 412 / 409 / 429 / 401 as `Io` | `PreconditionFailed` / `AlreadyExists` / `Unavailable` / `Unauthenticated` |
 
 ## Limitations
 
@@ -742,8 +1055,17 @@ The backend then works with [`VfsRegistry`](#vfsregistry),
   (queries, fragments) are interpreted.
 - **`append` is not atomic**, and the default `append` / `create` hold the
   whole file in memory; only `LocalFs` overrides them.
-- **`list_page` is by name, not a snapshot**, and `LocalFs` still reads every
-  name in the directory to order them.
+- **`list_page` is by name, not a snapshot** for the bundled backends, and
+  `LocalFs` still reads every name in the directory to order them.
+- **`LocalFs` has no write preconditions**: `IfAbsent` / `IfMatch` return
+  `Unsupported`, and it stores neither a content type nor user metadata (nor
+  an `etag` / `version`). `MemoryFs` supports all of them.
+- **No bundled backend issues signed URLs**; `signed_url` is `Unsupported`
+  unless an external backend overrides it.
+- **The registry routes by scheme only** — not by host or bucket; see
+  [One scheme per backend](#one-scheme-per-backend).
+- **Dropping a `VfsWriter` cleans up on a best-effort basis**; use `abort` to
+  wait for the cleanup and see whether it worked.
 - **No file locking and no change notification.**
 - **`walk` and `glob` do not follow symbolic links**; walk order is unspecified.
 - **No ownership information** in [`Metadata`](#metadata), and `mode` is Unix-only.

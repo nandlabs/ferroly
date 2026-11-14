@@ -24,10 +24,10 @@ need neither async nor TLS compile with no external crates at all.
 ```toml
 [dependencies]
 # pick the modules you use — nothing else is compiled
-ferroly = { version = "0.4", features = ["rest", "auth", "log", "metrics"] }
+ferroly = { version = "0.5", features = ["rest", "auth", "log", "metrics"] }
 
 # or everything
-ferroly = { version = "0.4", features = ["full"] }
+ferroly = { version = "0.5", features = ["full"] }
 ```
 
 Default features are `codec` and `errutils`. Each feature turns on only the
@@ -55,8 +55,8 @@ Default features are `codec` and `errutils`. Each feature turns on only the
 | `genai` | `ferroly::genai` | Provider-agnostic LLM interface: chat, typed streaming, tools, structured output, embeddings, prompt templates, a model router with budgets and fallback, a mock provider | `codec`, `clients`, `http` |
 | `openai` / `claude` / `ollama` | — | Provider implementations (`all-providers` enables all three) | `genai` |
 | `vectorstore` | `ferroly::vectorstore` | `VectorStore` trait, in-memory store with metadata filters, namespaces and snapshots, text chunking | `codec` |
-| `messaging` | `ferroly::messaging` | In-process queues and topics: ack / retry / dead-letter, backoff, TTL, request-reply, graceful drain | `codec`, `lifecycle` |
-| `vfs` | `ferroly::vfs` | Virtual filesystem trait; rooted local backend, in-memory backend, scheme registry, atomic and streaming writes | tokio |
+| `messaging` | `ferroly::messaging` | In-process queues and topics with typed attributes, subscription filters, a delivery context (deferred acks, delivery info), priority, scheduling, TTL, dead-lettering and graceful drain; a provider trait with receipts and capabilities | `codec`, `lifecycle` |
+| `vfs` | `ferroly::vfs` | Virtual filesystem trait; rooted local and in-memory backends, scheme registry, atomic and streaming writes with abort, write preconditions, etags, signed-URL and typed-error hooks for object stores | tokio |
 | `log` | `ferroly::log` | Structured logging: JSON or text, multiple sinks, file rotation, redaction, per-target levels | `codec` |
 | `metrics` | `ferroly::metrics` | Counters, gauges, histograms; Prometheus and OpenMetrics text; cardinality guard | — |
 | `obs` | `ferroly::obs` | Tracing: spans, W3C trace context, sampling, OTLP/HTTP export | `codec` (+ `http` for OTLP) |

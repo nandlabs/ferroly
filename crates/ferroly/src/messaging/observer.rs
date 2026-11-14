@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use ferroly::messaging::{Ack, Message};
+use ferroly::messaging::{Ack, Message, MessagingError, Receipt};
 
 /// Why a message was discarded without reaching a handler (or without being
 /// completed by one).
@@ -19,6 +19,9 @@ pub enum DropReason {
     Duplicate,
     /// It was published to a topic that has no matching subscription.
     NoSubscribers,
+    /// It was published to a topic whose pattern matched at least one
+    /// subscription, but every such subscription's filter excluded it.
+    Filtered,
     /// A topic subscription's buffer was full (or stayed full for the allowed
     /// wait), so that subscription missed the message.
     BufferFull,
@@ -35,6 +38,7 @@ impl DropReason {
             DropReason::Evicted => "evicted",
             DropReason::Duplicate => "duplicate",
             DropReason::NoSubscribers => "no_subscribers",
+            DropReason::Filtered => "filtered",
             DropReason::BufferFull => "buffer_full",
             DropReason::Shutdown => "shutdown",
         }
@@ -52,6 +56,8 @@ impl DropReason {
 ///
 /// | Metric | Hook |
 /// |---|---|
+/// | published | [`on_published`](Self::on_published) |
+/// | send failures | [`on_send_failed`](Self::on_send_failed) |
 /// | enqueued | [`on_send`](Self::on_send) |
 /// | delivered | [`on_receive`](Self::on_receive) |
 /// | acked | [`on_ack`](Self::on_ack) |
@@ -64,6 +70,15 @@ impl DropReason {
 /// | handler duration | [`on_handled`](Self::on_handled) |
 /// | handler panics | [`on_handler_panic`](Self::on_handler_panic) |
 pub trait Observer: Send + Sync {
+    /// A send was accepted by the provider. Fires once per successful
+    /// `send`, whatever the number of subscriptions that received a copy.
+    fn on_published(&self, addr: &str, receipt: &Receipt) {
+        let _ = (addr, receipt);
+    }
+    /// A send failed. `error.message()` is the message, when it was handed back.
+    fn on_send_failed(&self, addr: &str, error: &MessagingError) {
+        let _ = (addr, error);
+    }
     /// A message was accepted into a listener's buffer at `addr`.
     fn on_send(&self, addr: &str, msg: &Message) {
         let _ = (addr, msg);
@@ -135,6 +150,27 @@ impl LogObserver {
 
 #[cfg(feature = "log")]
 impl Observer for LogObserver {
+    fn on_published(&self, addr: &str, receipt: &Receipt) {
+        match &receipt.message_id {
+            Some(id) => self.logger.debug(
+                "message.published",
+                &[("addr", addr.into()), ("message_id", id.as_str().into())],
+            ),
+            None => self
+                .logger
+                .debug("message.published", &[("addr", addr.into())]),
+        }
+    }
+    fn on_send_failed(&self, addr: &str, error: &MessagingError) {
+        self.logger.warn(
+            "message.send_failed",
+            &[
+                ("addr", addr.into()),
+                ("error", error.to_string().into()),
+                ("retryable", error.is_retryable().into()),
+            ],
+        );
+    }
     fn on_send(&self, addr: &str, msg: &Message) {
         self.logger.debug(
             "message.send",

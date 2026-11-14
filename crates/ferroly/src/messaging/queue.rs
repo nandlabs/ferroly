@@ -8,8 +8,9 @@
 //! [`LocalProvider`]: crate::messaging::LocalProvider
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use tokio::sync::{watch, Notify, Semaphore, TryAcquireError};
 use tokio::time::Instant;
@@ -21,9 +22,17 @@ pub(crate) struct Envelope {
     pub(crate) msg: Message,
     /// When the message's time to live runs out, if it has one.
     pub(crate) expires_at: Option<Instant>,
+    /// When the provider accepted the message.
+    pub(crate) enqueued_at: SystemTime,
+    /// The queue's sequence number for the message (from 1).
+    pub(crate) sequence: u64,
 }
 
 impl Envelope {
+    fn priority(&self) -> u8 {
+        self.msg.priority()
+    }
+
     pub(crate) fn is_expired(&self, now: Instant) -> bool {
         self.expires_at.is_some_and(|at| now >= at)
     }
@@ -60,12 +69,29 @@ impl State {
                 let seq = self.seq;
                 self.delayed.push(Delayed { due, seq, env });
             }
-            _ => self.ready.push_back(env),
+            _ => self.push_ready(env),
         }
     }
 
-    /// Moves every delayed message that is due to the back of the ready list,
-    /// in due order.
+    /// Puts `env` in the ready queue: ahead of every message of lower priority,
+    /// behind every message of the same or higher priority (so equal priorities
+    /// stay first-in, first-out).
+    fn push_ready(&mut self, env: Envelope) {
+        let priority = env.priority();
+        if priority == 0 {
+            self.ready.push_back(env);
+            return;
+        }
+        let at = self
+            .ready
+            .iter()
+            .rposition(|queued| queued.priority() >= priority)
+            .map_or(0, |i| i + 1);
+        self.ready.insert(at, env);
+    }
+
+    /// Moves every delayed message that is due to the ready list, in due order
+    /// (placed by priority, see [`push_ready`](Self::push_ready)).
     fn promote_due(&mut self, now: Instant) {
         if self.delayed.iter().all(|d| d.due > now) {
             return;
@@ -75,7 +101,9 @@ impl State {
             .partition(|d| d.due <= now);
         self.delayed = later;
         due.sort_by_key(|d| (d.due, d.seq));
-        self.ready.extend(due.into_iter().map(|d| d.env));
+        for delayed in due {
+            self.push_ready(delayed.env);
+        }
     }
 
     /// Removes the oldest buffered message: the head of the ready list, or
@@ -94,11 +122,12 @@ impl State {
     }
 }
 
-/// Why a push did not store the message; the envelope is handed back.
+/// Why a push did not store the message; the envelope is handed back, boxed
+/// so the error stays small on the success path.
 pub(crate) enum PushError {
-    Full(Envelope),
-    Closed(Envelope),
-    TimedOut(Envelope),
+    Full(Box<Envelope>),
+    Closed(Box<Envelope>),
+    TimedOut(Box<Envelope>),
 }
 
 /// A bounded, single-consumer queue of [`Envelope`]s.
@@ -116,6 +145,8 @@ pub(crate) struct Queue {
     abort: watch::Sender<bool>,
     /// Buffered messages across the listener group this queue belongs to.
     depth: Arc<AtomicUsize>,
+    /// Messages accepted so far, for sequence numbers.
+    accepted: AtomicU64,
 }
 
 impl Queue {
@@ -127,7 +158,13 @@ impl Queue {
             readable: Notify::new(),
             abort: watch::channel(false).0,
             depth,
+            accepted: AtomicU64::new(0),
         })
+    }
+
+    /// The next sequence number for a message accepted by this queue (from 1).
+    pub(crate) fn next_sequence(&self) -> u64 {
+        self.accepted.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Buffered messages across this queue's listener group.
@@ -147,18 +184,18 @@ impl Queue {
         match policy {
             OnFull::Reject => match self.slots.try_acquire() {
                 Ok(permit) => permit.forget(),
-                Err(TryAcquireError::NoPermits) => return Err(PushError::Full(env)),
-                Err(TryAcquireError::Closed) => return Err(PushError::Closed(env)),
+                Err(TryAcquireError::NoPermits) => return Err(PushError::Full(Box::new(env))),
+                Err(TryAcquireError::Closed) => return Err(PushError::Closed(Box::new(env))),
             },
             OnFull::Block => match self.slots.acquire().await {
                 Ok(permit) => permit.forget(),
-                Err(_) => return Err(PushError::Closed(env)),
+                Err(_) => return Err(PushError::Closed(Box::new(env))),
             },
             OnFull::BlockFor(limit) => {
                 match tokio::time::timeout(limit, self.slots.acquire()).await {
                     Ok(Ok(permit)) => permit.forget(),
-                    Ok(Err(_)) => return Err(PushError::Closed(env)),
-                    Err(_) => return Err(PushError::TimedOut(env)),
+                    Ok(Err(_)) => return Err(PushError::Closed(Box::new(env))),
+                    Err(_) => return Err(PushError::TimedOut(Box::new(env))),
                 }
             }
             OnFull::DropOldest => loop {
@@ -167,14 +204,14 @@ impl Queue {
                         permit.forget();
                         break;
                     }
-                    Err(TryAcquireError::Closed) => return Err(PushError::Closed(env)),
+                    Err(TryAcquireError::Closed) => return Err(PushError::Closed(Box::new(env))),
                     Err(TryAcquireError::NoPermits) => {}
                 }
                 // Full: take the oldest message's slot instead of a new one.
                 {
                     let mut state = self.state.lock().unwrap();
                     if state.closed {
-                        return Err(PushError::Closed(env));
+                        return Err(PushError::Closed(Box::new(env)));
                     }
                     if let Some(evicted) = state.evict_oldest() {
                         state.insert(env, due, Instant::now());
@@ -191,7 +228,7 @@ impl Queue {
 
         let mut state = self.state.lock().unwrap();
         if state.closed {
-            return Err(PushError::Closed(env));
+            return Err(PushError::Closed(Box::new(env)));
         }
         state.insert(env, due, Instant::now());
         drop(state);
@@ -317,6 +354,8 @@ mod tests {
         Envelope {
             msg: Message::text(body),
             expires_at: None,
+            enqueued_at: SystemTime::now(),
+            sequence: 0,
         }
     }
 
@@ -427,6 +466,75 @@ mod tests {
             .collect();
         assert_eq!(left, ["a", "b"]);
         assert_eq!(q.depth(), 0);
+    }
+
+    fn env_with_priority(body: &str, priority: u8) -> Envelope {
+        let mut e = env(body);
+        e.msg = e.msg.with_priority(priority);
+        e
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn higher_priority_is_popped_first() {
+        let q = queue(8);
+        for (body, priority) in [
+            ("low", 0),
+            ("mid", 5),
+            ("high", 9),
+            ("mid2", 5),
+            ("low2", 0),
+        ] {
+            assert!(q
+                .push(env_with_priority(body, priority), None, OnFull::Reject)
+                .await
+                .is_ok());
+        }
+        let mut order = Vec::new();
+        for _ in 0..5 {
+            order.push(body(&q).await);
+        }
+        assert_eq!(order, ["high", "mid", "mid2", "low", "low2"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn equal_priority_stays_fifo() {
+        let q = queue(8);
+        for body in ["a", "b", "c"] {
+            assert!(q
+                .push(env_with_priority(body, 3), None, OnFull::Reject)
+                .await
+                .is_ok());
+        }
+        assert!(q.push(env("zero"), None, OnFull::Reject).await.is_ok());
+        assert!(q
+            .push(env_with_priority("d", 3), None, OnFull::Reject)
+            .await
+            .is_ok());
+        let mut order = Vec::new();
+        for _ in 0..5 {
+            order.push(body(&q).await);
+        }
+        assert_eq!(order, ["a", "b", "c", "d", "zero"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delayed_high_priority_message_jumps_the_queue_when_due() {
+        let q = queue(8);
+        let now = Instant::now();
+        assert!(q
+            .push(
+                env_with_priority("urgent", 9),
+                Some(now + Duration::from_secs(5)),
+                OnFull::Reject
+            )
+            .await
+            .is_ok());
+        assert!(q.push(env("a"), None, OnFull::Reject).await.is_ok());
+        assert!(q.push(env("b"), None, OnFull::Reject).await.is_ok());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(body(&q).await, "urgent");
+        assert_eq!(body(&q).await, "a");
+        assert_eq!(body(&q).await, "b");
     }
 
     #[tokio::test(start_paused = true)]

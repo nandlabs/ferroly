@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferroly::messaging::{
-    handler, headers, Ack, Backoff, BoxFuture, DropReason, ExpiryAction, Handler, ListenerOptions,
+    handler, Ack, Backoff, BoxFuture, DropReason, ExpiryAction, Handler, ListenerOptions,
     LocalOptions, LocalProvider, Message, MessagingError, Observer, OnFull, Producer, Provider,
     ProviderRegistry, Receiver, SendOptions,
 };
@@ -778,17 +778,17 @@ async fn send_batch_sends_in_order_and_reports_a_partial_failure() {
         )
         .await
         .unwrap_err();
-    let MessagingError::Batch(failure) = err else {
-        panic!("expected a Batch error, got {err}");
+    let MessagingError::PartialBatch(failure) = err else {
+        panic!("expected a PartialBatch error, got {err}");
     };
     assert_eq!(failure.sent, 2);
     assert!(
-        matches!(*failure.error, MessagingError::BufferFull(_)),
+        matches!(failure.failures[0].error, MessagingError::BufferFull(_)),
         "{}",
-        failure.error
+        failure.failures[0].error
     );
     let unsent: Vec<String> = failure
-        .unsent
+        .into_messages()
         .iter()
         .map(|m| m.body_str().into_owned())
         .collect();
@@ -1220,15 +1220,20 @@ async fn an_external_provider_plugs_in_through_the_traits() {
         .send_batch("fake://orders", batch, SendOptions::default())
         .await
         .unwrap_err();
-    let MessagingError::Batch(failure) = err else {
-        panic!("expected a Batch error, got {err}");
+    let MessagingError::PartialBatch(failure) = err else {
+        panic!("expected a PartialBatch error, got {err}");
     };
     assert_eq!(failure.sent, 1);
-    assert!(matches!(*failure.error, MessagingError::Backend { .. }));
-    assert!(std::error::Error::source(&*failure.error).is_some());
+    assert!(matches!(
+        failure.failures[0].error,
+        MessagingError::Backend { .. }
+    ));
+    assert!(std::error::Error::source(&failure.failures[0].error).is_some());
     // (the backend error did not hand the failed message back, so only the
     // untried remainder is listed)
+    assert!(failure.failures[0].message.is_none());
     assert_eq!(failure.unsent.len(), 1);
+    assert_eq!(failure.into_messages().len(), 1);
     // ...listener removal reports "unsupported", and close is a no-op.
     let err = provider
         .remove_listeners("fake://orders")
@@ -1273,7 +1278,7 @@ async fn headers_carry_the_metadata_conventions_end_to_end() {
         .stamped()
         .with_correlation_id("saga-7")
         .with_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
-        .with_header("tenant", "acme");
+        .with_attribute("tenant", "acme");
     let (id, at) = (sent.id().unwrap().to_string(), sent.timestamp().unwrap());
     bus.send("chan://q", sent, SendOptions::default())
         .await
@@ -1285,10 +1290,10 @@ async fn headers_carry_the_metadata_conventions_end_to_end() {
     assert_eq!(got.timestamp(), Some(at));
     assert_eq!(got.correlation_id(), Some("saga-7"));
     assert_eq!(
-        got.header_str(headers::TRACEPARENT),
+        got.traceparent(),
         Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
     );
-    assert_eq!(got.header_str("tenant"), Some("acme"));
+    assert_eq!(got.attribute_str("tenant"), Some("acme"));
     // A message produced while handling `got` continues the same trace.
     let follow_up = Message::text("next").with_trace_from(&got);
     assert_eq!(follow_up.traceparent(), got.traceparent());

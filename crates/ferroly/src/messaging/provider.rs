@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ferroly::messaging::{
-    BatchFailure, BoxFuture, Handler, ListenerOptions, Message, MessagingError, SendOptions,
+    BatchEntryFailure, BatchFailure, BoxFuture, Capabilities, DeliveryHandler, Handler,
+    ListenerOptions, Message, MessagingError, Observer, Receipt, SendOptions,
 };
 
 /// Sends messages to a destination.
@@ -21,13 +22,38 @@ pub trait Producer: Send + Sync {
         opts: SendOptions,
     ) -> BoxFuture<'_, Result<(), MessagingError>>;
 
+    /// Sends `msg` and returns the provider's [`Receipt`].
+    ///
+    /// The default calls [`send`](Self::send) and returns a receipt holding
+    /// the message's own id. A backend whose broker assigns ids overrides it.
+    fn send_with_receipt(
+        &self,
+        addr: &str,
+        msg: Message,
+        opts: SendOptions,
+    ) -> BoxFuture<'_, Result<Receipt, MessagingError>> {
+        let addr = addr.to_string();
+        Box::pin(async move {
+            let message_id = msg.id().map(str::to_string);
+            self.send(&addr, msg, opts).await?;
+            Ok(Receipt {
+                message_id,
+                ..Receipt::default()
+            })
+        })
+    }
+
     /// Sends `msgs` to `addr` in order, applying `opts` to each.
     ///
-    /// The default implementation calls [`send`](Self::send) once per message
-    /// and stops at the first failure, returning [`MessagingError::Batch`] with
-    /// the number already sent and every unsent message (the failed one
-    /// first). It is **not** atomic. A backend with a native batch call should
-    /// override it.
+    /// The default implementation is **sequential**: it calls
+    /// [`send`](Self::send) once per message and stops at the first failure,
+    /// returning [`MessagingError::PartialBatch`] with the number already
+    /// sent, one [`BatchEntryFailure`] for the message that failed (carrying
+    /// it, when the error handed it back), and the messages never tried in
+    /// [`BatchFailure::unsent`]. It is **not** atomic.
+    ///
+    /// A backend with a native batch call overrides it and reports **every**
+    /// failed entry in [`BatchFailure::failures`], with `unsent` empty.
     fn send_batch(
         &self,
         addr: &str,
@@ -39,14 +65,12 @@ pub trait Producer: Send + Sync {
             let mut pending = msgs.into_iter();
             let mut sent = 0;
             while let Some(msg) = pending.next() {
-                if let Err(mut error) = self.send(&addr, msg, opts.clone()).await {
-                    let mut unsent: Vec<Message> = error.take_message().into_iter().collect();
-                    unsent.extend(pending);
-                    return Err(MessagingError::Batch(BatchFailure {
+                if let Err(error) = self.send(&addr, msg, opts.clone()).await {
+                    return Err(MessagingError::PartialBatch(BatchFailure::new(
                         sent,
-                        error: Box::new(error),
-                        unsent,
-                    }));
+                        vec![BatchEntryFailure::new(sent, error)], // index == number already sent
+                        pending.collect(),
+                    )));
                 }
                 sent += 1;
             }
@@ -58,12 +82,40 @@ pub trait Producer: Send + Sync {
 /// Consumes messages from a destination.
 pub trait Receiver: Send + Sync {
     /// Registers `handler` as a listener on `addr`.
+    ///
+    /// The default returns [`MessagingError::Unsupported`], which is what a
+    /// publish-only provider wants: it implements [`Producer`] and writes
+    /// `impl Receiver for MyProvider {}`.
     fn add_listener(
         &self,
         addr: &str,
         handler: Handler,
         opts: ListenerOptions,
-    ) -> BoxFuture<'_, Result<(), MessagingError>>;
+    ) -> BoxFuture<'_, Result<(), MessagingError>> {
+        let _ = (handler, opts);
+        let addr = addr.to_string();
+        Box::pin(async move { Err(MessagingError::Unsupported(format!("add_listener({addr})"))) })
+    }
+
+    /// Registers a handler that receives the delivery context ([`Delivery`]).
+    ///
+    /// The default returns [`MessagingError::Unsupported`].
+    ///
+    /// [`Delivery`]: crate::messaging::Delivery
+    fn add_delivery_listener(
+        &self,
+        addr: &str,
+        handler: DeliveryHandler,
+        opts: ListenerOptions,
+    ) -> BoxFuture<'_, Result<(), MessagingError>> {
+        let _ = (handler, opts);
+        let addr = addr.to_string();
+        Box::pin(async move {
+            Err(MessagingError::Unsupported(format!(
+                "add_delivery_listener({addr})"
+            )))
+        })
+    }
 
     /// Removes every listener registered on `addr`, returning how many were
     /// removed. Messages already buffered for them are still handled.
@@ -95,11 +147,26 @@ pub trait Receiver: Send + Sync {
 /// - **Addresses.** Claim one or more URL schemes in
 ///   [`schemes`](Self::schemes) (`"kafka"`, `"nats"`, `"sqs"`); use
 ///   [`split_address`] to separate the scheme from the destination name.
-/// - **Sending.** Map [`Message::body`], [`Message::routing_key`] (partition /
-///   group key) and the [`headers`](crate::messaging::headers) conventions onto
-///   the broker's native fields, and honour [`SendOptions`] where the broker
-///   can (`ttl`, `delay`); ignore what it cannot. Report transport failures
-///   with [`MessagingError::backend`].
+/// - **Sending.** Map [`Message::properties`] and [`Message::attributes`] (or
+///   [`Message::to_wire_attributes`] for a broker with one flat attribute
+///   map), [`Message::routing_key`] (partition / group key) and
+///   [`SendOptions`] onto the broker's native fields.
+/// - **Options.** A provider must **refuse** a send whose options it cannot
+///   honour when they change what delivery means — `delay`, `deliver_at`,
+///   `ttl` — by returning [`MessagingError::InvalidOptions`] (use
+///   [`SendOptions::unsupported_by`]). It may ignore hints (`on_full`,
+///   `block_on_full`) and `extensions` that are not its own.
+/// - **Failures.** Return [`MessagingError::refused`] (or
+///   [`refused_transient`](MessagingError::refused_transient)), handing the
+///   message back, when one message is not accepted, and
+///   [`MessagingError::backend`] /
+///   [`backend_transient`](MessagingError::backend_transient) for transport
+///   failures.
+/// - **Publish-only providers.** Implement [`Producer`], write
+///   `impl Receiver for X {}` (the defaults return
+///   [`MessagingError::Unsupported`]), and implement
+///   [`schemes`](Self::schemes). Report what the backend supports in
+///   [`capabilities`](Self::capabilities).
 /// - **Receiving.** Drive the [`Handler`] and translate its
 ///   [`Ack`](crate::messaging::Ack) into the broker's acknowledgement:
 ///   `Ok` → ack/commit, `Retry` → nack/redeliver (bounded by
@@ -108,7 +175,12 @@ pub trait Receiver: Send + Sync {
 ///   [`Message::delivery_count`] from the broker's redelivery counter. Contain
 ///   handler panics and treat them as `Retry`.
 /// - **Lifecycle.** Connect and declare topology in [`setup`](Self::setup);
-///   flush, drain and disconnect in [`close`](Self::close).
+///   flush, drain and disconnect in [`close`](Self::close). Both default to
+///   doing nothing.
+/// - **Observability.** Accept an [`Observer`] in
+///   [`set_observer`](Self::set_observer) and fire at least
+///   [`on_published`](Observer::on_published) and
+///   [`on_send_failed`](Observer::on_send_failed).
 ///
 /// The semantics a backend actually provides — durability, ordering, delivery
 /// guarantee — are the backend's; this trait does not promise more than the
@@ -117,14 +189,29 @@ pub trait Provider: Producer + Receiver {
     /// The URL schemes this provider handles (e.g. `["chan"]`).
     fn schemes(&self) -> &[&str];
 
-    /// Initializes the provider (connect, declare topology, …).
-    fn setup(&self) -> BoxFuture<'_, Result<(), MessagingError>>;
+    /// Initializes the provider (connect, declare topology, …). The default
+    /// does nothing.
+    fn setup(&self) -> BoxFuture<'_, Result<(), MessagingError>> {
+        Box::pin(async { Ok(()) })
+    }
 
     /// Shuts the provider down gracefully: stop accepting sends, let in-flight
     /// and buffered work finish, release connections. The default does
     /// nothing.
     fn close(&self) -> BoxFuture<'_, Result<(), MessagingError>> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// What this provider supports. The default claims nothing.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+
+    /// Installs an [`Observer`], replacing any previous one. The default
+    /// returns [`MessagingError::Unsupported`].
+    fn set_observer(&self, observer: Arc<dyn Observer>) -> Result<(), MessagingError> {
+        let _ = observer;
+        Err(MessagingError::Unsupported("set_observer".to_string()))
     }
 }
 
@@ -265,6 +352,66 @@ impl ProviderRegistry {
         schemes.sort_unstable();
         schemes
     }
+
+    /// The registered providers, each once (a provider registered under several
+    /// schemes is listed a single time), in no particular order.
+    pub fn providers(&self) -> Vec<Arc<dyn Provider>> {
+        let providers = self.providers.lock().unwrap();
+        let mut unique: Vec<Arc<dyn Provider>> = Vec::new();
+        for provider in providers.values() {
+            if !unique.iter().any(|seen| Arc::ptr_eq(seen, provider)) {
+                unique.push(provider.clone());
+            }
+        }
+        unique
+    }
+
+    /// The capabilities of the provider that handles `addr`.
+    pub fn capabilities_for(&self, addr: &str) -> Result<Capabilities, MessagingError> {
+        Ok(self.provider_for(addr)?.capabilities())
+    }
+
+    /// Calls [`Provider::setup`] on every provider. All are attempted; the first
+    /// error (if any) is returned.
+    pub async fn setup_all(&self) -> Result<(), MessagingError> {
+        // Collected first, so the registry's lock is not held across an await.
+        let providers = self.providers();
+        let mut first = None;
+        for provider in providers {
+            if let Err(error) = provider.setup().await {
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Calls [`Provider::close`] on every provider. All are attempted; the first
+    /// error (if any) is returned.
+    pub async fn close_all(&self) -> Result<(), MessagingError> {
+        let providers = self.providers();
+        let mut first = None;
+        for provider in providers {
+            if let Err(error) = provider.close().await {
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Installs `observer` on every provider that accepts one. Providers that
+    /// return `Unsupported` are skipped; the first other error is returned.
+    pub fn set_observer(&self, observer: Arc<dyn Observer>) -> Result<(), MessagingError> {
+        let mut first = None;
+        for provider in self.providers() {
+            match provider.set_observer(observer.clone()) {
+                Ok(()) | Err(MessagingError::Unsupported(_)) => {}
+                Err(error) => {
+                    first.get_or_insert(error);
+                }
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
 }
 
 impl Producer for ProviderRegistry {
@@ -276,6 +423,20 @@ impl Producer for ProviderRegistry {
     ) -> BoxFuture<'_, Result<(), MessagingError>> {
         let addr = addr.to_string();
         Box::pin(async move { self.provider_for(&addr)?.send(&addr, msg, opts).await })
+    }
+
+    fn send_with_receipt(
+        &self,
+        addr: &str,
+        msg: Message,
+        opts: SendOptions,
+    ) -> BoxFuture<'_, Result<Receipt, MessagingError>> {
+        let addr = addr.to_string();
+        Box::pin(async move {
+            self.provider_for(&addr)?
+                .send_with_receipt(&addr, msg, opts)
+                .await
+        })
     }
 
     fn send_batch(
@@ -304,6 +465,20 @@ impl Receiver for ProviderRegistry {
         Box::pin(async move {
             self.provider_for(&addr)?
                 .add_listener(&addr, handler, opts)
+                .await
+        })
+    }
+
+    fn add_delivery_listener(
+        &self,
+        addr: &str,
+        handler: DeliveryHandler,
+        opts: ListenerOptions,
+    ) -> BoxFuture<'_, Result<(), MessagingError>> {
+        let addr = addr.to_string();
+        Box::pin(async move {
+            self.provider_for(&addr)?
+                .add_delivery_listener(&addr, handler, opts)
                 .await
         })
     }

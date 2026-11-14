@@ -5,19 +5,21 @@ use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::{oneshot, watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use ferroly::messaging::delivery::from_handler;
 use ferroly::messaging::provider::{
     split_address, topic_matches, validate_pattern, validate_topic,
 };
 use ferroly::messaging::queue::{Envelope, PushError, Queue};
 use ferroly::messaging::{
-    headers, new_message_id, Ack, BoxFuture, DropReason, ExpiryAction, Handler, ListenerOptions,
-    LocalOptions, Message, MessagingError, Observer, OnFull, Producer, Provider, Receiver,
+    headers, new_message_id, Ack, BoxFuture, Capabilities, Delivery, DeliveryControl,
+    DeliveryHandler, DeliveryInfo, DropReason, ExpiryAction, Filter, Handler, ListenerOptions,
+    LocalOptions, Message, MessagingError, Observer, OnFull, Producer, Provider, Receipt, Receiver,
     Rejected, SendOptions,
 };
 
@@ -132,6 +134,8 @@ struct TopicSub {
     pattern: String,
     /// `Some` for a named (shared) subscription.
     name: Option<String>,
+    /// Only messages matching this filter are delivered; `None` = all.
+    filter: Option<Filter>,
     group: Group,
 }
 
@@ -304,9 +308,10 @@ impl Inner {
             return Err(MessagingError::Closed(Rejected::new(canonical, msg)));
         }
 
-        // De-duplicate caller sends by message id.
+        // De-duplicate caller sends by dedup key, falling back to the
+        // message id.
         let window = self.options.dedup_window;
-        let dedup_id = match (origin, window > 0, msg.id()) {
+        let dedup_id = match (origin, window > 0, msg.dedup_key().or(msg.id())) {
             (Origin::External, true, Some(id)) => Some(id.to_string()),
             _ => None,
         };
@@ -329,19 +334,24 @@ impl Inner {
         }
 
         let key = opts.routing_key.as_deref().or(msg.routing_key.as_deref());
-        let (targets, topic) = match &target {
+        let (targets, topic, pattern_matched) = match &target {
             Target::Queue(name) => {
                 let picked = routing.queues.get_mut(name).and_then(|g| g.pick(key));
-                (picked.into_iter().collect::<Vec<_>>(), None)
+                (picked.into_iter().collect::<Vec<_>>(), None, false)
             }
             Target::Topic(name) => {
-                let picked = routing
+                let mut pattern_matched = false;
+                let picked: Vec<_> = routing
                     .topics
                     .iter_mut()
                     .filter(|sub| topic_matches(&sub.pattern, name))
+                    .filter(|sub| {
+                        pattern_matched = true;
+                        sub.filter.as_ref().map_or(true, |f| f.matches(&msg))
+                    })
                     .filter_map(|sub| sub.group.pick(key))
                     .collect();
-                (picked, Some(name.clone()))
+                (picked, Some(name.clone()), pattern_matched)
             }
             Target::Reply(_) => unreachable!("handled above"),
         };
@@ -352,11 +362,16 @@ impl Inner {
                 seen.remove(id);
             }
             return match target {
-                // Publishing to a topic nobody subscribes to is not an error.
+                // Publishing to a topic nobody subscribes to (or whose every
+                // subscription filters the message out) is not an error.
                 Target::Topic(_) => Ok((
                     Route::Discard {
                         addr: canonical,
-                        reason: DropReason::NoSubscribers,
+                        reason: if pattern_matched {
+                            DropReason::Filtered
+                        } else {
+                            DropReason::NoSubscribers
+                        },
                     },
                     msg,
                 )),
@@ -389,6 +404,11 @@ impl Inner {
         msg: Message,
         opts: SendOptions,
     ) -> Result<(), MessagingError> {
+        if opts.delay.is_some() && opts.deliver_at.is_some() {
+            return Err(MessagingError::InvalidOptions(
+                "set either delay or deliver_at, not both".to_string(),
+            ));
+        }
         let (route, msg) = self.route(addr, msg, &opts, Origin::External)?;
         match route {
             Route::Reply(tx) => tx.send(msg).map_err(|msg| {
@@ -412,7 +432,7 @@ impl Inner {
                 if let (Err(_), Some(id)) = (&result, &dedup_id) {
                     self.forget_dedup(&addr, id);
                 }
-                result.map_err(|(kind, msg)| kind.into_error(Rejected::new(addr, msg)))
+                result.map_err(|(kind, env)| kind.into_error(Rejected::new(addr, env.msg)))
             }
             Route::Queues {
                 targets,
@@ -424,7 +444,7 @@ impl Inner {
                 // through the observer); the others are unaffected.
                 let mut msg = msg;
                 if msg.topic().is_none() {
-                    msg.set_header(headers::TOPIC, topic);
+                    msg.properties.topic = Some(topic);
                 }
                 let last = targets.len() - 1;
                 let mut original = Some(msg);
@@ -441,7 +461,7 @@ impl Inner {
                             Refusal::Full | Refusal::TimedOut => DropReason::BufferFull,
                         };
                         self.core
-                            .notify(|o| o.on_dropped(&queue.addr, &lost, reason));
+                            .notify(|o| o.on_dropped(&queue.addr, &lost.msg, reason));
                     }
                 }
                 Ok(())
@@ -541,20 +561,29 @@ impl Refusal {
 }
 
 /// Puts `msg` into `queue`, honouring the send options. On refusal the message
-/// is handed back. Needs only the [`Core`], so a consumer can dead-letter
+/// is handed back in its envelope. Needs only the [`Core`], so a consumer can dead-letter
 /// without holding the provider alive while it waits for room.
 async fn enqueue(
     core: &Core,
     queue: &Queue,
     msg: Message,
     opts: &SendOptions,
-) -> Result<(), (Refusal, Message)> {
+) -> Result<(), (Refusal, Box<Envelope>)> {
     let now = Instant::now();
     let env = Envelope {
         msg,
         expires_at: opts.ttl.map(|ttl| now + ttl),
+        enqueued_at: SystemTime::now(),
+        sequence: queue.next_sequence(),
     };
-    let due = opts.delay.map(|delay| now + delay);
+    let due = match (opts.delay, opts.deliver_at) {
+        (Some(delay), _) => Some(now + delay),
+        (None, Some(at)) => at
+            .duration_since(SystemTime::now())
+            .ok() // a time in the past means "now"
+            .map(|wait| now + wait),
+        (None, None) => None,
+    };
     // Keep a copy for the observer only when there is one to tell.
     let observed = core
         .observer
@@ -581,9 +610,9 @@ async fn enqueue(
         Err(refused) => {
             core.completed();
             Err(match refused {
-                PushError::Full(env) => (Refusal::Full, env.msg),
-                PushError::Closed(env) => (Refusal::Closed, env.msg),
-                PushError::TimedOut(env) => (Refusal::TimedOut, env.msg),
+                PushError::Full(env) => (Refusal::Full, env),
+                PushError::Closed(env) => (Refusal::Closed, env),
+                PushError::TimedOut(env) => (Refusal::TimedOut, env),
             })
         }
     }
@@ -803,9 +832,9 @@ impl LocalProvider {
     /// Sends `msg` to `addr` and waits up to `timeout` for a reply.
     ///
     /// The request is given a message id and correlation id if it has none, a
-    /// private `reply://…` address in its [`headers::REPLY_TO`] header, and a
-    /// time to live equal to `timeout` (so it is not handled after the caller
-    /// has given up). The listener answers with [`reply`](Self::reply) or by
+    /// private `reply://…` address as its reply address
+    /// ([`Message::reply_to`]), and a time to live equal to `timeout` (so it is
+    /// not handled after the caller has given up). The listener answers with [`reply`](Self::reply) or by
     /// being built with [`responder`](Self::responder). Returns
     /// [`MessagingError::RequestTimeout`] if no reply arrives in time.
     ///
@@ -880,8 +909,8 @@ impl LocalProvider {
         }
     }
 
-    /// Sends `reply` to the address in `request`'s [`headers::REPLY_TO`]
-    /// header, after marking it as a reply ([`Message::in_reply_to`]: the
+    /// Sends `reply` to the address in `request`'s reply-to property
+    /// ([`Message::reply_to`]), after marking it as a reply ([`Message::in_reply_to`]: the
     /// correlation id and trace context are carried over).
     ///
     /// Fails with [`MessagingError::InvalidAddress`] if the request has no
@@ -914,9 +943,9 @@ impl LocalProvider {
         let bus = self.downgrade();
         Arc::new(move |msg: Message| {
             let bus = bus.clone();
-            // Only the headers are needed to address the reply.
+            // Only the properties are needed to address the reply.
             let request = Message {
-                headers: msg.headers.clone(),
+                properties: msg.properties.clone(),
                 ..Message::default()
             };
             let work = f(msg);
@@ -939,7 +968,7 @@ impl LocalProvider {
     fn register(
         &self,
         addr: &str,
-        handler: Handler,
+        handler: DeliveryHandler,
         opts: ListenerOptions,
     ) -> Result<(), MessagingError> {
         let target = Target::parse(addr)?;
@@ -953,6 +982,11 @@ impl LocalProvider {
                 "buffer_size must be at most {}",
                 Semaphore::MAX_PERMITS
             )));
+        }
+        if matches!(target, Target::Queue(_)) && opts.filter.is_some() {
+            return Err(MessagingError::InvalidOptions(
+                "filter is only supported on topic:// subscriptions".to_string(),
+            ));
         }
         let canonical = target.canonical();
         if let Some(dead_letter) = &opts.dead_letter {
@@ -993,11 +1027,20 @@ impl LocalProvider {
                     None => None,
                 };
                 let index = match existing {
-                    Some(index) => index,
+                    Some(index) => {
+                        if routing.topics[index].filter != opts.filter {
+                            let name = name.unwrap_or_default();
+                            return Err(MessagingError::InvalidOptions(format!(
+                                "subscription `{name}` on `{pattern}` already exists with a different filter"
+                            )));
+                        }
+                        index
+                    }
                     None => {
                         routing.topics.push(TopicSub {
                             pattern: pattern.clone(),
                             name,
+                            filter: opts.filter.clone(),
                             group: Group::default(),
                         });
                         routing.topics.len() - 1
@@ -1072,7 +1115,21 @@ impl Producer for LocalProvider {
         opts: SendOptions,
     ) -> BoxFuture<'_, Result<(), MessagingError>> {
         let addr = addr.to_string();
-        Box::pin(async move { self.inner.send(&addr, msg, opts).await })
+        Box::pin(async move {
+            let message_id = msg.id().map(str::to_string);
+            let result = self.inner.send(&addr, msg, opts).await;
+            match &result {
+                Ok(()) => {
+                    let receipt = Receipt {
+                        message_id,
+                        ..Receipt::default()
+                    };
+                    self.inner.core.notify(|o| o.on_published(&addr, &receipt));
+                }
+                Err(error) => self.inner.core.notify(|o| o.on_send_failed(&addr, error)),
+            }
+            result
+        })
     }
 }
 
@@ -1081,6 +1138,16 @@ impl Receiver for LocalProvider {
         &self,
         addr: &str,
         handler: Handler,
+        opts: ListenerOptions,
+    ) -> BoxFuture<'_, Result<(), MessagingError>> {
+        let addr = addr.to_string();
+        Box::pin(async move { self.register(&addr, from_handler(handler), opts) })
+    }
+
+    fn add_delivery_listener(
+        &self,
+        addr: &str,
+        handler: DeliveryHandler,
         opts: ListenerOptions,
     ) -> BoxFuture<'_, Result<(), MessagingError>> {
         let addr = addr.to_string();
@@ -1100,6 +1167,26 @@ impl Provider for LocalProvider {
 
     fn setup(&self) -> BoxFuture<'_, Result<(), MessagingError>> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Every delivery feature is supported; there is no native batch call and
+    /// no size limit.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::new()
+            .delay(true)
+            .deliver_at(true)
+            .ttl(true)
+            .priority(true)
+            .ordering(true)
+            .filters(true)
+            .dedup(true)
+            .delivery_context(true)
+    }
+
+    /// Installs the observer, like [`LocalProvider::set_observer`].
+    fn set_observer(&self, observer: Arc<dyn Observer>) -> Result<(), MessagingError> {
+        LocalProvider::set_observer(self, observer);
+        Ok(())
     }
 
     /// Drains with [`LocalOptions::drain_timeout`]; fails with
@@ -1123,7 +1210,7 @@ struct Consumer {
     core: Arc<Core>,
     provider: Weak<Inner>,
     queue: Arc<Queue>,
-    handler: Handler,
+    handler: DeliveryHandler,
     opts: ListenerOptions,
 }
 
@@ -1211,8 +1298,83 @@ async fn consume(consumer: Arc<Consumer>) {
 /// How one handler invocation ended.
 enum Attempt {
     Done(Ack),
+    /// The handler panicked; the text is the panic message.
+    Panicked(String),
     /// The provider is stopping and the handler was cancelled.
     Cancelled,
+}
+
+/// The local provider's delivery control. There is no lease to extend; a
+/// deferred ack is carried over a one-shot channel.
+///
+/// The consumer never holds one of these: it keeps only the receiving end of
+/// the channel and the description slot. The sender lives here, owned by the
+/// [`Delivery`] and its [`Acker`](ferroly::messaging::Acker) clones, so when
+/// every one of them is dropped unsettled the consumer's receiver fails and
+/// the message is retried instead of waited on forever.
+struct LocalControl {
+    settle: Mutex<Option<oneshot::Sender<Ack>>>,
+    description: Arc<Mutex<Option<String>>>,
+}
+
+impl DeliveryControl for LocalControl {
+    fn extend(&self, _by: Duration) -> BoxFuture<'_, Result<(), MessagingError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_dead_letter_description(&self, description: String) {
+        *self.description.lock().unwrap() = Some(description);
+    }
+
+    fn resolve(&self, ack: Ack) -> bool {
+        if ack == Ack::Pending {
+            return false;
+        }
+        // Take the sender out first, so the guard is released before sending.
+        let sender = self.settle.lock().unwrap().take();
+        match sender {
+            Some(tx) => tx.send(ack).is_ok(),
+            None => false,
+        }
+    }
+}
+
+/// Why a message is being dead-lettered.
+struct DeadLetterCause {
+    reason: &'static str,
+    description: Option<String>,
+    /// Delivery attempts made but not yet counted in `delivery_count` (the
+    /// current one, for a handler that asked for the dead-letter itself).
+    uncounted_attempts: u32,
+}
+
+impl DeadLetterCause {
+    /// The last attempt failed and none are left.
+    fn exhausted(description: Option<String>) -> Self {
+        Self {
+            reason: "max-delivery-attempts",
+            description,
+            uncounted_attempts: 0,
+        }
+    }
+
+    /// The handler returned [`Ack::DeadLetter`].
+    fn rejected(description: Option<String>) -> Self {
+        Self {
+            reason: "rejected",
+            description,
+            uncounted_attempts: 1,
+        }
+    }
+
+    /// The time to live ran out before a handler took it.
+    fn expired() -> Self {
+        Self {
+            reason: "expired",
+            description: None,
+            uncounted_attempts: 0,
+        }
+    }
 }
 
 impl Consumer {
@@ -1228,13 +1390,33 @@ impl Consumer {
             }
             core.notify(|o| o.on_receive(addr, &env.msg));
             let began = Instant::now();
-            let ack = match self.invoke(&env.msg, stop).await {
+            let (attempt, settled, description) = self.invoke(&env, stop).await;
+
+            let mut panic_text = None;
+            let mut ack = match attempt {
                 Attempt::Done(ack) => ack,
+                Attempt::Panicked(text) => {
+                    panic_text = Some(text);
+                    Ack::Retry
+                }
                 Attempt::Cancelled => return core.abandon(addr, env.msg),
             };
+
+            if ack == Ack::Pending {
+                // Wait for the Acker, or for the provider to stop.
+                ack = tokio::select! {
+                    settled = settled => match settled {
+                        // Never settled (every Acker dropped): retry.
+                        Ok(Ack::Pending) | Err(_) => Ack::Retry,
+                        Ok(ack) => ack,
+                    },
+                    _ = aborted(stop) => return core.abandon(addr, env.msg),
+                };
+            }
+
             core.notify(|o| o.on_handled(addr, &env.msg, began.elapsed(), ack));
 
-            match ack {
+            let retry_delay = match ack {
                 Ack::Ok => {
                     core.notify(|o| o.on_ack(addr, &env.msg));
                     return core.completed();
@@ -1243,20 +1425,32 @@ impl Consumer {
                     core.notify(|o| o.on_nack(addr, &env.msg, false));
                     return core.completed();
                 }
-                Ack::Retry => {}
-            }
+                Ack::DeadLetter => {
+                    core.notify(|o| o.on_nack(addr, &env.msg, false));
+                    let description = description.lock().unwrap().take();
+                    let cause = DeadLetterCause::rejected(description);
+                    return self.dead_letter(env.msg, cause, stop).await;
+                }
+                Ack::Retry => None,
+                Ack::RetryAfter(delay) => Some(delay),
+                // Settled above; treated as a retry.
+                Ack::Pending => None,
+            };
 
             env.msg.delivery_count += 1;
             let attempts_left = env.msg.delivery_count < self.opts.max_delivery_attempts;
             // Report the *actual* fate: requeue only when attempts remain.
             core.notify(|o| o.on_nack(addr, &env.msg, attempts_left));
             if !attempts_left {
-                return self.dead_letter(env.msg, stop).await;
+                let description = panic_text.or_else(|| description.lock().unwrap().take());
+                let cause = DeadLetterCause::exhausted(description);
+                return self.dead_letter(env.msg, cause, stop).await;
             }
 
             // Back off before redelivering. The message stays with this
             // consumer, so a serial listener handles nothing else meanwhile.
-            let delay = self.opts.retry_backoff.delay(env.msg.delivery_count);
+            let delay = retry_delay
+                .unwrap_or_else(|| self.opts.retry_backoff.delay(env.msg.delivery_count));
             let interrupted = if delay.is_zero() {
                 tokio::task::yield_now().await;
                 *stop.borrow()
@@ -1273,29 +1467,53 @@ impl Consumer {
     }
 
     /// Calls the handler on its own task, so a panic is contained and reported
-    /// as [`Ack::Retry`] instead of ending the consumer.
-    async fn invoke(&self, msg: &Message, stop: &mut watch::Receiver<bool>) -> Attempt {
+    /// instead of ending the consumer. Returns how the call ended, the
+    /// receiving end of the delivery's deferred ack, and the slot holding the
+    /// dead-letter description the handler may have set.
+    async fn invoke(
+        &self,
+        env: &Envelope,
+        stop: &mut watch::Receiver<bool>,
+    ) -> (Attempt, oneshot::Receiver<Ack>, Arc<Mutex<Option<String>>>) {
+        let (tx, rx) = oneshot::channel();
+        let description = Arc::new(Mutex::new(None));
+        let mut info = DeliveryInfo::new(self.queue.addr.as_str())
+            .with_attempt(env.msg.delivery_count + 1)
+            .with_enqueued_at(env.enqueued_at)
+            .with_sequence(env.sequence);
+        if let Some(name) = &self.opts.subscription {
+            info = info.with_subscription(name.as_str());
+        }
+        let delivery = Delivery::new(
+            env.msg.clone(),
+            info,
+            Arc::new(LocalControl {
+                settle: Mutex::new(Some(tx)),
+                description: description.clone(),
+            }),
+        );
+
         let handler = self.handler.clone();
-        let copy = msg.clone();
         // The handler is called inside the task, so a panic while it builds
         // its future is contained as well.
-        let mut task = AbortOnDrop(tokio::spawn(async move { handler(copy).await }));
+        let mut task = AbortOnDrop(tokio::spawn(async move { handler(delivery).await }));
         let joined = tokio::select! {
             joined = &mut task.0 => joined,
             // Dropping `task` cancels the handler at its next await point.
-            _ = aborted(stop) => return Attempt::Cancelled,
+            _ = aborted(stop) => return (Attempt::Cancelled, rx, description),
         };
-        match joined {
+        let attempt = match joined {
             Ok(ack) => Attempt::Done(ack),
             Err(error) if error.is_panic() => {
                 let text = panic_text(error.into_panic());
                 self.core
-                    .notify(|o| o.on_handler_panic(&self.queue.addr, msg, &text));
-                Attempt::Done(Ack::Retry)
+                    .notify(|o| o.on_handler_panic(&self.queue.addr, &env.msg, &text));
+                Attempt::Panicked(text)
             }
             // Cancelled from outside: the runtime is shutting down.
             Err(_) => Attempt::Cancelled,
-        }
+        };
+        (attempt, rx, description)
     }
 
     /// Handles a message whose time to live ran out.
@@ -1303,7 +1521,10 @@ impl Consumer {
         let addr = self.queue.addr.as_str();
         self.core.notify(|o| o.on_expired(addr, &env.msg));
         match (self.opts.on_expired, &self.opts.dead_letter) {
-            (ExpiryAction::DeadLetter, Some(_)) => self.dead_letter(env.msg, stop).await,
+            (ExpiryAction::DeadLetter, Some(_)) => {
+                self.dead_letter(env.msg, DeadLetterCause::expired(), stop)
+                    .await
+            }
             _ => {
                 self.core
                     .notify(|o| o.on_dropped(addr, &env.msg, DropReason::Expired));
@@ -1315,7 +1536,23 @@ impl Consumer {
     /// Moves a message to the dead-letter destination, waiting for room there
     /// rather than dropping it. Without a destination — or if it cannot take
     /// the message — the loss is reported as `on_dead_letter(to_dlq = false)`.
-    async fn dead_letter(&self, msg: Message, stop: &mut watch::Receiver<bool>) {
+    ///
+    /// The message is first stamped with why it was dead-lettered, where it
+    /// came from and how many attempts it had; its `delivery_count` is kept.
+    async fn dead_letter(
+        &self,
+        mut msg: Message,
+        cause: DeadLetterCause,
+        stop: &mut watch::Receiver<bool>,
+    ) {
+        let attempts = msg.delivery_count.saturating_add(cause.uncounted_attempts);
+        msg.set_attribute(headers::DEAD_LETTER_REASON, cause.reason);
+        msg.set_attribute(headers::DEAD_LETTER_SOURCE, self.queue.addr.as_str());
+        msg.set_attribute(headers::DEAD_LETTER_ATTEMPTS, i64::from(attempts));
+        if let Some(description) = cause.description {
+            msg.set_attribute(headers::DEAD_LETTER_DESCRIPTION, description);
+        }
+
         let addr = self.queue.addr.as_str();
         let core = &self.core;
         let Some(dlq) = self.opts.dead_letter.as_deref() else {
@@ -1345,7 +1582,7 @@ impl Consumer {
             }
         };
         if let Some(topic) = topic {
-            msg.set_header(headers::TOPIC, topic);
+            msg.properties.topic = Some(topic);
         }
 
         let mut moved = false;

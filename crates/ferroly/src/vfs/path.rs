@@ -41,8 +41,22 @@ pub fn scheme_of(addr: &str) -> Option<&str> {
 /// Strips an optional scheme that must be one of `accepted` (compared ignoring
 /// ASCII case), returning the rest of the address. Any other scheme is an
 /// [`VfsError::InvalidPath`] — a backend must never quietly treat
-/// `s3://bucket/key` as one of its own paths.
-pub(crate) fn strip_scheme<'a>(
+/// `s3://bucket/key` as one of its own paths. `backend` names the backend in
+/// that error's reason.
+///
+/// This is the first thing a [`Vfs`](super::Vfs) backend does with a path:
+///
+/// ```
+/// use ferroly::vfs::{strip_scheme, VfsError};
+///
+/// assert_eq!(strip_scheme("s3://bucket/key", &["s3"], "S3").unwrap(), "bucket/key");
+/// assert_eq!(strip_scheme("bucket/key", &["s3"], "S3").unwrap(), "bucket/key");
+/// assert!(matches!(
+///     strip_scheme("gs://bucket/key", &["s3"], "S3"),
+///     Err(VfsError::InvalidPath { .. })
+/// ));
+/// ```
+pub fn strip_scheme<'a>(
     addr: &'a str,
     accepted: &[&str],
     backend: &str,

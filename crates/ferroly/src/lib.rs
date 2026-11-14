@@ -5,7 +5,7 @@
 //! you enable:
 //!
 //! ```toml
-//! ferroly = { version = "0.4", features = ["genai", "codec"] }
+//! ferroly = { version = "0.5", features = ["genai", "codec"] }
 //! ```
 //!
 //! ```
@@ -32,14 +32,14 @@
 //! | `http` | HTTP/1.1 client and server (chunked, SSE, range downloads, TLS) |
 //! | `lifecycle` | Dependency-ordered component start/stop and health probes |
 //! | `log` | Structured logger |
-//! | `messaging` | Provider-agnostic messaging with a local in-process bus |
+//! | `messaging` | Provider-agnostic messaging: typed attributes, filters, a delivery context, and an in-process bus |
 //! | `metrics` | Counters, gauges, histograms and Prometheus exposition |
 //! | `obs` | Span/event tracing with exporters |
 //! | `rest` | REST client and server framework |
 //! | `rt` | Async runtime surface (re-exported `tokio` primitives) |
 //! | `turbo` | HTTP router with middleware |
 //! | `vectorstore` | Vector-store trait with an in-memory backend |
-//! | `vfs` | Virtual filesystem trait with a local backend |
+//! | `vfs` | Virtual filesystem trait with local and in-memory backends and object-store hooks |
 //! | `ws` | WebSocket client and server (RFC 6455) |
 //!
 //! The `openai`, `claude` and `ollama` features add the matching `genai`
@@ -298,7 +298,23 @@ impl errutils::Classify for Error {
             #[cfg(feature = "turbo")]
             Error::Param(_) => K::InvalidInput,
             #[cfg(feature = "messaging")]
-            Error::Messaging(messaging::MessagingError::BufferFull { .. }) => K::Unavailable,
+            Error::Messaging(e) => {
+                use messaging::MessagingError as M;
+                match e {
+                    M::BufferFull(_) | M::SendTimeout(_) | M::Closed(_) => K::Unavailable,
+                    M::NoListeners(_) => K::NotFound,
+                    M::RequestTimeout(_) => K::Timeout,
+                    M::InvalidAddress(_) | M::InvalidOptions(_) => K::InvalidInput,
+                    M::Unsupported(_) => K::Unsupported,
+                    M::Backend {
+                        transient: true, ..
+                    }
+                    | M::Refused {
+                        transient: true, ..
+                    } => K::Unavailable,
+                    _ => K::Unknown,
+                }
+            }
             #[cfg(feature = "vectorstore")]
             Error::VectorStore(vectorstore::VectorStoreError::DimMismatch { .. }) => {
                 K::InvalidInput
@@ -309,6 +325,12 @@ impl errutils::Classify for Error {
                 vfs::VfsError::Permission { .. } => K::PermissionDenied,
                 vfs::VfsError::NotDir { .. } | vfs::VfsError::IsDir { .. } => K::InvalidInput,
                 vfs::VfsError::Unsupported { .. } => K::Unsupported,
+                vfs::VfsError::AlreadyExists { .. } | vfs::VfsError::PreconditionFailed { .. } => {
+                    K::Conflict
+                }
+                vfs::VfsError::Unavailable { .. } => K::Unavailable,
+                vfs::VfsError::Timeout { .. } => K::Timeout,
+                vfs::VfsError::Unauthenticated { .. } => K::Unauthenticated,
                 other => classify::io_source(other).unwrap_or(K::Unknown),
             },
             #[cfg(feature = "cli")]

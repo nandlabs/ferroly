@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use super::path::strip_scheme;
 use super::{
     BoxFuture, Entry, ListPage, Metadata, Vfile, Vfs, VfsError, VfsWriter, WalkAction, WalkFn,
-    WriteSink,
+    WriteOptions, WriteSink,
 };
 
 /// A [`Vfs`] backed by the local filesystem via tokio's non-blocking `fs`.
@@ -529,6 +529,26 @@ impl WriteSink for LocalSink {
         })
     }
 
+    fn abort<'s>(mut self: Box<Self>) -> BoxFuture<'s, Result<(), VfsError>>
+    where
+        Self: 's,
+    {
+        Box::pin(async move {
+            // Close the handle first: Windows cannot remove an open file.
+            // `into_std` waits for any write still running on the blocking
+            // pool (one whose `write_all` future was cancelled), so the file
+            // really is closed when the `std` handle drops.
+            if let Some(file) = self.file.take() {
+                drop(file.into_std().await);
+            }
+            match std::fs::remove_file(&self.draft.tmp) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(VfsError::from_io(&self.loc.shown, e)),
+            }
+        })
+    }
+
     fn finish<'s>(mut self: Box<Self>) -> BoxFuture<'s, Result<(), VfsError>>
     where
         Self: 's,
@@ -940,6 +960,26 @@ impl Vfs for LocalFs {
                 Err(e) => Err(classify(&loc, e, Expect::File).await),
             }
         })
+    }
+
+    fn create_with(
+        &self,
+        path: &str,
+        opts: WriteOptions,
+    ) -> BoxFuture<'_, Result<VfsWriter<'_>, VfsError>> {
+        let path = path.to_string();
+        Box::pin(async move {
+            if opts.precondition.is_some() {
+                return Err(VfsError::Unsupported(format!(
+                    "write preconditions are not supported by LocalFs: {path}"
+                )));
+            }
+            self.create(&path).await
+        })
+    }
+
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(self)
     }
 }
 

@@ -10,7 +10,7 @@ Provider-agnostic messaging with a full-featured **in-process** provider: queues
 
 The module is built around a small set of traits and one batteries-included backend:
 
-- A [`Message`](#message) is a plain data struct: headers, a byte body, an optional routing key, and a redelivery counter. Metadata such as the message id or trace context lives in [conventional headers](#metadata-conventions).
+- A [`Message`](#message) is a plain data struct: typed system [properties](#properties), typed application [attributes](#attributes), a byte body, an optional routing key, and a redelivery counter.
 - A **[`Handler`](#handler)** consumes a `Message` and **returns an [`Ack`](#ack)** telling the provider what to do with it (keep it, redeliver it, or discard it).
 - Three traits describe a backend: [`Producer`](#producer) (send), [`Receiver`](#receiver) (add listeners), and [`Provider`](#provider) (the two plus schemes/setup/close). They are the [extension point for external brokers](#implementing-a-provider).
 - [`LocalProvider`](#localprovider) is an in-process bus implementing all three.
@@ -31,7 +31,7 @@ Read this before relying on the module for anything that matters:
 - `LocalProvider` is **in-process and in-memory.** Nothing is written to disk and nothing crosses a process boundary.
 - **Within the life of the process, delivery is at-least-once.** A message that `send` accepted is handed to a handler until it is acked, rejected, or dead-lettered. A handler that returns `Retry`, returns an error (via [`fallible`](#fallible)), or **panics** causes a redelivery — not a loss. Because a message can be delivered more than once, handlers should be idempotent.
 - **Nothing survives a restart.** A message that has not been completed when the process exits — or crashes — is gone. A graceful [`stop`/`shutdown`](#graceful-shutdown-and-draining) drains what is buffered and hands back whatever it could not finish, but that is a courtesy, not durability.
-- Messages are only ever discarded for a reason you configured or can observe: `Ack::Reject`, exhausted attempts with no dead-letter destination, TTL expiry, `OnFull::DropOldest`, de-duplication, a topic with no subscribers, or a shutdown that timed out. Every one of these is reported through the [`Observer`](#observer).
+- Messages are only ever discarded for a reason you configured or can observe: `Ack::Reject`, exhausted attempts with no dead-letter destination, TTL expiry, `OnFull::DropOldest`, de-duplication, a topic with no (matching) subscribers, or a shutdown that timed out. Every one of these is reported through the [`Observer`](#observer).
 
 If you need durability, cross-process delivery, or consumer groups across processes, [implement `Provider`](#implementing-a-provider) over a broker. Those are out of scope for the built-in provider.
 
@@ -40,7 +40,7 @@ If you need durability, cross-process delivery, or consumer groups across proces
 | Concern | ferroly's design |
 | --- | --- |
 | Signalling a message's fate | the handler **returns an [`Ack`](#ack)** — explicit, no interior mutability or hidden side effects |
-| Message shape | one [`Message`](#message) struct + the [codec](codec.md) `Value` for headers, not an interface split |
+| Message shape | one [`Message`](#message) struct with typed properties and attributes, not an interface split |
 | Addressing | a `&str` address (`chan://name`, `topic://name`) |
 | Cancellation | drop the future — there are no separate context-carrying method variants |
 | Constructing messages | inherent constructors: [`Message::new`](#constructors) / `text` / `json` |
@@ -96,22 +96,33 @@ async fn main() {
 
 | Item | Kind | Summary |
 | --- | --- | --- |
-| [`Message`](#message) | struct | Headers, body, routing key, delivery count |
-| [`headers`](#metadata-conventions) | module | Conventional header keys (`MESSAGE_ID`, `TRACEPARENT`, …) |
-| [`new_message_id`](#metadata-conventions) | fn | Generates a process-unique message id |
-| [`Ack`](#ack) | enum | `Ok` / `Retry` / `Reject` disposition returned by a handler |
+| [`Message`](#message) | struct | Properties, attributes, body, routing key, delivery count |
+| [`Properties`](#properties) | struct | System metadata: id, correlation id, content type, priority, … |
+| [`Attributes`](#attributes), `AttrValue` | struct, enum | Typed application attributes |
+| [`headers`](#properties) | module | Wire names of the properties (`MESSAGE_ID`, `TRACEPARENT`, …) |
+| [`new_message_id`](#properties) | fn | Generates a process-unique message id |
+| [`Ack`](#ack) | enum | `Ok` / `Retry` / `Reject` / `RetryAfter` / `DeadLetter` / `Pending` disposition returned by a handler |
 | [`Handler`](#handler) | type alias | `Arc<dyn Fn(Message) -> BoxFuture<'static, Ack> + Send + Sync>` |
+| [`DeliveryHandler`](#delivery-context), `delivery_handler` | type alias, fn | A handler that receives the delivery context |
+| [`Delivery`](#delivery), [`DeliveryInfo`](#deliveryinfo), [`Acker`](#acker) | structs | The delivery context: details, lease extension, deferred acks |
+| [`DeliveryControl`](#deliverycontrol--for-provider-implementations) | trait | The provider's side of a `Delivery` |
 | [`handler`](#handler) | fn | Wraps an async closure returning `Ack` |
 | [`fallible`](#fallible) | fn | Wraps an async closure returning `Result<(), E>` |
 | [`SendOptions`](#sendoptions) | struct | Per-send: routing key, backpressure policy, TTL, delay |
 | [`OnFull`](#onfull) | enum | `Reject` / `Block` / `BlockFor` / `DropOldest` |
 | [`ListenerOptions`](#listeneroptions) | struct | Per-listener: buffer, concurrency, attempts, DLQ, backoff, expiry, subscription |
+| [`Filter`](#filtering-subscriptions) | enum | Attribute filter for a topic subscription |
 | [`Backoff`](#backoff) | struct | Delay between redeliveries |
+
 | [`ExpiryAction`](#listeneroptions) | enum | What happens to an expired message |
-| [`LocalOptions`](#localprovider) | struct | Provider-level: drain timeout, de-duplication window |
-| [`Producer`](#producer) | trait | `send`, `send_batch` |
-| [`Receiver`](#receiver) | trait | `add_listener`, `remove_listeners` |
-| [`Provider`](#provider) | trait | `Producer + Receiver` + `schemes` / `setup` / `close` |
+| [`LocalOptions`](#localprovider) | struct | Provider-level: drain timeout, de-duplication window (by dedup key, then message id) |
+
+| [`Producer`](#producer) | trait | `send`, `send_with_receipt`, `send_batch` |
+| [`Receiver`](#receiver) | trait | `add_listener`, `remove_listeners` (both defaulted) |
+| [`Provider`](#provider) | trait | `Producer + Receiver` + `schemes` / `setup` / `close` / `capabilities` / `set_observer` |
+| [`Capabilities`](#capabilities) | struct | What a provider supports |
+| [`Receipt`](#receipts) | struct | What a provider returns for an accepted message |
+
 | [`ProviderRegistry`](#providerregistry) | struct | Dispatches to providers by address scheme |
 | [`LocalProvider`](#localprovider) | struct | In-process provider |
 | [`WeakLocalProvider`](#localprovider) | struct | A handle that does not keep the provider alive |
@@ -120,7 +131,7 @@ async fn main() {
 | [`DropReason`](#observer) | enum | Why a message was discarded |
 | [`LogObserver`](#logobserver) | struct | `Observer` that logs via `ferroly::log` (feature `log`) |
 | [`MessagingError`](#error-handling) | enum | Errors; send errors hand the message back |
-| [`Rejected`](#error-handling), `BatchFailure` | structs | Error payloads |
+| [`Rejected`](#error-handling), [`BatchFailure`](#batch-send), `BatchEntryFailure` | structs | Error payloads |
 | [`topic_matches`](#wildcards), `split_address` | fns | Address helpers |
 | [`BoxFuture`](#boxfuture) | type alias | `Pin<Box<dyn Future<Output = T> + Send + 'a>>` |
 
@@ -135,17 +146,20 @@ The object-safe async return type used throughout the traits. You rarely name it
 ## Message
 
 ```rust
+#[non_exhaustive]
 pub struct Message {
-    pub headers: Value,               // ferroly::codec::Value
+    pub properties: Properties,     // system metadata: id, correlation id, content type, …
+    pub attributes: Attributes,     // application metadata: typed key/value pairs
     pub body: Vec<u8>,
     pub routing_key: Option<String>,
     pub delivery_count: u32,
 }
 ```
 
-A message is a plain, `Clone`-able data struct. Every field is public.
+A message is a plain, `Clone`-able data struct. Every field is public, but the struct is `#[non_exhaustive]`: outside the crate, build one with [`Message::new` / `text` / `json`](#constructors) (or `Message::default()`) and the `with_*` methods rather than a struct literal.
 
-- `headers` — arbitrary metadata as a [codec](codec.md) `Value` (a `Value::Object` once any header is set).
+- `properties` — the [system properties](#properties): well-known metadata with a fixed meaning (message id, correlation id, timestamp, reply address, trace context, content type, priority, …).
+- `attributes` — the application's own metadata, as typed [`Attributes`](#attributes).
 - `body` — the raw payload bytes.
 - `routing_key` — an optional partition key. When set, every message sharing that key is delivered to the *same* listener (see [routing-key affinity](#queues-competing-consumers--routing-key-affinity)).
 - `delivery_count` — how many times this message has been redelivered. It starts at `0` and is incremented by the provider before each redelivery; a handler can inspect it to detect a redelivered message.
@@ -155,10 +169,10 @@ A message is a plain, `Clone`-able data struct. Every field is public.
 ```rust
 Message::new(body: impl Into<Vec<u8>>) -> Message   // raw bytes
 Message::text(text: impl Into<String>) -> Message   // UTF-8 body
-Message::json<T: Encode>(value: &T) -> Message      // JSON-encoded body
+Message::json<T: Encode>(value: &T) -> Message      // JSON-encoded body, content type application/json
 ```
 
-`Message::json` uses the [codec](codec.md) `Encode` trait (not serde) to render the body as JSON bytes.
+`Message::json` uses the [codec](codec.md) `Encode` trait (not serde) to render the body as JSON bytes, and sets the `content_type` property to `application/json`. `new` and `text` leave the content type unset.
 
 ```rust
 use ferroly::messaging::Message;
@@ -169,44 +183,102 @@ struct Order { id: u32, total: u64 }
 let raw  = Message::new(vec![0xDE, 0xAD]);
 let text = Message::text("hello");
 let json = Message::json(&Order { id: 1, total: 4200 });
+assert_eq!(json.content_type(), Some("application/json"));
 ```
 
-### Builder methods and headers
+### Attributes
+
+Application metadata is a typed, ordered map:
 
 ```rust
-Message::with_header(self, key: impl Into<String>, value: impl Into<Value>) -> Message
-Message::set_header(&mut self, key: impl Into<String>, value: impl Into<Value>)
+#[non_exhaustive]
+pub enum AttrValue {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Bytes(Vec<u8>),
+}
+
+pub struct Attributes { /* ordered (name, AttrValue) entries */ }
+```
+
+There is no timestamp variant — carry a time as an `Int` of milliseconds. Nested or array values are not supported; put structured data in the body or encode it into a string.
+
+`AttrValue` converts `From` `&str`, `String`, `&String`, `i64`, `i32`, `u32`, `u16`, `u8`, `f64`, `f32`, `bool`, `Vec<u8>` and `&[u8]`. There is deliberately no `From<u64>` / `From<usize>` (they do not fit an `i64`): cast, as in `with_attribute("n", n as i64)`.
+
+| `AttrValue` method | Returns |
+| --- | --- |
+| `as_str()` / `as_i64()` / `as_bool()` / `as_bytes()` | `Some` only for the matching variant |
+| `as_f64()` | `Float(f)` → `f`, `Int(i)` → `i as f64`, otherwise `None` |
+| `type_name()` | `"string"`, `"int"`, `"float"`, `"bool"`, `"bytes"` |
+| `to_text()` | a string as is; numbers and booleans in their usual form; bytes as lowercase hex |
+
+`Attributes` keeps entries in insertion order and allows a name more than once. Names are compared exactly (case-sensitively).
+
+| `Attributes` method | Behaviour |
+| --- | --- |
+| `new()`, `len()`, `is_empty()`, `clear()` | the usual |
+| `insert(name, value) -> Option<AttrValue>` | sets `name` to exactly one value: replaces the first entry in place, removes every other entry with that name, returns the first old value; appends a new name at the end |
+| `append(name, value)` | always adds a new entry at the end, keeping existing ones |
+| `get(name)` / `get_all(name)` | the first value / every value with that name, in order |
+| `get_str` / `get_i64` / `get_f64` / `get_bool` / `get_bytes` | `get(name)` with the typed accessor applied |
+| `contains_key(name)` | whether any entry has that name |
+| `remove(name) -> Option<AttrValue>` | removes **every** entry with that name, returns the first |
+| `iter()` / `keys()` | entries / names in order (a repeated name is repeated) |
+
+`Attributes` also implements `FromIterator<(K, V)>`, `Extend<(K, V)>` (both via `append`) and `IntoIterator<Item = (String, AttrValue)>`.
+
+On a `Message`:
+
+```rust
+Message::with_attribute(self, name: impl Into<String>, value: impl Into<AttrValue>) -> Message
+Message::set_attribute(&mut self, name: impl Into<String>, value: impl Into<AttrValue>)
+Message::attribute(&self, name: &str) -> Option<&AttrValue>
+Message::attribute_str(&self, name: &str) -> Option<&str>
 Message::with_routing_key(self, key: impl Into<String>) -> Message
-
-Message::header(&self, key: &str) -> Option<&Value>
-Message::header_str(&self, key: &str) -> Option<&str>
 ```
 
-`with_header` / `set_header` **replace** an existing header with the same key (promoting `headers` to a `Value::Object` if it was not one already). `header` / `header_str` read one back.
+`with_attribute` / `set_attribute` call `Attributes::insert`, so they **replace** an existing attribute with the same name. For repeated names use `msg.attributes.append(…)`.
 
 ```rust
-use ferroly::messaging::Message;
+use ferroly::messaging::{AttrValue, Message};
 
 let msg = Message::text("ship it")
-    .with_header("content-type", "text/plain")
-    .with_header("priority", 5u64)
+    .with_attribute("tenant", "acme")
+    .with_attribute("attempt", 2)
+    .with_attribute("express", true)
     .with_routing_key("customer-42");
-assert_eq!(msg.header_str("content-type"), Some("text/plain"));
+assert_eq!(msg.attribute_str("tenant"), Some("acme"));
+assert_eq!(msg.attributes.get_i64("attempt"), Some(2));
+assert_eq!(msg.attribute("express"), Some(&AttrValue::Bool(true)));
 ```
 
-### Metadata conventions
+### Properties
 
-Well-known metadata is carried in headers under fixed keys, exposed as constants in `ferroly::messaging::headers` and through typed accessors on `Message`. They are conventions, not separate fields — so they travel through any provider that carries headers, and an adapter for an external broker can map them to that broker's native attributes.
+System metadata lives in `Message::properties`, a `#[non_exhaustive]` struct of optional fields. Each has a typed setter/getter on `Message`, and a conventional **wire name** in the `ferroly::messaging::headers` module — the name an adapter uses when its broker has a single flat attribute map.
 
-| Constant | Key | Value | Setter / getter |
+| Field | Wire name (`headers::…`) | Wire type | Setter / getter |
 | --- | --- | --- | --- |
-| `headers::MESSAGE_ID` | `message-id` | string | `with_id`, `with_new_id` / `id` |
-| `headers::CORRELATION_ID` | `correlation-id` | string | `with_correlation_id` / `correlation_id` |
-| `headers::TIMESTAMP` | `timestamp` | unsigned integer: milliseconds since the Unix epoch | `with_timestamp(SystemTime)` / `timestamp` |
-| `headers::REPLY_TO` | `reply-to` | string: an address | `with_reply_to` / `reply_to` |
-| `headers::TRACEPARENT` | `traceparent` | string: W3C Trace Context | `with_traceparent` / `traceparent` |
-| `headers::TRACESTATE` | `tracestate` | string: W3C Trace Context | `with_tracestate` / `tracestate` |
-| `headers::TOPIC` | `topic` | string: the concrete topic a copy was published to | set by the provider / `topic` |
+| `message_id` | `MESSAGE_ID` = `message-id` | string | `with_id`, `with_new_id` / `id` |
+| `correlation_id` | `CORRELATION_ID` = `correlation-id` | string | `with_correlation_id` / `correlation_id` |
+| `timestamp` | `TIMESTAMP` = `timestamp` | int: milliseconds since the Unix epoch | `with_timestamp(SystemTime)` / `timestamp` |
+| `reply_to` | `REPLY_TO` = `reply-to` | string: an address | `with_reply_to` / `reply_to` |
+| `traceparent` | `TRACEPARENT` = `traceparent` | string: W3C Trace Context | `with_traceparent` / `traceparent` |
+| `tracestate` | `TRACESTATE` = `tracestate` | string: W3C Trace Context | `with_tracestate` / `tracestate` |
+| `topic` | `TOPIC` = `topic` | string: the concrete topic a copy was published to | set by the provider / `topic` |
+| `content_type` | `CONTENT_TYPE` = `content-type` | string: a media type | `with_content_type` / `content_type` |
+| `content_encoding` | `CONTENT_ENCODING` = `content-encoding` | string, e.g. `gzip` | `with_content_encoding` / `content_encoding` |
+| `subject` | `SUBJECT` = `subject` | string | `with_subject` / `subject` |
+| `event_type` | `EVENT_TYPE` = `event-type` | string, e.g. `order.created` | `with_event_type` / `event_type` |
+| `source` | `SOURCE` = `source` | string: what produced the message | `with_source` / `source` |
+| `user_id` | `USER_ID` = `user-id` | string: the sender's identity | `with_user_id` / `user_id` |
+| `dedup_key` | `DEDUP_KEY` = `dedup-key` | string | `with_dedup_key` / `dedup_key` |
+| `priority` | `PRIORITY` = `priority` | int, 0–255 | `with_priority(u8)` / `priority() -> u8` (0 when unset) |
+
+`headers::PROPERTY_NAMES` lists those wire names in the order above. The module also names the four attributes a provider adds to a [dead-lettered](#ackredelivery--dead-lettering) message: `DEAD_LETTER_REASON`, `DEAD_LETTER_DESCRIPTION`, `DEAD_LETTER_SOURCE`, `DEAD_LETTER_ATTEMPTS`.
+
+The timestamp is stored with **millisecond precision**: `with_timestamp` truncates to whole milliseconds, so it survives a trip through the wire form unchanged.
 
 Helpers that combine them:
 
@@ -216,76 +288,137 @@ Helpers that combine them:
 - `new_message_id() -> String` — 32 hex characters, unique within the process and unlikely to collide across processes. It is an identifier, not a secret.
 
 ```rust
-use ferroly::messaging::{headers, Message};
+use ferroly::messaging::Message;
 
 let msg = Message::text("payload")
     .stamped()                                   // message-id + timestamp
     .with_correlation_id("checkout-7781")
+    .with_event_type("order.created")
     .with_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
 
 assert!(msg.id().is_some());
-assert_eq!(msg.header_str(headers::CORRELATION_ID), Some("checkout-7781"));
+assert_eq!(msg.correlation_id(), Some("checkout-7781"));
+assert_eq!(msg.event_type(), Some("order.created"));
 ```
 
+**Properties and attributes are separate.** `with_id("m1")` and `with_attribute("message-id", "app")` set two different things: `id()` returns `"m1"`, `attribute_str("message-id")` returns `"app"`.
+
 **Trace propagation.** The module does not create spans and does not depend on `obs`. The convention is: when you send, copy the active span's W3C `traceparent` (and `tracestate`) into the message with `with_traceparent`; when you handle a message, start your consumer span from `msg.traceparent()`; and when a handler produces a follow-up message, call `with_trace_from(&msg)` so the trace continues.
+
+#### The wire form
+
+An adapter for a broker that has one flat attribute map (SQS message attributes, Pub/Sub attributes, AMQP application properties, …) uses three helpers:
+
+```rust
+Message::to_wire_attributes(&self) -> Attributes
+Message::from_wire(body: impl Into<Vec<u8>>, attributes: Attributes) -> Message
+Message::lookup(&self, name: &str) -> Option<AttrValue>
+```
+
+- `to_wire_attributes` writes every **set** property under its wire name (in `PROPERTY_NAMES` order), then the application attributes. An application attribute whose name is a property name is left out — the property wins.
+- `from_wire` is the reverse: an entry whose name is a property name **and** whose value has that property's wire type becomes the property (the timestamp from an `Int` of milliseconds, the priority from an `Int` in `0..=255`, everything else from a `Str`); every other entry — including a property name with the wrong type — is kept as an application attribute. If a property name appears more than once, the first well-typed entry becomes the property and the rest stay attributes.
+- `lookup` finds a name the way a subscription filter does: a set property under its wire name first, then the first application attribute.
+
+```rust
+use ferroly::messaging::{headers, AttrValue, Message};
+
+let msg = Message::text("hi")
+    .with_id("m-1")
+    .with_priority(3)
+    .with_attribute("tenant", "acme");
+
+let wire = msg.to_wire_attributes();
+let names: Vec<&str> = wire.keys().collect();
+assert_eq!(names, [headers::MESSAGE_ID, headers::PRIORITY, "tenant"]);
+assert_eq!(wire.get_i64(headers::PRIORITY), Some(3));
+
+// … hand `wire` and `msg.body` to the broker; on the way back:
+let back = Message::from_wire(msg.body.clone(), wire);
+assert_eq!(back.id(), Some("m-1"));
+assert_eq!(back.priority(), 3);
+assert_eq!(back.attribute_str("tenant"), Some("acme"));
+assert_eq!(back.lookup("message-id"), Some(AttrValue::Str("m-1".into())));
+```
 
 ### Reading the body
 
 ```rust
-Message::body_str(&self) -> Cow<'_, str>          // lossy UTF-8 view
-Message::decode<T: Decode>(&self) -> Result<T, CodecError>   // JSON body → T
+Message::body_str(&self) -> Cow<'_, str>                                     // lossy UTF-8 view
+Message::decode<T: Decode>(&self) -> Result<T, CodecError>                   // body → T, by content type
+Message::encode_as<T: Encode + ?Sized>(content_type: &str, value: &T)
+    -> Result<Message, CodecError>                                           // T → body, content type set
 ```
 
-`body_str` gives you a lossy UTF-8 view for text payloads. `decode` parses the body as JSON into any [codec](codec.md) `Decode` type.
+`body_str` gives you a lossy UTF-8 view for text payloads.
+
+`decode` parses the body into any [codec](codec.md) `Decode` type. It uses the message's `content_type` property when it is one the codec registry knows (JSON, XML, YAML or TOML, including `+json`-style suffixes), and **JSON otherwise** — also when no content type is set, or when it is one the registry does not know.
+
+`encode_as` is the other direction: it encodes `value` for `content_type` with the codec registry and sets that content type on the message. An unknown content type is an error. (`Message::json` is the infallible JSON shorthand.)
 
 ```rust
 use ferroly::messaging::Message;
 
-#[derive(ferroly::codec::Decode)]
+#[derive(ferroly::codec::Encode, ferroly::codec::Decode)]
 struct Order { id: u32, total: u64 }
 
+let yaml = Message::encode_as("application/yaml", &Order { id: 1, total: 4200 }).unwrap();
+assert_eq!(yaml.content_type(), Some("application/yaml"));
+
 fn handle(msg: &Message) {
-    if let Ok(order) = msg.decode::<Order>() {
+    if let Ok(order) = msg.decode::<Order>() {     // YAML here, because of the content type
         println!("order {} = {}", order.id, order.total);
     } else {
         println!("plain text: {}", msg.body_str());
     }
 }
+# handle(&yaml);
 ```
 
 ## Ack
 
 ```rust
+#[non_exhaustive]
 pub enum Ack {
-    Ok,      // processed successfully; remove the message
-    Retry,   // failed transiently; redeliver after a backoff (then dead-letter)
-    Reject,  // failed permanently; discard (no redelivery, no dead-lettering)
+    Ok,                    // processed successfully; remove the message
+    Retry,                 // failed transiently; redeliver after the listener's backoff (then dead-letter)
+    Reject,                // failed permanently; discard (no redelivery, no dead-lettering)
+    RetryAfter(Duration),  // like Retry, but after this delay instead of the backoff
+    DeadLetter,            // failed permanently; dead-letter now, skipping the remaining attempts
+    Pending,               // not decided yet: an Acker will settle it later
 }
 ```
 
 **This is the central design choice of the module.** A handler is a pure function of its input: it **returns an `Ack`**, rather than mutating the message or flipping an ack/nack flag on it. That keeps the control flow explicit — no interior mutability, no hidden side effects — and makes a handler trivially testable in isolation.
 
-The value you return *is* the disposition, and the provider acts on it:
+The value you return *is* the disposition. What `LocalProvider` does for each:
 
-- `Ack::Ok` — the provider drops the message and fires [`Observer::on_ack`](#observer).
-- `Ack::Retry` — the provider increments `delivery_count` and, while attempts remain, redelivers the message to the same listener after the [retry backoff](#backoff), firing `on_nack(requeue = true)`. Once `delivery_count` reaches `max_delivery_attempts` the message is instead routed to the [dead-letter destination](#ackredelivery--dead-lettering) (or dropped if none is configured); that final nack fires `on_nack(requeue = false)` followed by [`Observer::on_dead_letter`](#observer).
-- `Ack::Reject` — the provider discards the message immediately. Fires `on_nack(requeue = false)`.
+| `Ack` | What `LocalProvider` does | Observer |
+| --- | --- | --- |
+| `Ok` | drops the message | `on_ack` |
+| `Retry` | increments `delivery_count`; while attempts remain, redelivers to the same listener after the [retry backoff](#backoff); once `delivery_count` reaches `max_delivery_attempts`, [dead-letters](#ackredelivery--dead-lettering) it (or drops it if no destination is configured) | `on_nack(requeue = true)`, finally `on_nack(requeue = false)` + `on_dead_letter` |
+| `Reject` | discards the message immediately | `on_nack(requeue = false)` |
+| `RetryAfter(d)` | like `Retry`, but waits `d` instead of the backoff. It **counts as a delivery attempt**, so it still ends in the dead-letter destination after `max_delivery_attempts` | as `Retry` |
+| `DeadLetter` | moves the message to the dead-letter destination **now**, without using the remaining attempts (reason `rejected`); without a destination it is dropped and reported | `on_nack(requeue = false)` + `on_dead_letter` |
+| `Pending` | waits for the delivery's [`Acker`](#delivery-context) to settle it, then acts on that `Ack`. If every `Acker` is dropped unsettled, it is treated as `Retry`. From a plain [`Handler`](#handler) — which has no `Acker` — it is treated as `Retry` at once | per the final `Ack` |
 
 **A handler that panics is treated as having returned `Ack::Retry`.** The panic is contained, reported through [`Observer::on_handler_panic`](#observer), and the consumer keeps running.
 
-`Ack` is `Copy`, so returning it is free.
+`Ack` is `Copy`, so returning it is free. It is `#[non_exhaustive]`: a `match` on it outside the crate needs a wildcard arm.
 
 ```rust
+use std::time::Duration;
 use ferroly::messaging::{handler, Ack, Message};
 
 let h = handler(|msg: Message| async move {
     match validate(&msg) {
         Verdict::Good      => Ack::Ok,
-        Verdict::TryLater  => Ack::Retry,   // transient — will be redelivered
-        Verdict::Poison    => Ack::Reject,  // permanent — drop now
+        Verdict::TryLater  => Ack::Retry,                                // transient — redelivered after the backoff
+        Verdict::RateLimit => Ack::RetryAfter(Duration::from_secs(30)), // transient — redelivered in 30 s
+        Verdict::Poison    => Ack::DeadLetter,                          // permanent — park it for inspection
+        Verdict::Junk      => Ack::Reject,                              // permanent — drop now
     }
 });
-# enum Verdict { Good, TryLater, Poison }
+# enum Verdict { Good, TryLater, RateLimit, Poison, Junk }
 # fn validate(_: &Message) -> Verdict { Verdict::Good }
 ```
 
@@ -351,21 +484,139 @@ let h = fallible(|msg: Message| async move {
 
 If you need to distinguish permanent failures (`Reject`) from transient ones, use [`handler`](#handler) and match explicitly — `fallible` only knows "succeeded" vs. "retry".
 
+## Delivery context
+
+A plain [`Handler`](#handler) sees only the `Message`. A **delivery handler** also gets the delivery context — facts about this delivery, a way to ask for more time, and a way to settle the message later:
+
+```rust
+pub type DeliveryHandler = Arc<dyn Fn(Delivery) -> BoxFuture<'static, Ack> + Send + Sync>;
+
+pub fn delivery_handler<F, Fut>(f: F) -> DeliveryHandler
+where
+    F: Fn(Delivery) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Ack> + Send + 'static;
+
+// on Receiver — defaulted to MessagingError::Unsupported; LocalProvider implements it
+fn add_delivery_listener(&self, addr: &str, handler: DeliveryHandler, opts: ListenerOptions)
+    -> BoxFuture<'_, Result<(), MessagingError>>;
+```
+
+`add_delivery_listener` takes the same [`ListenerOptions`](#listeneroptions) as `add_listener`, and `ProviderRegistry` forwards it. A provider that supports it says so with [`Capabilities::delivery_context`](#capabilities).
+
+### `Delivery`
+
+```rust
+pub struct Delivery {
+    pub message: Message,
+    /* the info and the provider's control */
+}
+
+impl Delivery {
+    pub fn new(message: Message, info: DeliveryInfo, control: Arc<dyn DeliveryControl>) -> Self;
+    pub fn detached(message: Message) -> Self;          // no provider behind it — for unit tests
+    pub fn info(&self) -> &DeliveryInfo;
+    pub fn into_message(self) -> Message;
+    pub async fn extend(&self, by: Duration) -> Result<(), MessagingError>;
+    pub fn acker(&self) -> Acker;
+    pub fn dead_letter_description(&self, description: impl Into<String>);
+}
+```
+
+- `info()` — the [`DeliveryInfo`](#deliveryinfo).
+- `extend(by)` — asks for `by` more time before the message is redelivered to someone else (a broker's visibility timeout or lease). **`LocalProvider` has no leases, so `extend` is a successful no-op there.**
+- `acker()` — an [`Acker`](#acker) to settle the message later; return `Ack::Pending` after taking one.
+- `dead_letter_description(text)` — free text recorded on the message (as `dead-letter-description`) if the handler returns `Ack::DeadLetter` or the message is dead-lettered after its last attempt.
+- `detached(msg)` — a delivery with no provider: `extend` succeeds and does nothing, and an `Acker` settles nothing (`ack()` returns `false`). Use it to unit-test a delivery handler.
+
+### `DeliveryInfo`
+
+```rust
+#[non_exhaustive]
+pub struct DeliveryInfo {
+    pub address: String,               // the address the message was consumed from
+    pub attempt: u32,                  // which delivery attempt this is, from 1
+    pub redelivered: bool,             // attempt > 1
+    pub enqueued_at: Option<SystemTime>,
+    pub sequence: Option<u64>,         // the provider's sequence number or offset
+    pub subscription: Option<String>,  // the subscription name, for topics
+}
+```
+
+Providers build one with `DeliveryInfo::new(address)` (attempt 1) and `with_attempt`, `with_enqueued_at`, `with_sequence`, `with_subscription`. `LocalProvider` fills every field: `address` is the listener's canonical address (`chan://jobs`, `topic://orders.*`), `enqueued_at` is when the message was accepted, `sequence` counts the messages accepted by that listener's buffer (from 1, increasing in acceptance order), and `subscription` is the listener's `ListenerOptions::subscription`.
+
+### `Acker`
+
+```rust
+#[derive(Clone)]
+pub struct Acker { /* … */ }
+
+impl Acker {
+    pub fn ack(&self) -> bool;
+    pub fn retry(&self) -> bool;
+    pub fn retry_after(&self, delay: Duration) -> bool;
+    pub fn reject(&self) -> bool;
+    pub fn dead_letter(&self, description: impl Into<String>) -> bool;
+}
+```
+
+An `Acker` settles a delivery whose handler returned `Ack::Pending` — later, or from another task (it is `Send + Sync + Clone`). Each method has the same effect as returning the matching `Ack`, and returns `true` if **this** call settled the delivery, `false` if it was already settled (or the delivery was not pending).
+
+```rust
+use ferroly::messaging::{delivery_handler, Ack, Delivery, LocalProvider, Receiver};
+
+# async fn ex(bus: LocalProvider, work: tokio::sync::mpsc::UnboundedSender<(String, ferroly::messaging::Acker)>) {
+bus.add_delivery_listener(
+    "chan://jobs",
+    delivery_handler(move |delivery: Delivery| {
+        let work = work.clone();
+        async move {
+            if delivery.info().redelivered {
+                eprintln!("attempt {} of {}", delivery.info().attempt, delivery.message.body_str());
+            }
+            // Hand the job to a worker pool; the worker calls `acker.ack()` when done.
+            let job = delivery.message.body_str().into_owned();
+            let _ = work.send((job, delivery.acker()));
+            Ack::Pending
+        }
+    }),
+    Default::default(),
+)
+.await
+.unwrap();
+# }
+```
+
+**The consumer does not wait forever.** While a delivery is pending, a serial listener handles nothing else (as for a retry backoff), and the message still counts towards `pending()`. If every `Acker` for it is dropped without settling, the provider treats the message as `Retry`. A [shutdown](#graceful-shutdown-and-draining) that reaches its deadline gives up on a pending delivery and reports it as undelivered.
+
+### `DeliveryControl` — for provider implementations
+
+```rust
+pub trait DeliveryControl: Send + Sync {
+    fn extend(&self, by: Duration) -> BoxFuture<'_, Result<(), MessagingError>>;
+    fn set_dead_letter_description(&self, description: String);
+    fn resolve(&self, ack: Ack) -> bool;
+}
+```
+
+The provider's side of a `Delivery`, one per delivery: `extend` renews the broker's lease (a provider without leases returns `Ok(())`), `set_dead_letter_description` records the text for a later dead-letter, and `resolve` settles a pending delivery — returning `true` only for the call that settled it, and never accepting `Ack::Pending` itself as a resolution.
+
 ## Options
 
 ### SendOptions
 
 ```rust
 pub struct SendOptions {
-    pub routing_key: Option<String>,   // overrides the message's own routing_key
-    pub block_on_full: bool,           // shorthand for on_full = Some(OnFull::Block)
-    pub on_full: Option<OnFull>,       // backpressure policy
-    pub ttl: Option<Duration>,         // time to live
-    pub delay: Option<Duration>,       // delayed delivery
+    pub routing_key: Option<String>,     // overrides the message's own routing_key
+    pub block_on_full: bool,             // shorthand for on_full = Some(OnFull::Block)
+    pub on_full: Option<OnFull>,         // backpressure policy
+    pub ttl: Option<Duration>,           // time to live
+    pub delay: Option<Duration>,         // delayed delivery
+    pub deliver_at: Option<SystemTime>,  // delivery at an absolute time
+    pub extensions: Attributes,          // provider-specific options
 }
 ```
 
-Per-`send` options. `Default` gives no routing-key override, [`OnFull::Reject`](#onfull), no TTL, no delay. Build one with a struct literal and `..Default::default()`, or fluently:
+Per-`send` options. `Default` gives no routing-key override, [`OnFull::Reject`](#onfull), no TTL, no delay, no schedule and no extensions. Build one with a struct literal and `..Default::default()`, or fluently:
 
 ```rust
 use std::time::Duration;
@@ -375,13 +626,34 @@ let opts = SendOptions::new()
     .routing_key("customer-7")
     .on_full(OnFull::BlockFor(Duration::from_secs(1)))
     .ttl(Duration::from_secs(30))
-    .delay(Duration::from_secs(5));
+    .delay(Duration::from_secs(5))
+    .extension("sqs.message-group-id", "orders");
 ```
 
 - `routing_key` — takes precedence over `Message::routing_key` when picking the target listener.
 - `on_full` — what to do when the target listener's buffer is full; see [`OnFull`](#onfull). `block_on_full: true` is the older spelling of `OnFull::Block` and is ignored when `on_full` is set. `full_policy()` returns the effective policy.
 - `ttl` — [time to live](#ttl-and-expiry), counted from the moment the message is accepted.
 - `delay` — [delayed delivery](#delayed-delivery): the message becomes visible to its listener only after this long.
+- `deliver_at` (builder `deliver_at(SystemTime)`) — [scheduled delivery](#delayed-delivery) at an absolute time instead of after a delay. Setting both `delay` and `deliver_at` is an error.
+- `extensions` (builder `extension(name, value)`) — provider-specific options for this one send, e.g. `"sqs.message-group-id"`. Prefix each name with the provider's name; a provider ignores names that are not its own.
+
+**Options a provider cannot honour.** `delay`, `deliver_at` and `ttl` change what delivery means, so a provider that does not support one must **refuse** the send with `InvalidOptions` rather than deliver it differently. `unsupported_by` is the check an adapter runs:
+
+```rust
+SendOptions::unsupported_by(&self, caps: &Capabilities) -> Option<&'static str>
+```
+
+It returns the name of the first set option that `caps` does not support (`"delay"`, `"deliver_at"`, `"ttl"`), or `None`. `on_full`, `block_on_full` and foreign `extensions` are hints and may be ignored.
+
+```rust
+use std::time::Duration;
+use ferroly::messaging::{Capabilities, SendOptions};
+
+let caps = Capabilities::new().ttl(true);
+let opts = SendOptions::new().delay(Duration::from_secs(1)).ttl(Duration::from_secs(9));
+assert_eq!(opts.unsupported_by(&caps), Some("delay"));
+assert_eq!(SendOptions::new().ttl(Duration::from_secs(9)).unsupported_by(&caps), None);
+```
 
 ### OnFull
 
@@ -407,6 +679,7 @@ pub struct ListenerOptions {
     pub retry_backoff: Backoff,        // default 100 ms doubling up to 30 s
     pub on_expired: ExpiryAction,      // default ExpiryAction::DeadLetter
     pub subscription: Option<String>,  // topic:// only; default None
+    pub filter: Option<Filter>,        // topic:// only; default None
 }
 ```
 
@@ -419,6 +692,7 @@ Per-listener configuration passed to [`add_listener`](#receiver). Use `..Default
 - `retry_backoff` — the delay between redeliveries; see [`Backoff`](#backoff).
 - `on_expired` — `ExpiryAction::DeadLetter` (move an expired message to `dead_letter`, or drop it if none is configured) or `ExpiryAction::Drop`.
 - `subscription` — for `topic://` listeners, the name of a [shared subscription](#publishsubscribe-topics).
+- `filter` — for `topic://` listeners, only messages matching this [filter](#filtering-subscriptions) are delivered to the subscription. A filter on a `chan://` listener is `InvalidOptions`.
 
 ### Backoff
 
@@ -448,6 +722,10 @@ pub trait Producer: Send + Sync {
     fn send(&self, addr: &str, msg: Message, opts: SendOptions)
         -> BoxFuture<'_, Result<(), MessagingError>>;
 
+    // Defaulted: calls `send` and returns a receipt holding the message's own id.
+    fn send_with_receipt(&self, addr: &str, msg: Message, opts: SendOptions)
+        -> BoxFuture<'_, Result<Receipt, MessagingError>>;
+
     // Defaulted: one `send` per message, stopping at the first failure.
     fn send_batch(&self, addr: &str, msgs: Vec<Message>, opts: SendOptions)
         -> BoxFuture<'_, Result<(), MessagingError>>;
@@ -470,39 +748,99 @@ bus.send(
 # }
 ```
 
-### Batch send
+### Receipts
 
-`send_batch` sends several messages to one address in order, applying the same options to each. It is **not atomic**: it stops at the first failure and returns `MessagingError::Batch(BatchFailure)`:
+`send_with_receipt` sends like `send` and returns what the provider knows about the accepted message:
 
 ```rust
-pub struct BatchFailure {
-    pub sent: usize,                 // accepted before the failure
-    pub error: Box<MessagingError>,  // why it stopped
-    pub unsent: Vec<Message>,        // the failed message first, then the rest
+#[non_exhaustive]
+pub struct Receipt {
+    pub message_id: Option<String>,  // the broker's id, or the message's own
+    pub sequence: Option<String>,    // the broker's sequence number or offset, if any
+    pub extra: Attributes,           // anything else the broker returned
 }
 ```
 
-```rust
-use ferroly::messaging::{LocalProvider, Message, MessagingError, Producer};
+Build one with `Receipt::new()` and `with_message_id`, `with_sequence`, `with_extra(name, value)`. The default implementation calls `send` and returns a receipt holding the message's own id (`msg.id()`); a backend whose broker assigns ids or offsets overrides it.
 
-# async fn ex(bus: LocalProvider) {
-let batch = vec![Message::text("a"), Message::text("b"), Message::text("c")];
-match bus.send_batch("chan://orders", batch, Default::default()).await {
-    Ok(()) => {}
-    Err(MessagingError::Batch(failure)) => {
-        eprintln!("{} sent, {} to retry: {}", failure.sent, failure.unsent.len(), failure.error);
-        // `failure.unsent` is yours again — retry or park it.
-    }
-    Err(other) => eprintln!("{other}"),
-}
+```rust
+use ferroly::messaging::{LocalProvider, Message, Producer};
+
+# async fn ex(bus: LocalProvider) -> Result<(), ferroly::messaging::MessagingError> {
+let receipt = bus
+    .send_with_receipt("chan://orders", Message::text("o").with_id("m-9"), Default::default())
+    .await?;
+assert_eq!(receipt.message_id.as_deref(), Some("m-9"));
+# Ok(())
 # }
 ```
+
+### Batch send
+
+`send_batch` sends several messages to one address, applying the same options to each. It is **not atomic**. When some messages are not accepted it returns `MessagingError::PartialBatch(BatchFailure)`, which says exactly which ones:
+
+```rust
+#[non_exhaustive]
+pub struct BatchFailure {
+    pub sent: usize,                       // how many were accepted
+    pub failures: Vec<BatchEntryFailure>,  // tried and failed, in ascending index order
+    pub unsent: Vec<Message>,              // never tried, in their original order
+}
+
+#[non_exhaustive]
+pub struct BatchEntryFailure {
+    pub index: usize,              // position in the batch that was passed in (0-based)
+    pub error: MessagingError,     // why it failed
+    pub message: Option<Message>,  // the message, when the failing operation handed it back
+}
+```
+
+| Method | Description |
+| --- | --- |
+| `BatchFailure::new(sent, failures, unsent)` | Builds one (for provider implementations); `failures` are sorted by index. |
+| `BatchFailure::first_error()` | The error of the first failed entry. |
+| `BatchFailure::into_messages()` | Every message not accepted: the failed ones that were handed back (in index order), then the ones never tried. |
+| `BatchFailure::failed()` | `failures.len() + unsent.len()`. |
+| `BatchEntryFailure::new(index, error)` | An entry failure; a message carried by `error` is moved into `message`. |
+| `BatchEntryFailure::with_message(index, error, message)` | An entry failure with the message supplied. |
+
+How much a `BatchFailure` reports depends on the provider:
+
+- **The default `send_batch`** (used by `LocalProvider`) is **sequential**: it calls `send` once per message and **stops at the first failure**. `failures` then has exactly one entry — at `index == sent` — and the rest of the batch is in `unsent`.
+- **A provider with a native batch call** tries every message and reports **every** failed entry in `failures`, with `unsent` empty.
+
+`PartialBatch` is [retryable](#error-handling) when any of its entries is. A retry loop that resends only what was not accepted:
+
+```rust
+use ferroly::messaging::{Message, MessagingError, Producer};
+
+# async fn ex(bus: &dyn Producer, mut batch: Vec<Message>) -> Result<(), MessagingError> {
+for _attempt in 0..3 {
+    match bus.send_batch("chan://orders", batch, Default::default()).await {
+        Ok(()) => return Ok(()),
+        Err(MessagingError::PartialBatch(failure)) => {
+            eprintln!("{failure}");               // "2 sent, 1 failed: …"
+            batch = failure.into_messages();      // only what was not accepted
+        }
+        Err(other) => return Err(other),
+    }
+}
+# Ok(())
+# }
+```
+
+A real retry loop would also check `is_retryable()` and back off between attempts.
 
 ## Receiver
 
 ```rust
 pub trait Receiver: Send + Sync {
+    // Defaulted: returns MessagingError::Unsupported.
     fn add_listener(&self, addr: &str, handler: Handler, opts: ListenerOptions)
+        -> BoxFuture<'_, Result<(), MessagingError>>;
+
+    // Defaulted: returns MessagingError::Unsupported.
+    fn add_delivery_listener(&self, addr: &str, handler: DeliveryHandler, opts: ListenerOptions)
         -> BoxFuture<'_, Result<(), MessagingError>>;
 
     // Defaulted: returns MessagingError::Unsupported.
@@ -515,76 +853,124 @@ pub trait Receiver: Send + Sync {
 
 `remove_listeners` removes every listener on an address and returns how many were removed. With `LocalProvider`, removed listeners take no new messages but **finish the backlog already buffered for them**. For `topic://`, the address is matched against subscription patterns literally (`topic://orders.*` removes the subscriptions registered with exactly that pattern).
 
+`add_delivery_listener` registers a [`DeliveryHandler`](#delivery-context), which receives the delivery context as well as the message.
+
+All three methods have defaults that return `MessagingError::Unsupported`,
+ which is exactly what a **publish-only** provider wants: it implements `Producer` and writes `impl Receiver for MyProvider {}`.
+
 ## Provider
 
 ```rust
 pub trait Provider: Producer + Receiver {
     fn schemes(&self) -> &[&str];                             // e.g. ["chan"]
-    fn setup(&self) -> BoxFuture<'_, Result<(), MessagingError>>;
 
+    // Defaulted: Ok(()).
+    fn setup(&self) -> BoxFuture<'_, Result<(), MessagingError>>;
     // Defaulted: does nothing.
     fn close(&self) -> BoxFuture<'_, Result<(), MessagingError>>;
+    // Defaulted: claims nothing.
+    fn capabilities(&self) -> Capabilities;
+    // Defaulted: returns MessagingError::Unsupported.
+    fn set_observer(&self, observer: Arc<dyn Observer>) -> Result<(), MessagingError>;
 }
 ```
 
-A full backend: both a [`Producer`](#producer) and a [`Receiver`](#receiver), plus the URL `schemes` it handles, a `setup` hook to connect / declare topology, and a `close` hook for a graceful shutdown.
+A full backend: both a [`Producer`](#producer) and a [`Receiver`](#receiver), plus the URL `schemes` it handles, a `setup` hook to connect / declare topology, a `close` hook for a graceful shutdown, a statement of what it supports, and a way to install an [`Observer`](#observer) through `Arc<dyn Provider>`.
 
-For [`LocalProvider`](#localprovider): `schemes()` returns `["chan", "topic", "reply"]`, `setup()` is a no-op, and `close()` is a [draining shutdown](#graceful-shutdown-and-draining) that fails with `MessagingError::Undelivered(n)` if messages were left over.
+### Capabilities
+
+```rust
+#[non_exhaustive]
+pub struct Capabilities {
+    pub delay: bool,               // SendOptions::delay
+    pub deliver_at: bool,          // SendOptions::deliver_at
+    pub ttl: bool,                 // SendOptions::ttl
+    pub priority: bool,            // message priority
+    pub ordering: bool,            // ordering by routing key
+    pub filters: bool,             // attribute filters on subscriptions
+    pub dedup: bool,               // de-duplication
+    pub delivery_context: bool,    // add_delivery_listener: delivery details, lease extension, deferred acks
+    pub native_batch: bool,        // a batch send that reports per-entry results
+    pub max_message_bytes: Option<usize>,
+    pub max_batch_len: Option<usize>,
+    pub max_attributes: Option<usize>,
+}
+```
+
+A field left `false` / `None` means "no" or "not stated". Outside the crate build one with `Capabilities::new()` and the chainable setter named after each field (`.delay(true)`, `.max_message_bytes(1024)`, …). Application code can ask before relying on a feature — `registry.capabilities_for("sqs://orders")?.delay` — and an adapter uses its own capabilities with [`SendOptions::unsupported_by`](#sendoptions).
+
+For [`LocalProvider`](#localprovider): `schemes()` returns `["chan", "topic", "reply"]`, `setup()` is a no-op, `close()` is a [draining shutdown](#graceful-shutdown-and-draining) that fails with `MessagingError::Undelivered(n)` if messages were left over, `set_observer` installs the observer (like the inherent `LocalProvider::set_observer`), and `capabilities()` claims `delay`, `deliver_at`, `ttl`, `priority`, `ordering`, `filters`, `dedup` and `delivery_context`, with no native batch and no size limits.
 
 ### Implementing a provider
 
 `Provider` is the extension point for external brokers — Kafka, NATS, SQS, Google Pub/Sub. No such backend ships with ferroly; **durable backends are out of scope for this crate** and belong in adapter crates that implement these traits. Application code written against `Arc<dyn Provider>` (or a [`ProviderRegistry`](#providerregistry)) then does not change when the backend does.
 
-The traits are object-safe (every method returns a [`BoxFuture`](#boxfuture)), and only four methods are required: `send`, `add_listener`, `schemes` and `setup`. What an adapter is expected to do:
+The traits are object-safe (every method returns a [`BoxFuture`](#boxfuture)), and only two methods are required: `Producer::send` and `Provider::schemes`. What an adapter is expected to do:
 
 - **Addresses.** Claim one or more schemes in `schemes()` (`"kafka"`, `"nats"`, `"sqs"`); use `split_address(addr)` to separate the scheme from the destination name.
-- **Sending.** Map `Message::body`, `Message::routing_key` (partition / group key) and the [header conventions](#metadata-conventions) onto the broker's native fields. Honour `SendOptions` where the broker can (`ttl`, `delay`) and ignore what it cannot. Report transport and protocol failures with `MessagingError::backend(err)`. Where it still holds the message, hand it back in the error.
-- **Receiving.** Drive the `Handler` and translate its `Ack` into the broker's acknowledgement: `Ok` → ack/commit, `Retry` → nack/redeliver (bounded by `max_delivery_attempts`, then `dead_letter`), `Reject` → discard. Set `Message::delivery_count` from the broker's redelivery counter. Contain handler panics and treat them as `Retry`.
-- **Lifecycle.** Connect and declare topology in `setup`; flush, drain and disconnect in `close`. Override `send_batch` if the broker has a native batch call, and `remove_listeners` if it can unsubscribe.
+- **Sending.** Map `Message::properties` and `Message::attributes` onto the broker's native fields — or, for a broker with one flat attribute map, use [`to_wire_attributes()` / `from_wire`](#the-wire-form) — plus `Message::body`, `Message::routing_key` (partition / group key) and `SendOptions`.
+- **Options.** A provider must **refuse** a send whose options it cannot honour when they change what delivery means — `delay`, `deliver_at`, `ttl` — by returning `InvalidOptions` (use `SendOptions::unsupported_by`). It may ignore hints (`on_full`, `block_on_full`) and `extensions` that are not its own.
+- **Failures.** Return `MessagingError::refused(…)` / `refused_transient(…)` (handing the message back) when one message is not accepted, and `backend(…)` / `backend_transient(…)` for transport failures. See [error handling](#error-handling).
+- **Receipts and batches.** Override `send_with_receipt` if the broker assigns ids or offsets, and `send_batch` if it has a native batch call — reporting every failed entry in [`BatchFailure::failures`](#batch-send).
+- **Receiving.** Drive the `Handler` and translate its `Ack` into the broker's acknowledgement: `Ok` → ack/commit, `Retry` → nack/redeliver (bounded by `max_delivery_attempts`, then `dead_letter`), `RetryAfter(d)` → nack with a redelivery delay (a visibility-timeout change), `Reject` → discard, `DeadLetter` → move to the dead-letter destination now, `Pending` → wait for the `Acker`. Set `Message::delivery_count` from the broker's redelivery counter. Contain handler panics and treat them as `Retry`. When dead-lettering, add the four `dead-letter-*` attributes. Override `remove_listeners` if the broker can unsubscribe.
+- **Delivery context.** To support `add_delivery_listener`, build one [`Delivery`](#delivery-context) per delivery: `Delivery::new(message, info, control)` with a `DeliveryInfo` (`DeliveryInfo::new(addr).with_attempt(n).with_enqueued_at(t).with_sequence(s)`) and an `Arc<dyn DeliveryControl>` of your own. `extend` renews the broker lease, `set_dead_letter_description` stores the text for a later dead-letter, and `resolve(ack)` hands a deferred `Ack` back to the code that is waiting on a `Pending` delivery (a one-shot channel works well; return `true` only for the call that settled it). Keep the receiving end in the consumer and the sending end inside the control, so that when every `Acker` is dropped unsettled the consumer sees the channel close and retries. A plain `Handler` is adapted by calling it with `delivery.message` and treating `Pending` as `Retry`. Claim `delivery_context` in `capabilities()`.
+- **Capabilities and observability.** Report what the backend supports in `capabilities()`; accept an observer in `set_observer` and fire its hooks (at least `on_published` / `on_send_failed`).
+- **Lifecycle.** Connect and declare topology in `setup`; flush, drain and disconnect in `close`. Both default to doing nothing.
+- **Publish-only providers** implement `Producer`, write `impl Receiver for X {}`, and implement `Provider::schemes` (and usually `capabilities`).
 
 The semantics a backend actually provides — durability, ordering, delivery guarantee — are the backend's; the trait does not promise more than the underlying broker does.
 
+A complete publish-only provider:
+
 ```rust
 use ferroly::messaging::{
-    BoxFuture, Handler, ListenerOptions, Message, MessagingError, Producer, Provider, Receiver,
-    SendOptions,
+    BoxFuture, Capabilities, Message, MessagingError, Producer, Provider, Receiver, SendOptions,
 };
 
-struct NatsProvider { /* client handle */ }
+struct QueueClient { /* the broker's SDK client */ }
 
-impl Producer for NatsProvider {
-    fn send(&self, addr: &str, msg: Message, _opts: SendOptions)
+impl Producer for QueueClient {
+    fn send(&self, addr: &str, msg: Message, opts: SendOptions)
         -> BoxFuture<'_, Result<(), MessagingError>>
     {
-        let subject = ferroly::messaging::split_address(addr).1.to_string();
+        let addr = addr.to_string();
         Box::pin(async move {
-            self.publish(&subject, &msg).await.map_err(MessagingError::backend)
+            if let Some(option) = opts.unsupported_by(&self.capabilities()) {
+                return Err(MessagingError::InvalidOptions(format!("{option} is not supported")));
+            }
+            if msg.body.len() > 256 * 1024 {
+                return Err(MessagingError::refused("message too large", addr, msg));
+            }
+            let queue = ferroly::messaging::split_address(&addr).1.to_string();
+            let group = opts.extensions.get_str("queue.group").map(str::to_string);
+            match self.put(&queue, msg.to_wire_attributes(), &msg.body, group).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(MessagingError::refused_transient(e, addr, msg))   // throttled
+                }
+                Err(e) => Err(MessagingError::backend_transient(e)),
+            }
         })
     }
 }
 
-impl Receiver for NatsProvider {
-    fn add_listener(&self, addr: &str, handler: Handler, opts: ListenerOptions)
-        -> BoxFuture<'_, Result<(), MessagingError>>
-    {
-        let subject = ferroly::messaging::split_address(addr).1.to_string();
-        Box::pin(async move { self.subscribe(subject, handler, opts).await })
+impl Receiver for QueueClient {}   // publish-only: add_listener is Unsupported
+
+impl Provider for QueueClient {
+    fn schemes(&self) -> &[&str] { &["queue"] }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::new().max_message_bytes(256 * 1024)
     }
 }
-
-impl Provider for NatsProvider {
-    fn schemes(&self) -> &[&str] { &["nats"] }
-    fn setup(&self) -> BoxFuture<'_, Result<(), MessagingError>> { Box::pin(async { Ok(()) }) }
-}
-# impl NatsProvider {
-#     async fn publish(&self, _: &str, _: &Message) -> Result<(), std::io::Error> { Ok(()) }
-#     async fn subscribe(&self, _: String, _: Handler, _: ListenerOptions) -> Result<(), MessagingError> { Ok(()) }
+# impl QueueClient {
+#     async fn put(&self, _: &str, _: ferroly::messaging::Attributes, _: &[u8], _: Option<String>)
+#         -> Result<(), std::io::Error> { Ok(()) }
 # }
 ```
 
 ### ProviderRegistry
 
-Routes sends and listeners to the provider that owns an address's scheme, so one handle can front several backends. It implements `Producer` and `Receiver` itself.
+Routes sends and listeners to the provider that owns an address's scheme, so one handle can front several backends. It implements `Producer` and `Receiver` itself, forwarding every method (including `send_with_receipt` and `send_batch`) to the provider for the address.
 
 ```rust
 use std::sync::Arc;
@@ -596,6 +982,7 @@ use ferroly::messaging::{
 let registry = ProviderRegistry::new();
 registry.register(Arc::new(LocalProvider::new("local")))?;   // chan://, topic://, reply://
 // registry.register(Arc::new(nats_provider))?;              // nats://
+registry.setup_all().await?;
 
 registry
     .add_listener("chan://orders", handler(|_m| async { Ack::Ok }), Default::default())
@@ -603,6 +990,9 @@ registry
 registry
     .send("chan://orders", Message::text("o-1"), Default::default())
     .await?;
+assert!(registry.capabilities_for("chan://orders")?.delay);
+
+registry.close_all().await?;
 # Ok(())
 # }
 ```
@@ -612,6 +1002,11 @@ registry
 | `register(&self, Arc<dyn Provider>) -> Result<(), MessagingError>` | Register a provider for every scheme it reports; `InvalidOptions` (registering nothing) if a scheme is already taken. |
 | `provider_for(&self, addr) -> Result<Arc<dyn Provider>, MessagingError>` | The provider for an address; `InvalidAddress` if the address has no scheme or an unregistered one. |
 | `schemes(&self) -> Vec<String>` | The registered schemes, sorted. |
+| `providers(&self) -> Vec<Arc<dyn Provider>>` | The registered providers, each once (a provider registered under several schemes is listed a single time), in no particular order. |
+| `capabilities_for(&self, addr) -> Result<Capabilities, MessagingError>` | The capabilities of the provider that handles `addr`. |
+| `setup_all(&self).await -> Result<(), MessagingError>` | Calls `setup` on every provider; all are attempted, the first error is returned. |
+| `close_all(&self).await -> Result<(), MessagingError>` | Calls `close` on every provider; all are attempted, the first error is returned. |
+| `set_observer(&self, Arc<dyn Observer>) -> Result<(), MessagingError>` | Installs the observer on every provider that accepts one; providers that return `Unsupported` are skipped, the first other error is returned. |
 
 Unlike `LocalProvider` on its own, the registry needs a scheme on every address.
 
@@ -740,7 +1135,7 @@ How subscriptions work:
 
 - **Each `add_listener` on a topic is its own subscription** with its own buffer, consumer, retry counter and dead-letter routing. One subscriber failing or falling behind does not affect the others.
 - **Shared subscriptions.** Listeners that set the same [`ListenerOptions::subscription`](#listeneroptions) name on the same pattern form *one* subscription and compete for its messages (with routing-key affinity, as for a queue) — an in-process consumer group. A listener with no name is always a subscription of its own.
-- **The concrete topic** is stamped on every copy in the [`topic` header](#metadata-conventions) (`msg.topic()`), so a wildcard subscriber can tell which topic matched.
+- **The concrete topic** is stamped on every copy in the [`topic` property](#properties) (`msg.topic()`), so a wildcard subscriber can tell which topic matched.
 - **No subscribers is not an error.** Publishing to a topic nothing subscribes to returns `Ok(())`; the message is reported through `on_dropped(…, DropReason::NoSubscribers)`.
 - **Backpressure is per subscription.** With `OnFull::Reject` (the default) or `BlockFor`, a subscription whose buffer is full *misses* that message — reported through `on_dropped(…, DropReason::BufferFull)` — while the others still receive it, and `send` returns `Ok(())`. Use `OnFull::Block` if every subscription must get every message.
 - Subscriptions only see messages published **after** they were added; there is no replay.
@@ -756,6 +1151,75 @@ Topics are dot-separated tokens (`orders.eu.created`). In a subscription pattern
 | anything else | itself, literally | `orders.created` |
 
 Wildcards belong in subscriptions only: publishing to `topic://orders.*` is `MessagingError::InvalidAddress`, as is subscribing with an empty token or a `>` that is not last. `topic_matches(pattern, topic)` exposes the matching rule.
+
+### Filtering subscriptions
+
+A `topic://` listener can take only the messages that match a **filter** on their properties and attributes. Set [`ListenerOptions::filter`](#listeneroptions):
+
+```rust
+#[non_exhaustive]
+pub enum Filter {
+    Exists(String),               // the name is present
+    Eq(String, AttrValue),        // the value equals this one
+    In(String, Vec<AttrValue>),   // the value equals one of these
+    Prefix(String, String),       // the value is a string starting with this
+    Gt(String, f64),              // the value is a number >
+    Gte(String, f64),             //                       >=
+    Lt(String, f64),              //                       <
+    Lte(String, f64),             //                       <=
+    And(Vec<Filter>),             // all match (an empty list matches everything)
+    Or(Vec<Filter>),              // any matches (an empty list matches nothing)
+    Not(Box<Filter>),             // the inner filter does not match
+}
+```
+
+Build one with the constructors — `Filter::exists(name)`, `eq(name, value)`, `one_of(name, values)`, `prefix(name, prefix)`, `gt` / `gte` / `lt` / `lte(name, n)`, `all(filters)`, `any(filters)`, `not(filter)` — and test one by hand with `filter.matches(&msg)`.
+
+```rust
+use ferroly::messaging::{handler, Ack, Filter, ListenerOptions, LocalProvider, Message, Producer, Receiver};
+
+# async fn ex() {
+let bus = LocalProvider::new("bus");
+bus.add_listener(
+    "topic://orders.*",
+    handler(|m: Message| async move {
+        println!("big EU order: {}", m.body_str());
+        Ack::Ok
+    }),
+    ListenerOptions {
+        filter: Some(Filter::all([
+            Filter::eq("region", "eu"),
+            Filter::gte("amount", 100.0),
+        ])),
+        ..Default::default()
+    },
+)
+.await
+.unwrap();
+
+let order = Message::text("o-1").with_attribute("region", "eu").with_attribute("amount", 250);
+bus.send("topic://orders.created", order, Default::default()).await.unwrap();
+# }
+```
+
+The rules:
+
+- **Lookup.** A name is looked up with [`Message::lookup`](#the-wire-form): a set property under its wire name (`subject`, `event-type`, `priority`, …) first, then the first application attribute with that name. The `topic` property is stamped on the message only *after* routing, so a filter cannot see it — use the subscription pattern for that.
+- **Missing names.** A missing name makes every leaf filter false (`Exists`, `Eq`, `In`, `Prefix` and the comparisons). So `Filter::not(Filter::exists("x"))` is true when `x` is missing.
+- **Equality.** Two numbers (`Int` or `Float`, in any combination) compare as numbers, so `Int(5)` equals `Float(5.0)`. Anything else must be the same variant with the same value: `Str("5")` does **not** equal `Int(5)`.
+- **Prefix** matches only `Str` values.
+- **Comparisons** need a number; a non-number value, or a `NaN` on either side, is false.
+- **Topic subscriptions only.** A filter on a `chan://` listener is rejected with `InvalidOptions`.
+- **Shared subscriptions agree on one filter.** Listeners that share a [subscription name](#publishsubscribe-topics) on a pattern form one subscription with one filter; adding a listener with a different filter is `InvalidOptions`.
+- **Every subscription filtered out.** When at least one subscription's pattern matched but every such subscription's filter excluded the message, `send` still returns `Ok(())`, and the message is reported through `on_dropped(…, DropReason::Filtered)` (no pattern matching at all is still `DropReason::NoSubscribers`).
+
+`LocalProvider` evaluates filters in process. For adapter authors, the same filters map onto broker-side features:
+
+| Broker | Mapping |
+| --- | --- |
+| AWS SNS filter policies | `Eq` / `In` → a list of exact values; `Prefix` → `{"prefix": …}`; comparisons → `{"numeric": [">=", n]}`; `Exists` / `Not(Exists)` → `{"exists": true/false}`; `And` → several keys in one policy; `Or` → `$or`. |
+| Google Pub/Sub subscription filters | `Eq` → `attributes.name = "v"`; `Exists` → `attributes:name`; `Prefix` → `hasPrefix(attributes.name, "p")`; `And` / `Or` / `Not` → `AND` / `OR` / `NOT`. Pub/Sub attributes are strings, so numeric comparisons have no equivalent. |
+| Azure Service Bus correlation filters | `Eq` on system properties (`correlation-id`, `subject`, `content-type`, `reply-to`, `message-id`) and on application properties, combined with `And`; anything richer needs a SQL filter. |
 
 ### Backpressure
 
@@ -826,6 +1290,24 @@ Stated precisely:
 - **Per-key order across competing listeners.** Messages with the same routing key go to the same listener, so with serial listeners they are handled in send order — retries included — **as long as the destination's set of listeners does not change**. Adding or removing a listener changes the key-to-listener mapping; messages already buffered stay where they are, so around such a change two messages with the same key can be handled by different listeners, in either order.
 - **No guarantee** for: messages *without* a routing key on a destination with several listeners (they are spread round-robin); listeners with `concurrency: Some(n)` where `n > 1`; and messages sent concurrently from several tasks (their acceptance order is whatever order the sends complete in).
 - **Deliberate reordering:** a [delayed](#delayed-delivery) message is ordered by when it becomes due, not when it was sent; `OnFull::DropOldest` removes the oldest message; a dead-lettered or expired message leaves its queue.
+- **Priority:** a message with a [priority](#priority) above 0 overtakes lower-priority messages already buffered for the same listener, so per-key order holds only among messages of equal priority.
+
+### Priority
+
+`Message::with_priority(p)` (0, the default, to 255) lets a message overtake others waiting in a listener's buffer. When a message becomes ready — on acceptance, or when its delay is up — it is placed **ahead of every buffered message of lower priority and behind every one of the same or higher priority**, so messages of equal priority stay first-in, first-out.
+
+```rust
+use ferroly::messaging::{LocalProvider, Message, Producer};
+
+# async fn ex(bus: LocalProvider) {
+bus.send("chan://jobs", Message::text("batch report"), Default::default()).await.unwrap();
+bus.send("chan://jobs", Message::text("page the on-call").with_priority(9), Default::default())
+    .await
+    .unwrap();   // handled before the report if the report is still buffered
+# }
+```
+
+Priority only reorders what is **buffered**: it does not interrupt a message a handler is already working on (or backing off on), and it does not move messages between listeners. Priority 0 messages are never moved ahead of anything.
 
 ### Ack/redelivery & dead-lettering
 
@@ -839,7 +1321,18 @@ When a handler returns [`Ack::Retry`](#ack) (or panics):
 
 The dead-letter move waits for room in the destination's buffer rather than dropping under load. If the dead-letter destination has no listener, the message is lost and that is reported as `on_dead_letter(to_dlq = false)`. The message keeps its `delivery_count` when it arrives in the dead-letter queue, so the handler there can see how many attempts were made.
 
-`Ack::Reject` skips all of this and discards immediately, firing `on_nack(requeue = false)`.
+`Ack::Reject` skips all of this and discards immediately, firing `on_nack(requeue = false)`. `Ack::DeadLetter` skips the remaining attempts and goes to step 3 at once (firing `on_nack(requeue = false)`), and `Ack::RetryAfter(d)` is a `Retry` that waits `d` instead of the backoff.
+
+**Why it was dead-lettered.** Before a message is moved (or dropped for want of a destination) the provider adds four application attributes; the names are constants in `headers`:
+
+| Attribute | Type | Value |
+| --- | --- | --- |
+| `dead-letter-reason` (`DEAD_LETTER_REASON`) | string | `max-delivery-attempts` (retries exhausted), `rejected` (the handler returned `Ack::DeadLetter`, or an `Acker` called `dead_letter`), or `expired` (the TTL ran out, with `ExpiryAction::DeadLetter`) |
+| `dead-letter-source` (`DEAD_LETTER_SOURCE`) | string | the canonical address it was consumed from, e.g. `chan://orders` |
+| `dead-letter-attempts` (`DEAD_LETTER_ATTEMPTS`) | int | how many delivery attempts it had |
+| `dead-letter-description` (`DEAD_LETTER_DESCRIPTION`) | string | only when there is one: the text set with `Delivery::dead_letter_description` / `Acker::dead_letter`, or — for exhausted retries — the panic message of a handler that panicked on its last attempt |
+
+The message keeps its `delivery_count` unchanged.
 
 ```rust
 use std::time::Duration;
@@ -894,6 +1387,8 @@ A message that is already inside a handler when its TTL passes is not interrupte
 
 [`SendOptions::delay`](#sendoptions) holds a message back: it is accepted (and counts against the buffer and towards `pending()`) immediately, but its listener only sees it once the delay has passed. Delayed messages are delivered in the order they become due.
 
+[`SendOptions::deliver_at`](#sendoptions) schedules a message for an **absolute time** instead (a `SystemTime`). It behaves like a delay of `at - now`, measured when the message is accepted; a time in the past means "now". Setting both `delay` and `deliver_at` on one send is `InvalidOptions`.
+
 ```rust
 use std::time::Duration;
 use ferroly::messaging::{LocalProvider, Message, Producer, SendOptions};
@@ -906,6 +1401,12 @@ bus.send(
 )
 .await
 .unwrap();
+
+// The same, at a fixed time.
+let at = std::time::SystemTime::now() + Duration::from_secs(60);
+bus.send("chan://reminders", Message::text("follow up"), SendOptions::new().deliver_at(at))
+    .await
+    .unwrap();
 # }
 ```
 
@@ -913,7 +1414,17 @@ The delay lives in memory only: a delayed message does not survive a restart, an
 
 ### De-duplication
 
-With [`LocalOptions::dedup_window`](#localprovider) set to `n > 0`, the provider remembers the last `n` message ids ([`headers::MESSAGE_ID`](#metadata-conventions)) accepted **per destination**. A `send` whose message id is still in that window is treated as a duplicate: it returns `Ok(())`, the message is not delivered, and `on_dropped(…, DropReason::Duplicate)` fires.
+With [`LocalOptions::dedup_window`](#localprovider) set to `n > 0`, the provider remembers the last `n` **de-duplication keys** accepted **per destination**. A message's key is its `dedup_key` property ([`with_dedup_key`](#properties)) or, when that is unset, its message id. A `send` whose key is still in that window is treated as a duplicate: it returns `Ok(())`, the message is not delivered, and `on_dropped(…, DropReason::Duplicate)` fires.
+
+Use a `dedup_key` when the logical identity of a message is not its id — for example two sends with fresh ids that both describe "order 17 was paid":
+
+```rust
+use ferroly::messaging::Message;
+
+let first = Message::text("paid").with_new_id().with_dedup_key("order-17/paid");
+let again = Message::text("paid").with_new_id().with_dedup_key("order-17/paid");   // a duplicate
+# let _ = (first, again);
+```
 
 ```rust
 use ferroly::messaging::{LocalOptions, LocalProvider, Message, Producer};
@@ -930,9 +1441,9 @@ bus.send("chan://orders", again, Default::default()).await.ok();
 # }
 ```
 
-- Messages **without** an id are never de-duplicated.
-- The window is bounded by **count**, not time: once `n` newer ids have been accepted for the destination, an old id is forgotten.
-- A send that fails (`NoListeners`, `BufferFull`, …) does not record its id, so retrying the message you were handed back works.
+- Messages with **neither** a dedup key nor an id are never de-duplicated.
+- The window is bounded by **count**, not time: once `n` newer keys have been accepted for the destination, an old key is forgotten.
+- A send that fails (`NoListeners`, `BufferFull`, …) does not record its key, so retrying the message you were handed back works.
 - This de-duplicates *sends*. It does not make handling exactly-once: a redelivery after `Retry` reaches the handler again by design.
 
 ### Request/reply
@@ -962,12 +1473,12 @@ assert_eq!(reply.body_str(), "price of sku-1: 42");
 
 What `request` does:
 
-- gives the message a [message id and correlation id](#metadata-conventions) if it has none;
-- sets its `reply-to` header to a private `reply://…` inbox;
+- gives the message a [message id and correlation id](#properties) if it has none;
+- sets its `reply_to` property to a private `reply://…` inbox;
 - gives it a **TTL equal to the timeout**, so a request still waiting in a buffer when the caller gives up expires instead of being handled for nobody;
 - waits up to `timeout` for the reply, then returns `MessagingError::RequestTimeout(addr)`.
 
-On the answering side, `responder(f)` sends `f`'s `Ok(reply)` to the request's reply address — marked with [`in_reply_to`](#metadata-conventions), so the correlation id and trace context carry over — and acks. `Err(ack)` retries or rejects the request without replying. To reply by hand, call `bus.reply(&request, reply)` from a handler holding a [weak handle](#handle-lifetime). A reply whose requester is no longer waiting fails with `NoListeners`; `responder` ignores that.
+On the answering side, `responder(f)` sends `f`'s `Ok(reply)` to the request's reply address — marked with [`in_reply_to`](#properties), so the correlation id and trace context carry over — and acks. `Err(ack)` retries or rejects the request without replying. To reply by hand, call `bus.reply(&request, reply)` from a handler holding a [weak handle](#handle-lifetime). A reply whose requester is no longer waiting fails with `NoListeners`; `responder` ignores that.
 
 Requests work over `topic://` too; the first reply wins.
 
@@ -1015,6 +1526,8 @@ Each listener is a task serving its own buffer. If a listener is removed, or its
 
 ```rust
 pub trait Observer: Send + Sync {
+    fn on_published(&self, addr: &str, receipt: &Receipt) {}
+    fn on_send_failed(&self, addr: &str, error: &MessagingError) {}
     fn on_send(&self, addr: &str, msg: &Message) {}
     fn on_receive(&self, addr: &str, msg: &Message) {}
     fn on_ack(&self, addr: &str, msg: &Message) {}
@@ -1028,12 +1541,14 @@ pub trait Observer: Send + Sync {
 }
 ```
 
-Hooks for every step of a message's life. Every method has a default no-op body, so you only override what you care about. Install one with [`LocalProvider::set_observer`](#localprovider).
+Hooks for every step of a message's life. Every method has a default no-op body, so you only override what you care about. Install one with [`LocalProvider::set_observer`](#localprovider), with `Provider::set_observer` through an `Arc<dyn Provider>`, or on every provider of a registry with [`ProviderRegistry::set_observer`](#providerregistry).
 
 `addr` is the canonical address of the listener's buffer (`chan://orders`, `topic://orders.*`) — a stable value to use as a metrics label. Callbacks run synchronously on the task that caused the event and never while a provider lock is held; keep them short and non-blocking. A panic inside a callback is caught and discarded.
 
 | Hook | Fired when | Metric |
 | --- | --- | --- |
+| `on_published` | a `send` was accepted by the provider; **once per send**, however many topic subscriptions got a copy. `addr` is the address passed to `send`; `receipt` is what [`send_with_receipt`](#receipts) would return | published |
+| `on_send_failed` | a `send` failed; `error.message()` is the message when it was handed back | send failures |
 | `on_send` | a message has been **accepted** into a listener's buffer (once per copy for a topic; also for dead-letter moves) | enqueued |
 | `on_receive` | a message is about to be handed to a handler; once per delivery attempt | delivered |
 | `on_ack` | the handler returned [`Ack::Ok`](#ack) | acked |
@@ -1052,6 +1567,7 @@ pub enum DropReason {
     Evicted,        // displaced by a send with OnFull::DropOldest
     Duplicate,      // same message id within the de-duplication window
     NoSubscribers,  // published to a topic with no matching subscription
+    Filtered,       // matching subscriptions existed, but every one's filter excluded it
     BufferFull,     // a topic subscription had no room for its copy
     Shutdown,       // the provider stopped or was dropped first
 }
@@ -1119,7 +1635,8 @@ impl LogObserver {
 }
 ```
 
-An [`Observer`](#observer) that emits structured logs through [`ferroly::log`](log.md): `debug` on send/receive/ack, `warn` on nack, dead-letter, expiry and drop, and `error` on a handler panic, with fields such as `addr`, `bytes`, `delivery`, `requeue`, `dead_lettered`, `dropped`, `reason` and `panic`. It is the zero-code way to get message-level visibility — just hand it a [`Logger`](log.md#logger).
+An [`Observer`](#observer) that emits structured logs through [`ferroly::log`](log.md): `debug` on publish/send/receive/ack, `warn` on a failed send, nack, dead-letter, expiry and drop, and `error` on a handler panic, with fields such as `addr`, `message_id`, `error`, `retryable`, `bytes`, `delivery`, `requeue`, `dead_lettered`, `dropped`, `reason` and `panic`.
+ It is the zero-code way to get message-level visibility — just hand it a [`Logger`](log.md#logger).
 
 ```rust
 #[cfg(feature = "log")]
@@ -1167,7 +1684,7 @@ use ferroly::messaging::{
     handler, Ack, ListenerOptions, LocalProvider, Message, Producer, Receiver,
 };
 
-#[derive(ferroly::codec::Decode)]
+#[derive(ferroly::codec::Encode, ferroly::codec::Decode)]
 struct Order { id: u32, total: u64 }
 
 #[tokio::main]
@@ -1217,7 +1734,6 @@ async fn main() {
     let report = bus.shutdown(Duration::from_secs(10)).await;
     assert!(report.is_clean());
 }
-# mod _d { #[derive(ferroly::codec::Encode)] struct Order { id: u32, total: u64 } }
 ```
 
 ## Error handling
@@ -1231,11 +1747,19 @@ pub enum MessagingError {
     SendTimeout(Rejected),      // the buffer stayed full for the whole OnFull::BlockFor wait
     RequestTimeout(String),     // a request received no reply in time (the address)
     InvalidAddress(String),     // malformed address, unsupported scheme, or wrong kind for the operation
-    InvalidOptions(String),     // e.g. buffer_size: 0
+    InvalidOptions(String),     // e.g. buffer_size: 0, or an option the provider cannot honour
     Unsupported(String),        // the provider does not implement the operation
     Undelivered(usize),         // shutdown left this many messages undelivered
-    Batch(BatchFailure),        // a batch stopped part-way
-    Backend { source: Box<dyn Error + Send + Sync> },  // a failure from an external backend
+    PartialBatch(BatchFailure), // some messages of a batch were not accepted
+    Backend {                   // a failure from an external backend
+        source: Box<dyn Error + Send + Sync>,
+        transient: bool,
+    },
+    Refused {                   // a backend refused one message and hands it back
+        source: Box<dyn Error + Send + Sync>,
+        rejected: Rejected,
+        transient: bool,
+    },
 }
 
 pub struct Rejected {
@@ -1244,17 +1768,18 @@ pub struct Rejected {
 }
 ```
 
-`MessagingError` derives ferroly's error machinery (via `ferroly_derive::FerrolyError`) — it implements `std::error::Error` and `Display`.
+`MessagingError` derives ferroly's error machinery (via `ferroly_derive::FerrolyError`) — it implements `std::error::Error` and `Display`. `Backend` and `Refused` report their backend error through `source()`. Because `Backend` and `Refused` have named fields, match them with `{ .. }` (`MessagingError::Backend { source, .. }`).
 
-**Rejected sends hand the message back.** The four send-side variants carry a `Rejected`: the destination plus the message that was not accepted. Recover it instead of losing it:
+**Rejected sends hand the message back.** The four send-side variants and `Refused` carry a `Rejected`: the destination plus the message that was not accepted. Recover it instead of losing it:
 
 | Method | Description |
 | --- | --- |
 | `MessagingError::into_message(self) -> Option<Message>` | Take the rejected message back. |
+| `MessagingError::take_message(&mut self) -> Option<Message>` | Take it back, leaving the error in place (to log or wrap it afterwards). |
 | `MessagingError::message(&self) -> Option<&Message>` | Look at it without consuming the error. |
 | `MessagingError::destination(&self) -> Option<&str>` | The destination the operation was addressed to. |
+| `MessagingError::is_retryable(&self) -> bool` | Whether the same operation may succeed if tried again later. |
 | `Rejected::into_message(self) -> Option<Message>` | The same, on the payload. |
-| `MessagingError::backend(err)` | Wrap a backend's own error (for provider implementations). |
 
 ```rust
 use ferroly::messaging::{LocalProvider, Message, Producer};
@@ -1262,8 +1787,10 @@ use ferroly::messaging::{LocalProvider, Message, Producer};
 # async fn ex(bus: LocalProvider, parked: &mut Vec<Message>) {
 if let Err(error) = bus.send("chan://orders", Message::text("o-1"), Default::default()).await {
     eprintln!("send failed: {error}");
-    if let Some(msg) = error.into_message() {
-        parked.push(msg); // retry later
+    if error.is_retryable() {
+        if let Some(msg) = error.into_message() {
+            parked.push(msg); // retry later
+        }
     }
 }
 # }
@@ -1271,10 +1798,80 @@ if let Err(error) = bus.send("chan://orders", Message::text("o-1"), Default::def
 
 `Rejected::message` is `None` only when the failing operation carried no message (for example `add_listener` on a stopped provider returns `Closed`).
 
+**Transient or permanent.** `is_retryable()` is `true` for `BufferFull`, `SendTimeout`, and for `Backend` / `Refused` built as transient; `true` for `PartialBatch` when at least one of its entries is retryable; `false` for everything else. With the `errutils` feature, the root `ferroly::Error` classifies messaging errors the same way: `BufferFull` / `SendTimeout` / `Closed` and transient `Backend` / `Refused` are `Unavailable`, `NoListeners` is `NotFound`, `RequestTimeout` is `Timeout`, `InvalidAddress` / `InvalidOptions` are `InvalidInput`, `Unsupported` is `Unsupported`, the rest `Unknown`.
+
+**For provider implementations**, four constructors build the backend variants:
+
+| Constructor | Variant | Use it for |
+| --- | --- | --- |
+| `MessagingError::backend(err)` | `Backend { transient: false }` | a transport or protocol failure that will repeat (bad credentials, a missing queue) |
+| `MessagingError::backend_transient(err)` | `Backend { transient: true }` | an outage, a timeout, a dropped connection |
+| `MessagingError::refused(err, addr, msg)` | `Refused { transient: false }` | the broker will never take this message (too large, invalid) — the message is handed back |
+| `MessagingError::refused_transient(err, addr, msg)` | `Refused { transient: true }` | the broker will not take it *now* (throttled) — the message is handed back |
+
+Prefer `refused*` whenever the adapter still holds the message, so the caller never loses it.
+
 - [`send`](#producer) to a queue returns `NoListeners` if nothing is listening, `BufferFull`/`SendTimeout` per the [backpressure policy](#backpressure), and `Closed` if the provider is draining or stopped.
 - [`send`](#producer) to a topic returns `Ok(())` even if some or all subscriptions did not take the message; see [topics](#publishsubscribe-topics).
+- [`send_batch`](#batch-send) returns `PartialBatch` with the detail of what was and was not accepted.
 - [`add_listener`](#receiver) returns `InvalidOptions`, `InvalidAddress`, or `Closed`.
 - Redelivery and dead-letter moves happen inside the provider and cannot be returned to a caller. A dead-letter move that fails is reported through [`Observer::on_dead_letter`](#observer) with `to_dlq = false`. Configure the DLQ listener before you start producing, and watch that hook.
+
+## Migrating from 0.4
+
+0.5 changes the shape of several messaging types. Most code needs only the
+renames below; the behaviour changes are listed after the tables.
+
+### `Message`
+
+| 0.4 | 0.5 |
+|---|---|
+| `msg.headers` (`codec::Value`) | `msg.attributes` (`Attributes`) for application data; `msg.properties` (`Properties`) for system metadata |
+| `msg.with_header(k, v)` | `msg.with_attribute(k, v)` |
+| `msg.set_header(k, v)` | `msg.set_attribute(k, v)` |
+| `msg.header(k)` → `Option<&Value>` | `msg.attribute(k)` → `Option<&AttrValue>` |
+| `msg.header_str(k)` | `msg.attribute_str(k)` |
+| `msg.with_header(headers::MESSAGE_ID, id)` | `msg.with_id(id)` (and likewise `with_correlation_id`, `with_reply_to`, …) |
+| `msg.header_str(headers::TOPIC)` | `msg.topic()` |
+| `Message { body, ..Default::default() }` | `Message::new(body)` — `Message` is `#[non_exhaustive]` |
+| a `u64` header value | cast to `i64`: `with_attribute("n", n as i64)` |
+| nested / array header values | not supported; encode into the body or a string attribute |
+| `msg.decode::<T>()` is always JSON | uses `content_type` when the codec knows it, else JSON |
+
+### Acknowledgements and errors
+
+| 0.4 | 0.5 |
+|---|---|
+| `match ack { Ack::Ok => …, Ack::Retry => …, Ack::Reject => … }` | add a wildcard arm; `Ack` is `#[non_exhaustive]` and has `RetryAfter`, `DeadLetter`, `Pending` |
+| `MessagingError::Batch(f)` | `MessagingError::PartialBatch(f)` |
+| `f.error` | `f.first_error()` or `f.failures[i].error` |
+| `f.unsent` (failed message first, then the rest) | `f.failures[i].message` for failed entries, `f.unsent` for those never tried; `f.into_messages()` for all of them |
+| `MessagingError::Backend { source }` (pattern) | `MessagingError::Backend { source, .. }` |
+| a backend error that loses the message | `MessagingError::refused(err, addr, msg)` |
+| a provider ignores an unsupported `delay` / `ttl` | it must return `InvalidOptions` (`SendOptions::unsupported_by`) |
+
+### Providers
+
+| 0.4 | 0.5 |
+|---|---|
+| a publish-only provider stubs `add_listener` | `impl Receiver for P {}` |
+| `Provider::setup` is required | optional (defaults to `Ok(())`) |
+| de-duplication is by message id | by `dedup_key`, then message id |
+
+Behaviour changes to check:
+
+- **`Message::decode`** uses the message's content type when the codec knows it
+  (JSON, XML, YAML, TOML) and falls back to JSON. `Message::json` now sets the
+  content type to `application/json`.
+- **Providers must refuse what they cannot honour.** A provider that cannot do
+  `delay`, `deliver_at` or `ttl` returns `InvalidOptions` instead of delivering
+  the message differently. `LocalProvider` supports all three.
+- **Dead-lettered messages carry four extra attributes**
+  (`dead-letter-reason`, `-source`, `-attempts`, `-description`); their
+  `delivery_count` is unchanged.
+- **Priority reorders a listener's buffer**: a message with a priority above 0
+  overtakes lower-priority ones, so per-key order holds only among messages of
+  equal priority.
 
 ## Limitations
 
@@ -1286,20 +1883,23 @@ if let Err(error) = bus.send("chan://orders", Message::text("o-1"), Default::def
 - **Topics have no replay or retention.** A subscription receives only what is published after it was added.
 - **De-duplication is bounded by count**, per destination, in memory.
 - **DLQ moves can still fail.** If the `dead_letter` destination has no listener, the exhausted message is lost — reported via `on_dead_letter(to_dlq = false)`.
-- **Headers are metadata only.** The local provider routes on the address and the [routing key](#queues-competing-consumers--routing-key-affinity); it does not filter on headers.
+- **Filters are topic-only.** Queues route on the address and the [routing key](#queues-competing-consumers--routing-key-affinity) only; [attribute filters](#filtering-subscriptions) apply to `topic://` subscriptions and cannot see the `topic` property.
 - **Cancellation is cooperative.** A handler cancelled at a shutdown deadline stops at its next `.await`.
+- **Not provided:** pull or batch consumption (handlers are push-only, one message at a time), replay / retention / seek, transactions, a claim-check helper for payloads over a broker's size limit, an admin API (create / delete / purge / peek destinations), and cancelling a scheduled message. External providers can still offer these through their own types.
+- **Leases are a no-op locally.** `Delivery::extend` always succeeds on `LocalProvider`, which has no visibility timeout; the call matters for providers over a broker.
 
 ### Design rationale recap
 
 - **Cancellation is by dropping the future** — there are no separate context-carrying method variants to thread through.
-- **Headers and body live in one [`Message`](#message) struct**, with the [codec](codec.md) `Value` for headers, rather than a split interface.
+- **Properties, attributes and body live in one [`Message`](#message) struct**, rather than a split interface.
 - **Messages are built with the [`Message::new` / `text` / `json`](#constructors) constructors.**
 - **A handler signals its verdict by returning an [`Ack`](#ack)**, not by mutating the message — explicit and side-effect-free.
 - **A rejected message goes back to its sender**, and a discarded one is always reported.
 
 ## See also
 
-- [codec](codec.md) — `Value`, `Encode`, `Decode` used for headers and bodies.
+- [codec](codec.md) — `Encode`, `Decode` used for bodies.
+
 - [lifecycle](lifecycle.md) — the `Component` trait `LocalProvider` implements.
 - [log](log.md) — backs [`LogObserver`](#logobserver).
 

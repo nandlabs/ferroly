@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml"><img src="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.4.0-B22222" alt="version 0.4.0">
+  <img src="https://img.shields.io/badge/version-0.5.0-B22222" alt="version 0.5.0">
   <img src="https://img.shields.io/badge/rust-1.75%2B-B7410E" alt="MSRV 1.75+">
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="license: Apache-2.0 OR MIT"></a>
   <img src="https://img.shields.io/badge/unsafe-1%20audited%20module-9cbf3b" alt="unsafe: 1 audited module">
@@ -60,7 +60,7 @@ it needs. Cloud integrations will live in separate crates (`ferroly-aws`, `ferro
 
 ```toml
 [dependencies]
-ferroly = { version = "0.4", features = ["genai", "openai", "codec"] }
+ferroly = { version = "0.5", features = ["genai", "openai", "codec"] }
 ```
 
 Enable only what you need — unused modules and their dependencies are never compiled.
@@ -86,8 +86,8 @@ Enable only what you need — unused modules and their dependencies are never co
 | `genai` | `ferroly::genai` | Provider-agnostic LLM interface: chat, typed streaming, tools, structured output, embeddings, prompt templates, a model router with budgets and fallback, a mock provider | `codec`, `clients`, `http` |
 | `openai` / `claude` / `ollama` | — | Provider implementations (`all-providers` enables all three) | `genai` |
 | `vectorstore` | `ferroly::vectorstore` | `VectorStore` trait, in-memory store with metadata filters, namespaces and snapshots, text chunking | `codec` |
-| `messaging` | `ferroly::messaging` | In-process queues and topics: ack / retry / dead-letter, backoff, TTL, request-reply, graceful drain | `codec`, `lifecycle` |
-| `vfs` | `ferroly::vfs` | Virtual filesystem trait; rooted local backend, in-memory backend, scheme registry, atomic and streaming writes | tokio |
+| `messaging` | `ferroly::messaging` | In-process queues and topics with typed attributes, subscription filters, a delivery context (deferred acks, delivery info), priority, scheduling, TTL, dead-lettering and graceful drain; a provider trait with receipts and capabilities | `codec`, `lifecycle` |
+| `vfs` | `ferroly::vfs` | Virtual filesystem trait; rooted local and in-memory backends, scheme registry, atomic and streaming writes with abort, write preconditions, etags, signed-URL and typed-error hooks for object stores | tokio |
 | `log` | `ferroly::log` | Structured logging: JSON or text, multiple sinks, file rotation, redaction, per-target levels | `codec` |
 | `metrics` | `ferroly::metrics` | Counters, gauges, histograms; Prometheus and OpenMetrics text; cardinality guard | — |
 | `obs` | `ferroly::obs` | Tracing: spans, W3C trace context, sampling, OTLP/HTTP export | `codec` (+ `http` for OTLP) |

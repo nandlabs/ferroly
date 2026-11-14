@@ -8,7 +8,7 @@ mean" suggestions, and shell completion.
 Enable with the `cli` feature:
 
 ```toml
-ferroly = { version = "0.4", features = ["cli"] }
+ferroly = { version = "0.5", features = ["cli"] }
 ```
 
 ```rust

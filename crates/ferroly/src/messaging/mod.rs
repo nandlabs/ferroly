@@ -8,9 +8,10 @@
 //! - A handler **returns an [`Ack`]** rather than mutating the message in
 //!   place — the disposition is explicit, with no interior mutability.
 //! - A message is one [`Message`] struct plus a codec, not a split
-//!   header/body/message interface trio. Metadata (message id, correlation id,
-//!   timestamp, reply address, trace context) lives in conventional
-//!   [`headers`].
+//!   header/body/message interface trio. System metadata (message id,
+//!   correlation id, timestamp, reply address, trace context, content type, …)
+//!   lives in typed [`Properties`]; application metadata lives in typed
+//!   [`Attributes`]. The [`headers`] constants name the properties on the wire.
 //! - Destinations are addressed by a `&str`: `chan://name` is a queue
 //!   (competing consumers), `topic://name` is publish/subscribe (every
 //!   subscription gets a copy; `*` and `>` wildcards).
@@ -51,7 +52,11 @@
 use std::future::Future;
 use std::pin::Pin;
 
+mod attributes;
+mod capabilities;
+mod delivery;
 mod error;
+mod filter;
 mod local;
 mod message;
 mod observer;
@@ -62,9 +67,15 @@ mod queue;
 /// A boxed, `Send` future — the object-safe async desugaring.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-pub use error::{BatchFailure, MessagingError, Rejected};
+pub use attributes::{AttrValue, Attributes};
+pub use capabilities::{Capabilities, Receipt};
+pub use delivery::{
+    delivery_handler, Acker, Delivery, DeliveryControl, DeliveryHandler, DeliveryInfo,
+};
+pub use error::{BatchEntryFailure, BatchFailure, MessagingError, Rejected};
+pub use filter::Filter;
 pub use local::{DrainReport, LocalProvider, Undelivered, WeakLocalProvider};
-pub use message::{fallible, handler, headers, new_message_id, Ack, Handler, Message};
+pub use message::{fallible, handler, headers, new_message_id, Ack, Handler, Message, Properties};
 #[cfg(feature = "log")]
 pub use observer::LogObserver;
 pub use observer::{DropReason, Observer};

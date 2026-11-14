@@ -20,8 +20,8 @@ Enable with the `obs` feature (`obs = ["codec"]`, std-only); the OTLP exporter
 also needs `http`:
 
 ```toml
-ferroly = { version = "0.4", features = ["obs"] }              # spans + JSON export
-ferroly = { version = "0.4", features = ["obs", "http"] }      # + OTLP/HTTP export
+ferroly = { version = "0.5", features = ["obs"] }              # spans + JSON export
+ferroly = { version = "0.5", features = ["obs", "http"] }      # + OTLP/HTTP export
 ```
 
 ## At a glance

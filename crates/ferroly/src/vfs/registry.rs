@@ -2,17 +2,25 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::path::split_scheme;
-use super::{copy_between, Entry, LocalFs, Metadata, Vfile, Vfs, VfsError};
+use super::{
+    copy_between, Entry, ListPage, LocalFs, Metadata, SignedUrlMethod, Vfile, Vfs, VfsError,
+    VfsWriter, WalkFn, WriteOptions,
+};
 
 /// Routes a path to the [`Vfs`] backend registered for its URL scheme.
 ///
 /// Each backend announces the schemes it handles through [`Vfs::schemes`];
 /// [`register`](VfsRegistry::register) records them, and
 /// [`resolve`](VfsRegistry::resolve) picks the backend for a URL such as
-/// `mem://cache/x`. Paths with no scheme go to the *default* backend, if one
-/// has been chosen. Schemes are matched ignoring ASCII case.
+/// `mem://cache/x` ([`resolve_path`](VfsRegistry::resolve_path) also shows
+/// the path that backend is handed). Paths with no scheme go to the *default*
+/// backend, if one has been chosen. Schemes are matched ignoring ASCII case.
+/// Routing is by scheme only: give each store its own scheme, or mount
+/// several instances of one backend under different schemes with
+/// [`register_scheme`](VfsRegistry::register_scheme).
 ///
 /// The convenience methods (`read`, `write`, …) resolve and forward; and
 /// [`copy`](VfsRegistry::copy) / [`rename`](VfsRegistry::rename) work
@@ -109,7 +117,7 @@ impl VfsRegistry {
     /// plain path). Fails with [`VfsError::Unsupported`] if nothing is
     /// registered for it.
     pub fn resolve(&self, url: &str) -> Result<&Arc<dyn Vfs>, VfsError> {
-        self.route(url).map(|(backend, _)| backend)
+        self.resolve_path(url).map(|(backend, _)| backend)
     }
 
     /// Resolves `url` to its backend and the path to hand that backend.
@@ -117,7 +125,24 @@ impl VfsRegistry {
     /// The path is passed through unchanged when the backend itself claims
     /// the scheme; when the scheme is only an alias given to
     /// [`register_scheme`](VfsRegistry::register_scheme), it is stripped.
-    fn route<'a, 'u>(&'a self, url: &'u str) -> Result<(&'a Arc<dyn Vfs>, &'u str), VfsError> {
+    ///
+    /// Fails with [`VfsError::Unsupported`] if nothing is registered for the
+    /// scheme (or, for a plain path, no default is set).
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use ferroly::vfs::{MemoryFs, VfsRegistry};
+    ///
+    /// let mut registry = VfsRegistry::new();
+    /// registry.register(Arc::new(MemoryFs::new()));
+    /// registry.register_scheme("scratch", Arc::new(MemoryFs::new()));
+    /// assert_eq!(registry.resolve_path("mem://a/b").unwrap().1, "mem://a/b");
+    /// assert_eq!(registry.resolve_path("scratch://a/b").unwrap().1, "a/b");
+    /// ```
+    pub fn resolve_path<'a, 'u>(
+        &'a self,
+        url: &'u str,
+    ) -> Result<(&'a Arc<dyn Vfs>, &'u str), VfsError> {
         match split_scheme(url) {
             (Some(scheme), rest) => {
                 let key = scheme.to_ascii_lowercase();
@@ -149,26 +174,26 @@ impl VfsRegistry {
 
     /// Reads a whole file. See [`Vfs::read`].
     pub async fn read(&self, url: &str) -> Result<Vec<u8>, VfsError> {
-        let (backend, path) = self.route(url)?;
+        let (backend, path) = self.resolve_path(url)?;
         backend.read(path).await
     }
 
     /// Writes a whole file. See [`Vfs::write`].
     pub async fn write(&self, url: &str, data: Vec<u8>) -> Result<(), VfsError> {
-        let (backend, path) = self.route(url)?;
+        let (backend, path) = self.resolve_path(url)?;
         backend.write(path, data).await
     }
 
     /// Opens a file as a streaming reader. See [`Vfs::open`].
     pub async fn open(&self, url: &str) -> Result<Vfile, VfsError> {
-        let (backend, path) = self.route(url)?;
+        let (backend, path) = self.resolve_path(url)?;
         backend.open(path).await
     }
 
     /// Whether the path exists; `false` if no backend handles it. See
     /// [`Vfs::exists`].
     pub async fn exists(&self, url: &str) -> bool {
-        match self.route(url) {
+        match self.resolve_path(url) {
             Ok((backend, path)) => backend.exists(path).await,
             Err(_) => false,
         }
@@ -176,7 +201,7 @@ impl VfsRegistry {
 
     /// Metadata for the path. See [`Vfs::metadata`].
     pub async fn metadata(&self, url: &str) -> Result<Metadata, VfsError> {
-        let (backend, path) = self.route(url)?;
+        let (backend, path) = self.resolve_path(url)?;
         backend.metadata(path).await
     }
 
@@ -185,19 +210,19 @@ impl VfsRegistry {
     /// Entry paths are the backend's own: for a backend mounted under an
     /// alias scheme they come back without that scheme.
     pub async fn list(&self, url: &str) -> Result<Vec<Entry>, VfsError> {
-        let (backend, path) = self.route(url)?;
+        let (backend, path) = self.resolve_path(url)?;
         backend.list(path).await
     }
 
     /// Creates a directory and all missing parents. See [`Vfs::mkdir_all`].
     pub async fn mkdir_all(&self, url: &str) -> Result<(), VfsError> {
-        let (backend, path) = self.route(url)?;
+        let (backend, path) = self.resolve_path(url)?;
         backend.mkdir_all(path).await
     }
 
     /// Deletes a file, or a directory and its contents. See [`Vfs::delete`].
     pub async fn delete(&self, url: &str) -> Result<(), VfsError> {
-        let (backend, path) = self.route(url)?;
+        let (backend, path) = self.resolve_path(url)?;
         backend.delete(path).await
     }
 
@@ -206,8 +231,8 @@ impl VfsRegistry {
     /// When both URLs resolve to the same backend this is that backend's own
     /// [`Vfs::copy`]; otherwise the file is streamed with [`copy_between`].
     pub async fn copy(&self, src: &str, dst: &str) -> Result<(), VfsError> {
-        let (from, from_path) = self.route(src)?;
-        let (to, to_path) = self.route(dst)?;
+        let (from, from_path) = self.resolve_path(src)?;
+        let (to, to_path) = self.resolve_path(dst)?;
         if Arc::ptr_eq(from, to) {
             from.copy(from_path, to_path).await
         } else {
@@ -224,13 +249,93 @@ impl VfsRegistry {
     /// atomic** (a failure in between leaves both copies) and handles a
     /// single file only, not a directory tree.
     pub async fn rename(&self, src: &str, dst: &str) -> Result<(), VfsError> {
-        let (from, from_path) = self.route(src)?;
-        let (to, to_path) = self.route(dst)?;
+        let (from, from_path) = self.resolve_path(src)?;
+        let (to, to_path) = self.resolve_path(dst)?;
         if Arc::ptr_eq(from, to) {
             return from.rename(from_path, to_path).await;
         }
         copy_between(from.as_ref(), from_path, to.as_ref(), to_path).await?;
         from.delete(from_path).await
+    }
+
+    /// Reads up to `len` bytes starting at `offset`. See [`Vfs::read_range`].
+    pub async fn read_range(&self, url: &str, offset: u64, len: u64) -> Result<Vec<u8>, VfsError> {
+        let (backend, path) = self.resolve_path(url)?;
+        backend.read_range(path, offset, len).await
+    }
+
+    /// Appends to a file, creating it if missing. See [`Vfs::append`].
+    pub async fn append(&self, url: &str, data: Vec<u8>) -> Result<(), VfsError> {
+        let (backend, path) = self.resolve_path(url)?;
+        backend.append(path, data).await
+    }
+
+    /// Starts a streaming write. See [`Vfs::create`].
+    pub async fn create(&self, url: &str) -> Result<VfsWriter<'_>, VfsError> {
+        let (backend, path) = self.resolve_path(url)?;
+        backend.create(path).await
+    }
+
+    /// Writes a whole file with [`WriteOptions`]. See [`Vfs::write_with`].
+    pub async fn write_with(
+        &self,
+        url: &str,
+        data: Vec<u8>,
+        opts: WriteOptions,
+    ) -> Result<(), VfsError> {
+        let (backend, path) = self.resolve_path(url)?;
+        backend.write_with(path, data, opts).await
+    }
+
+    /// Starts a streaming write with [`WriteOptions`]. See
+    /// [`Vfs::create_with`].
+    pub async fn create_with(
+        &self,
+        url: &str,
+        opts: WriteOptions,
+    ) -> Result<VfsWriter<'_>, VfsError> {
+        let (backend, path) = self.resolve_path(url)?;
+        backend.create_with(path, opts).await
+    }
+
+    /// Lists one directory level a page at a time. See [`Vfs::list_page`].
+    ///
+    /// The cursor is the backend's own; pass it back to the same URL.
+    pub async fn list_page(
+        &self,
+        url: &str,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<ListPage, VfsError> {
+        let (backend, path) = self.resolve_path(url)?;
+        backend.list_page(path, after, limit).await
+    }
+
+    /// Recursively visits every entry under the path. See [`Vfs::walk`].
+    pub async fn walk(&self, url: &str, f: WalkFn) -> Result<(), VfsError> {
+        let (backend, path) = self.resolve_path(url)?;
+        backend.walk(path, f).await
+    }
+
+    /// Whether the path exists, reporting failures. See [`Vfs::try_exists`].
+    ///
+    /// Unlike [`exists`](VfsRegistry::exists), a URL that no backend handles
+    /// is an `Err` (the routing error), not `false`.
+    pub async fn try_exists(&self, url: &str) -> Result<bool, VfsError> {
+        let (backend, path) = self.resolve_path(url)?;
+        backend.try_exists(path).await
+    }
+
+    /// A URL granting `method` access to the path for `expires_in`. See
+    /// [`Vfs::signed_url`].
+    pub async fn signed_url(
+        &self,
+        url: &str,
+        method: SignedUrlMethod,
+        expires_in: Duration,
+    ) -> Result<String, VfsError> {
+        let (backend, path) = self.resolve_path(url)?;
+        backend.signed_url(path, method, expires_in).await
     }
 }
 

@@ -36,7 +36,7 @@ shareable handle with manual reload.
 
 ```toml
 [dependencies]
-ferroly = { version = "0.4", features = ["config"] }
+ferroly = { version = "0.5", features = ["config"] }
 ```
 
 Enabling `config` automatically pulls in `codec`.

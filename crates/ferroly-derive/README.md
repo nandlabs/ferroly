@@ -14,7 +14,7 @@ Derive macros for [Ferroly](https://crates.io/crates/ferroly):
 
 ```toml
 [dependencies]
-ferroly = { version = "0.4", features = ["codec"] }   # Encode, Decode
+ferroly = { version = "0.5", features = ["codec"] }   # Encode, Decode
 ```
 
 | Macro | Use it as | Needs feature |

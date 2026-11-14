@@ -1,6 +1,8 @@
 //! Send, listener and provider options.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+use ferroly::messaging::{AttrValue, Attributes, Capabilities, Filter};
 
 /// What `send` does when the target listener's buffer is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -51,11 +53,18 @@ pub struct SendOptions {
     /// Delayed delivery: the message becomes visible to its listener only after
     /// this long. `None` = immediately.
     pub delay: Option<Duration>,
+    /// Deliver at this absolute time instead of after a [`delay`](Self::delay).
+    /// Setting both is an error. `None` = not scheduled.
+    pub deliver_at: Option<SystemTime>,
+    /// Provider-specific options for this send, e.g. `"sqs.message-group-id"`.
+    /// Use a `provider.` prefix on each name; a provider ignores names that
+    /// are not its own.
+    pub extensions: Attributes,
 }
 
 impl SendOptions {
     /// The defaults: no routing-key override, reject when full, no TTL, no
-    /// delay.
+    /// delay, no schedule, no extensions.
     pub fn new() -> Self {
         Self::default()
     }
@@ -82,6 +91,46 @@ impl SendOptions {
     pub fn delay(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
         self
+    }
+
+    /// Delivers at an absolute time ([`deliver_at`](Self::deliver_at)).
+    pub fn deliver_at(mut self, at: SystemTime) -> Self {
+        self.deliver_at = Some(at);
+        self
+    }
+
+    /// Adds a provider-specific option ([`extensions`](Self::extensions)),
+    /// replacing one with the same name.
+    pub fn extension(mut self, name: impl Into<String>, value: impl Into<AttrValue>) -> Self {
+        self.extensions.insert(name, value);
+        self
+    }
+
+    /// The name of the first option set here that `caps` does not support
+    /// (`"delay"`, `"deliver_at"`, `"ttl"`), or `None` if every set option is
+    /// supported. A provider must refuse a send for which this is `Some` rather
+    /// than deliver it with different semantics.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use ferroly::messaging::{Capabilities, SendOptions};
+    ///
+    /// let caps = Capabilities::new().ttl(true);
+    /// let opts = SendOptions::new().ttl(Duration::from_secs(5));
+    /// assert_eq!(opts.unsupported_by(&caps), None);
+    /// assert_eq!(opts.delay(Duration::from_secs(1)).unsupported_by(&caps), Some("delay"));
+    /// ```
+    pub fn unsupported_by(&self, caps: &Capabilities) -> Option<&'static str> {
+        if self.delay.is_some() && !caps.delay {
+            return Some("delay");
+        }
+        if self.deliver_at.is_some() && !caps.deliver_at {
+            return Some("deliver_at");
+        }
+        if self.ttl.is_some() && !caps.ttl {
+            return Some("ttl");
+        }
+        None
     }
 
     /// The effective backpressure policy (resolving the
@@ -192,6 +241,10 @@ pub struct ListenerOptions {
     /// messages; a listener with `None` is a subscription of its own and
     /// receives every matching message. Ignored for `chan://`.
     pub subscription: Option<String>,
+    /// For `topic://` listeners: only messages matching this filter are
+    /// delivered to the subscription. `None` = every message. Not supported
+    /// on `chan://` listeners.
+    pub filter: Option<Filter>,
 }
 
 impl Default for ListenerOptions {
@@ -204,6 +257,7 @@ impl Default for ListenerOptions {
             retry_backoff: Backoff::default(),
             on_expired: ExpiryAction::default(),
             subscription: None,
+            filter: None,
         }
     }
 }
@@ -219,12 +273,11 @@ pub struct LocalOptions {
     /// lifecycle manager's default is 30 s): if the supervisor gives up first,
     /// the drain is cut short and the provider is stopped at once.
     pub drain_timeout: Duration,
-    /// De-duplication window: the number of recent message ids remembered per
-    /// destination. A message whose id ([`headers::MESSAGE_ID`]) is still in
-    /// the window is dropped as a duplicate. `0` (the default) disables
-    /// de-duplication.
-    ///
-    /// [`headers::MESSAGE_ID`]: crate::messaging::headers::MESSAGE_ID
+    /// De-duplication window: the number of recent de-duplication keys
+    /// remembered per destination. A message whose de-duplication key
+    /// ([`Properties::dedup_key`](crate::messaging::Properties::dedup_key), or
+    /// the message id when that is unset) is still in the window is dropped as
+    /// a duplicate. `0` (the default) disables de-duplication.
     pub dedup_window: usize,
 }
 
