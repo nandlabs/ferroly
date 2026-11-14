@@ -978,6 +978,10 @@ the double-submit pattern:
 - An unsafe request must send the same token twice — in the cookie and in the
   `X-CSRF-Token` request header. The two are compared in constant time; anything else is
   `403`.
+- The token comes from [`hash::random`](hash.md#platform-support-and-limits), which reads
+  `/dev/urandom`. Where that is unavailable (Windows, wasm, a sandbox without the device),
+  no token can be issued, and a safe request without a token cookie is answered `500`
+  rather than given a predictable token.
 
 ```rust
 use ferroly::http::{HttpResponse, StatusCode};

@@ -722,6 +722,12 @@ untrusted input. If you run any of these, upgrade:
 - **Unsound `unsafe`** (`fsutils`): the safe `Mmap::open` exposed a mapping that
   another process could change or truncate; the mapping is now behind
   `unsafe fn Mmap::map`, and the FFI signature was wrong on 32-bit targets.
+- **Dependency advisories**: `Cargo.lock` moves to rustls 0.23.46,
+  rustls-webpki 0.103.17, tokio-rustls 0.26.6, webpki-roots 1.0.12 and tokio
+  1.53.3, clearing RUSTSEC-2026-0285, -0346, -0348, -0349, -0381, -0382 and
+  -0386. These are lockfile changes only, so downstream crates resolve their
+  own versions: run `cargo update -p rustls -p rustls-webpki -p webpki-roots -p tokio`.
+  tokio stays on 1.53 because 1.54 requires Rust 1.85.
 
 ## [0.3.2]
 

@@ -519,7 +519,9 @@ Ferroly is deliberately narrow in places. Plan around these:
 
 - **MSRV:** Rust 1.75.
 - **Platforms:** Linux, macOS and Windows are tested in CI. `hash::random`
-  returns an explicit error on platforms without `/dev/urandom`.
+  returns an explicit error on platforms without `/dev/urandom` (including
+  Windows), so `turbo`'s CSRF layer answers `500` there instead of issuing a
+  weak token.
 - **Versioning:** pre-1.0; a minor release may contain breaking changes, all
   listed in the
   [changelog](https://github.com/nandlabs/ferroly/blob/main/CHANGELOG.md).
