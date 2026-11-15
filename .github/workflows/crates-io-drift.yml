@@ -4,18 +4,22 @@ name: crates.io drift
 # never-approved publish), so it is noticed:
 #   - with a `tag` (after `Publish to crates.io`, or by hand): that tag's
 #     version of both crates must be on crates.io;
-#   - without one (the daily run, or by hand): every `v*` tag newer than the
-#     newest one that is fully on crates.io is reported, and the version on
-#     `main` must have its tag (a missing one means tag-on-merge failed).
+#   - without one (by hand): every `v*` tag newer than the newest one that is
+#     fully on crates.io is reported, and the version on `main` must have its
+#     tag (a missing one means tag-on-merge failed).
 #
-# A tag (or untagged version) younger than the grace period (scheduled runs:
-# 24 hours) passes with a warning, so a publish waiting for approval is not
-# reported as drift at once. A failing scheduled run opens a tracking issue
-# (`crates-io-drift-alert.yml`). The fix is to publish the tag: run
-# `Publish to crates.io` with it (CONTRIBUTING.md, "Publishing to crates.io").
+# Publishing to crates.io is manual for now, so there is no daily run: it
+# would be red from every merge until the maintainer publishes. Run it by hand
+# after publishing. To bring the daily check back, add
+#   schedule:
+#     - cron: "37 5 * * *"
+# under `on:`; scheduled runs then get a 24-hour grace period, and a failing
+# one opens a tracking issue (`crates-io-drift-alert.yml`).
+#
+# A tag (or untagged version) younger than the grace period passes with a
+# warning. The fix is to publish the tag (CONTRIBUTING.md, "Publishing to
+# crates.io").
 on:
-  schedule:
-    - cron: "37 5 * * *"
   workflow_dispatch:
     inputs:
       tag:

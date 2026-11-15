@@ -15,13 +15,11 @@ Where fixes land:
 - **`main` first.** Every fix is merged to `main` and released in the next
   version, which is tagged `v<version>` in this repository.
 - **crates.io from the tag.** A release reaches
-  [crates.io](https://crates.io/crates/ferroly) when its tag is published (the
-  `Publish to crates.io` workflow, which runs only from `main` and waits for a
-  maintainer's approval); a daily `crates.io drift` check fails while any release
-  tag newer than the newest published one, or the version on `main`, is missing
-  there. Check the newest version there against the repository's newest `v*` tag.
-  At the time of writing 0.4.0 and 0.5.0 are tagged but not yet on crates.io
-  (which stops at 0.3.2). If crates.io is behind, depend on the tag directly until
+  [crates.io](https://crates.io/crates/ferroly) when a maintainer publishes its
+  tag; for now that is a manual step, so crates.io can lag behind the tags.
+  Check the newest version there against the repository's newest `v*` tag.
+  At the time of writing 0.4.0, 0.5.0 and 0.6.0 are tagged but not yet on
+  crates.io (which stops at 0.3.2). If crates.io is behind, depend on the tag directly until
   it catches up:
   `ferroly = { git = "https://github.com/nandlabs/ferroly", tag = "v0.6.0" }`.
 - **Old crates.io versions are not patched.** In particular, 0.3.2 and earlier

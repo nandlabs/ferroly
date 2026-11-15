@@ -5,11 +5,9 @@ name: Tag on merge
 # on PRs — which ensures every merge to `main` carries a fresh, untagged version
 # — this makes each merge that bumps the version produce its release tag.
 #
-# A tag pushed with the GITHUB_TOKEN does not trigger other workflows, so after
-# creating a tag this workflow calls `publish.yml` itself (which then waits for
-# approval in the protected `crates-io` environment). For crates.io trusted
-# publishing this file, not `publish.yml`, is the workflow crates.io sees for
-# these runs, so both are registered as trusted publishers (CONTRIBUTING.md).
+# It only tags. Publishing to crates.io is manual for now: a maintainer
+# publishes the new tag by hand or with the `Publish to crates.io` workflow
+# (CONTRIBUTING.md, "Publishing to crates.io").
 on:
   push:
     branches: [main]
@@ -30,9 +28,6 @@ jobs:
     # Needed to push the tag with the default GITHUB_TOKEN.
     permissions:
       contents: write
-    outputs:
-      created: ${{ steps.tag.outputs.created }}
-      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -109,22 +104,6 @@ jobs:
           git tag -a "$TAG" -m "$TAG" "$COMMIT"
           git push origin "$TAG"
           echo "Created and pushed $TAG at $COMMIT."
+          echo "::notice::Created $TAG. Publishing to crates.io is manual: publish $TAG by hand (CONTRIBUTING.md, \"Publishing to crates.io\")."
           echo "created=true" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-  publish:
-    name: Publish the new tag
-    needs: tag
-    if: needs.tag.outputs.created == 'true'
-    # A called workflow gets at most these. `actions: read` lets it read the
-    # `crates-io` environment's protection rules; `id-token: write` lets its
-    # `crates-io` job use crates.io trusted publishing when that is enabled.
-    # No secrets are passed: the token lives in the `crates-io` environment,
-    # which only the approved job can read.
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
-    uses: ./.github/workflows/publish.yml
-    with:
-      tag: ${{ needs.tag.outputs.tag }}

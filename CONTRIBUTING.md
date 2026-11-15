@@ -99,15 +99,44 @@ new version, and commit the updated lockfile.
 
 ### Publishing to crates.io
 
-Contributors don't publish anything: merging a version bump to `main` does it. The
-rest of this section is for maintainers.
+Contributors don't publish anything. Merging a version bump to `main` creates its
+`v<version>` tag (`tag-on-merge.yml`), and that is all that happens automatically:
+**publishing the tag to crates.io is manual for now**, done by a maintainer by hand
+or with the `Publish to crates.io` workflow. The rest of this section is for
+maintainers.
 
-**What happens on a release.** `tag-on-merge.yml` creates the `v<version>` tag and
-calls the `Publish to crates.io` workflow (`.github/workflows/publish.yml`) for it.
-That workflow has no tag-push trigger: for a tag push GitHub would run the workflow
-file from the tagged commit, which could be any commit with its own copy of the
-checks. It only runs from `main` (a merge, or *Run workflow*), so its checks are
-always main's. It runs:
+**By hand.** From a clean checkout of the tag, with cargo 1.90 or newer
+(multi-package `--dry-run`) and a crates.io token in `CARGO_REGISTRY_TOKEN` (scoped
+as under *Repository settings* below):
+
+```sh
+git fetch --tags
+git checkout v0.6.0
+.github/scripts/check-release-version.sh 0.6.0
+cargo publish --dry-run --locked -p ferroly-derive -p ferroly
+cargo publish --locked --no-verify -p ferroly-derive
+# wait until https://index.crates.io/fe/rr/ferroly-derive lists "vers":"0.6.0"
+cargo publish --locked --no-verify -p ferroly
+```
+
+`ferroly-derive` goes first: `ferroly` requires it at the same version and resolves
+it from the index. The dry-run must name both crates (see *verify* below for why).
+Afterwards, run the *crates.io drift* workflow (below) with the tag to confirm both
+crates are there.
+
+**Backlog: 0.4.0, 0.5.0 and 0.6.0 are not on crates.io.** All three are tagged on
+`main` (`v0.4.0`, `v0.5.0`, `v0.6.0`), but crates.io stops at 0.3.2. Publish them
+oldest first, so crates.io's newest version ends up the newest release: `v0.4.0`
+(optional; it keeps crates.io's version history complete), then `v0.5.0`, then
+`v0.6.0`.
+
+**With the workflow** (optional; needs the *Repository settings* below): Actions →
+*Publish to crates.io* → *Run workflow*, branch **`main`**, with the tag (for example
+`v0.6.0`) in the *tag* input. Any `v<version>` tag on `main` works, including ones
+whose tree predates the workflow. Nothing starts it automatically, and it has no
+tag-push trigger: for a tag push GitHub would run the workflow file from the tagged
+commit, which could be any commit with its own copy of the checks. It only runs from
+`main`, so its checks are always main's. It runs:
 
 1. **verify** (no credentials):
    - the run is from `main`, and the tag is `v<semver>`;
@@ -137,57 +166,24 @@ always main's. It runs:
    the job (and its approval prompt) is skipped.
 3. **drift**: the `crates.io drift` check below, for the tag just published.
 
-**Publishing an existing tag** (a failed or never-approved run, or a release from
-before this workflow existed): Actions → *Publish to crates.io* → *Run workflow*,
-branch **`main`**, with the tag (for example `v0.5.0`) in the *tag* input. Any
-`v<version>` tag on `main` works, including ones whose tree predates the workflow.
+**Drift check.** `.github/workflows/crates-io-drift.yml` runs by hand and after
+every publish workflow run. It asks the crates.io API (User-Agent `ferroly-ci`) for
+both crates:
 
-**Backlog: 0.4.0 and 0.5.0 are not on crates.io.** Both are tagged on `main`
-(`v0.4.0`, `v0.5.0`), but crates.io stops at 0.3.2. Once the environment below is set
-up, publish them with the dispatch input, oldest first so crates.io's newest version
-ends up the newest release:
+- with a *tag*: at that tag's version;
+- without one: at every `v*` tag, newest first, down to the newest one that is fully
+  on crates.io, so an older unpublished release is reported too. It also fails when
+  the version on `main` has no tag (tag-on-merge failed or never ran; re-run the
+  failed `Tag on merge` run of the merge that set the version).
 
-1. *Run workflow* on `main` with tag `v0.4.0` (optional; it keeps crates.io's version
-   history complete); approve it.
-2. *Run workflow* on `main` with tag `v0.5.0`; approve it.
-3. Then any newer tag (`v0.6.0` once merged) the same way, unless its merge already
-   published it.
+While publishing is manual it has no daily schedule, since it would be red from
+every merge until the release is published. The header of `crates-io-drift.yml`
+says how to bring the daily run back; a failing daily run then opens an issue titled
+"crates.io drift: a release is not on crates.io" (`crates-io-drift-alert.yml`).
 
-Until then the daily drift check is red and names both tags.
-
-By hand, from a clean checkout of the tag, with cargo 1.90 or newer (multi-package
-`--dry-run`) and a token in `CARGO_REGISTRY_TOKEN`:
-
-```sh
-git checkout v0.5.0
-cargo publish --dry-run --locked -p ferroly-derive -p ferroly
-cargo publish --locked --no-verify -p ferroly-derive
-# wait until https://index.crates.io/fe/rr/ferroly-derive lists "vers":"0.5.0"
-cargo publish --locked --no-verify -p ferroly
-```
-
-**Drift guard.** `.github/workflows/crates-io-drift.yml` runs daily on `main`, by
-hand, and after every publish run. It asks the crates.io API (User-Agent
-`ferroly-ci`) for both crates:
-
-- after a publish (or by hand with a *tag*): at that tag's version;
-- daily (or by hand without a tag): at every `v*` tag, newest first, down to the
-  newest one that is fully on crates.io, so an older unpublished release is reported
-  too. It also fails when the version on `main` has no tag (tag-on-merge failed or
-  never ran).
-
-The daily run allows a 24-hour grace period for a tag that is still waiting for
-approval; the run after a publish allows none. A failing daily run opens an issue
-titled "crates.io drift: a release is not on crates.io" (or comments on the open one;
-`crates-io-drift-alert.yml`), since GitHub mails a failed schedule only to whoever
-last edited its cron line. Close the issue once the release is published. GitHub
-also disables scheduled workflows after 60 days without repository activity;
-re-enable it under Actions if that happens. The fix for a red drift check is to
-publish the tags it names (above). For an untagged version on `main`, re-run the
-failed `Tag on merge` run of the merge that set the version.
-
-**Repository settings.** Do these before the first publish run; `verify` refuses to
-continue until the environment is protected.
+**Repository settings** (only for the workflow; publishing by hand needs none of
+this). Do these before the first workflow run; `verify` refuses to continue until
+the environment is protected.
 
 - Settings → Environments → **New environment** `crates-io`, then:
   - **Required reviewers**: the maintainers who may approve a release (and, ideally,
@@ -205,11 +201,9 @@ continue until the environment is protected.
     - *Trusted publishing* (no stored token): on crates.io, for **each** of the two
       crates, Settings → Trusted Publishing → add a GitHub publisher with owner
       `nandlabs`, repository `ferroly`, environment `crates-io`, and workflow
-      `publish.yml`; then add a second one, identical but with workflow
-      `tag-on-merge.yml` (crates.io checks the workflow that started the run, and
-      for a merge that is tag-on-merge, which calls `publish.yml`). Then set the
-      environment *variable* `CRATES_IO_TRUSTED_PUBLISHING` to `true`: the publish
-      job exchanges a GitHub OIDC token for a short-lived crates.io token
+      `publish.yml`. Then set the environment *variable*
+      `CRATES_IO_TRUSTED_PUBLISHING` to `true`: the publish job exchanges a GitHub
+      OIDC token for a short-lived crates.io token
       (`rust-lang/crates-io-auth-action`), which is revoked when the job ends. The
       `CARGO_REGISTRY_TOKEN` secret can then be deleted, and the crates.io token
       revoked.

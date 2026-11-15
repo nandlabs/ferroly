@@ -2,11 +2,10 @@ name: Publish to crates.io
 
 # Publishes `ferroly-derive`, then `ferroly`, for an existing `v<version>` tag.
 #
-# Two ways in, both running this file as it is on `main`:
-#   - `tag-on-merge.yml`, which calls this workflow after it creates the tag on
-#     a merge to main;
-#   - "Run workflow" (workflow_dispatch) on `main` with an existing tag, to
-#     publish or re-publish a release whose run failed or never happened.
+# Publishing is manual for now: nothing runs this automatically. A maintainer
+# starts it with "Run workflow" (workflow_dispatch) on `main` and an existing
+# tag, or publishes by hand instead (CONTRIBUTING.md, "Publishing to crates.io").
+# `tag-on-merge.yml` only creates the tag.
 # There is deliberately no `push: tags` trigger: for a tag push GitHub runs the
 # workflow file *from the tagged commit*, so a tag on any commit could bring its
 # own copy of this file with the checks below removed. `verify` refuses to run
@@ -35,12 +34,6 @@ on:
     inputs:
       tag:
         description: "The existing tag to publish (v<version>)"
-        required: true
-        type: string
-  workflow_call:
-    inputs:
-      tag:
-        description: "The tag to publish (v<version>)"
         required: true
         type: string
 

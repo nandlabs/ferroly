@@ -568,12 +568,14 @@ TAGGER = wf("tag-on-merge.yml")
 DRIFT_WF = wf("crates-io-drift.yml")
 ALERT_WF = wf("crates-io-drift-alert.yml")
 
-check("yaml: publish.yml has no `push: tags` trigger; only dispatch and call (REL-3)",
-      sorted(PUBLISH[True]) == ["workflow_call", "workflow_dispatch"], PUBLISH[True])
-check("yaml: publish.yml takes no secrets from a caller (REL-2)",
-      "secrets" not in (PUBLISH[True]["workflow_call"] or {}), PUBLISH[True]["workflow_call"])
-check("yaml: tag-on-merge passes no secrets to publish.yml (REL-2)",
-      "secrets" not in TAGGER["jobs"]["publish"], TAGGER["jobs"]["publish"])
+# Publishing is manual for now: only a maintainer's dispatch starts publish.yml.
+check("yaml: publish.yml has no `push: tags` trigger and no caller; dispatch only (REL-3)",
+      sorted(PUBLISH[True]) == ["workflow_dispatch"], PUBLISH[True])
+check("yaml: tag-on-merge only tags: one job, which calls no workflow",
+      list(TAGGER["jobs"]) == ["tag"]
+      and not any("uses" in j for j in TAGGER["jobs"].values()), list(TAGGER["jobs"]))
+check("yaml: the drift check has no schedule while publishing is manual",
+      "schedule" not in DRIFT_WF[True] and "workflow_dispatch" in DRIFT_WF[True], DRIFT_WF[True])
 pub_steps = PUBLISH["jobs"]["publish"]["steps"]
 check("yaml: the publish job checks out the commit verify checked, by SHA (REL-1)",
       pub_steps[0]["uses"].startswith("actions/checkout@")

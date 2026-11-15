@@ -5,6 +5,9 @@ name: crates.io drift alert
 # tracking issue, or comment on the one that is already open, so the
 # maintainers see it. Close the issue once the release is on crates.io.
 #
+# While publishing is manual, `crates-io-drift.yml` has no schedule, so this
+# never fires; it is kept so that restoring the schedule restores the alert.
+#
 # This is a separate workflow so that `crates-io-drift.yml`, which
 # `publish.yml` also calls, needs nothing beyond `contents: read`.
 # `workflow_run` always runs this file from the default branch, and it checks

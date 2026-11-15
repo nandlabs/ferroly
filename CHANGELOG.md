@@ -5,6 +5,16 @@ All notable changes to this project are documented here. The format is based on
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
 
+## [Unreleased]
+
+### Changed
+
+- **ci**: publishing to crates.io is manual for now. `tag-on-merge` still tags
+  each version merged to `main` but no longer starts `publish.yml`, which now
+  runs only when a maintainer dispatches it; the `crates.io drift` check runs by
+  hand and after a publish, with no daily schedule. CONTRIBUTING.md
+  ("Publishing to crates.io") has the by-hand steps.
+
 ## [0.6.0]
 
 New-capability and hardening release. It closes 21 issues: HTTP/2 and gRPC,
