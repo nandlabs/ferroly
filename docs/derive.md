@@ -1,8 +1,9 @@
 # Derive macros
 
-**Feature:** `codec` (default, for `Encode`/`Decode`); `FerrolyError` is
-always available · **Crate:** `ferroly-derive` (re-exported from
-`ferroly::codec`)
+**Feature:** `codec` (default, for `Encode`/`Decode`); `protobuf` (for the
+protobuf `Message`/`Oneof`/`Enumeration`); `FerrolyError` is always available ·
+**Crate:** `ferroly-derive` (re-exported from `ferroly::codec` and
+`ferroly::proto`)
 
 `ferroly-derive` is the proc-macro crate behind Ferroly's three derives —
 `#[derive(Encode)]`, `#[derive(Decode)]`, and `#[derive(FerrolyError)]`. It
@@ -18,8 +19,16 @@ The derives split into two families:
   emits **two** code paths — a `Value`-building path (used by XML, YAML, TOML and
   any dynamic use) and a streaming path (used by JSON for its fast path). You get
   both from one `#[derive]`, and they always agree on the wire format.
+- **`JsonSchema`** reads the same model and attributes and generates the
+  JSON-Schema document of the encoded form, which
+  [`Schema::of`](schema.md#generating-a-schema-from-a-type) compiles for
+  validation. It is re-exported from `ferroly::codec::schema` next to the
+  `JsonSchema` trait.
 - **`FerrolyError`** generates `Display`, `std::error::Error` (with `source()`),
   and `From` impls from `#[error(...)]`, `#[from]`, and `#[source]` attributes.
+- **`proto::Message` / `proto::Oneof` / `proto::Enumeration`** (feature
+  `protobuf`) give a type a Protocol Buffers wire encoding; see
+  [below](#protobuf-message-oneof-enumeration) and the [proto guide](proto.md).
 
 > Design note: the derives run entirely at compile time, so there is no runtime
 > reflection and no runtime encoding dependency — the wire mapping is baked into
@@ -198,8 +207,9 @@ assert_eq!(json::decode::<Event>(r#"{"type":"ping"}"#).unwrap(), Event::Ping);
 ```
 
 The tag is written first. A field whose key equals the tag is a compile error.
-Decoding fails with `MissingField(tag)` when the tag is absent, `Expected` when
-it is not a string, and `UnknownVariant` when it names no variant.
+Decoding fails with `MissingField(tag)` when the tag is absent, `TypeMismatch`
+when it is not a string (`expected string tag, found number`), and
+`UnknownVariant` when it names no variant.
 
 #### Untagged
 
@@ -235,6 +245,11 @@ claim data you meant for a later one — put `One(T)` before `Many(Vec<T>)`, and
 `Text(String)` before a numeric variant if both may see quoted digits. If no
 variant matches, decoding fails with a `Message` error naming the enum. Variant
 `rename` / `alias` have no effect on an untagged enum.
+
+To try each variant the content is first read into a `Value`, where a JSON
+integer literal wider than 64 bits is a float: an `i128` / `u128` inside an
+untagged variant rejects it (so no variant matches) rather than take a rounded
+number. Send such values as decimal strings, which is how they encode.
 
 ### Container attributes
 
@@ -282,7 +297,30 @@ it is an error (`CodecError::Message("unknown field: <key>")`). On an enum the
 rule applies to the fields of every struct variant (and, for an internally
 tagged enum, to unit variants, which then accept only the tag); it does not
 reach into the types of the fields. Aliases count as known keys; the name of a `skip` field
-does not. It cannot be combined with a `flatten` field.
+does not.
+
+It cannot be combined with a `flatten` field, and the derive says so at compile time: the
+flattened field receives every key the struct does not name, so no key would ever be
+unknown. To reject unknown keys anyway, put `deny_unknown_fields` on the **flattened type**:
+it decodes from exactly the leftover keys, so an unexpected one fails there.
+
+```rust
+use ferroly::codec::{json, Decode};
+
+#[derive(Decode)]
+#[ferroly(deny_unknown_fields)]
+struct Paging { page: u32 }
+
+#[derive(Decode)]
+struct Query {
+    q: String,
+    #[ferroly(flatten)]
+    paging: Paging,
+}
+
+assert!(json::decode::<Query>(r#"{"q":"x","page":2}"#).is_ok());
+assert!(json::decode::<Query>(r#"{"q":"x","page":2,"extra":1}"#).is_err());
+```
 
 ```rust
 use ferroly::codec::{json, Decode};
@@ -437,7 +475,10 @@ How it works, and what follows from it:
 - A flattened value that does not encode as an object or `null` cannot be
   merged; it is written under the field's own key instead of being dropped.
 - `flatten` costs one intermediate `Value` for that field on the streaming
-  path; the rest of the struct still streams.
+  path; the rest of the struct still streams. Inside that `Value` a JSON
+  integer literal wider than 64 bits is a float, so an `i128` / `u128` field
+  of a flattened struct rejects it (never rounding it): send such values as
+  decimal strings, which is how they encode.
 - It cannot be combined with `rename`, `alias`, `default`, `skip` or
   `skip_none`, nor used in a `deny_unknown_fields` container.
 
@@ -823,6 +864,93 @@ let e: Retry<std::io::Error> = std::io::Error::other("timeout").into();
 assert_eq!(e.source().unwrap().to_string(), "timeout");
 ```
 
+## Protobuf: `Message`, `Oneof`, `Enumeration`
+
+With the `protobuf` feature, `ferroly::proto` re-exports three derives
+(`ProtoMessage`, `ProtoOneof` and `ProtoEnumeration` in `ferroly-derive`)
+under the names of the traits they implement. They use the `proto(...)`
+helper attribute, not `ferroly(...)`.
+
+```rust
+use ferroly::proto::{EnumValue, Message, UnknownFields};
+
+#[derive(ferroly::proto::Enumeration, Clone, Copy, PartialEq, Debug)]
+enum Status {
+    #[proto(name = "STATUS_UNKNOWN")]
+    Unknown = 0,
+    #[proto(name = "STATUS_OK")]
+    Ok = 1,
+}
+
+#[derive(ferroly::proto::Oneof, PartialEq, Debug)]
+enum Target {
+    #[proto(tag = 5)]
+    Host(String),
+    #[proto(tag = 6, fixed32)]
+    Ipv4(u32),
+}
+
+#[derive(ferroly::proto::Message, Default, PartialEq, Debug)]
+struct Probe {
+    #[proto(tag = 1)]
+    id: u64,
+    #[proto(tag = 2, sint32)]
+    offset: i32,
+    #[proto(tag = 3, packed = false)]
+    samples: Vec<u32>,
+    #[proto(tag = 4)]
+    status: EnumValue<Status>,
+    #[proto(oneof)]
+    target: Option<Target>,
+    #[proto(unknown)]
+    unknown: UnknownFields,
+}
+
+let p = Probe { id: 1, offset: -1, samples: vec![7, 8], ..Default::default() };
+assert_eq!(p.encode_to_vec(), [0x08, 0x01, 0x10, 0x01, 0x18, 0x07, 0x18, 0x08]);
+assert_eq!(Probe::decode(&p.encode_to_vec()).unwrap(), p);
+```
+
+Field attributes (all inside `#[proto(...)]`):
+
+| Attribute | Effect |
+| --- | --- |
+| `tag = N` | the field number (1 to 2²⁹ − 1, outside 19000–19999, unique) |
+| `int32` … `sfixed64`, `float`, `double`, `bool`, `string`, `bytes`, `message`, `enumeration` | the protobuf type, when the Rust type does not imply it (`i32` is `int32`, `String` is `string`, `EnumValue<E>` an enum, other types messages) |
+| `packed = false` | write a repeated numeric field one element per key (packed is the default) |
+| `map(key = "…", value = "…")` | the key/value types of a `HashMap` / `BTreeMap` field |
+| `required` | proto2 `required`: always written; decoding fails when no occurrence of the message carried it (at most 64 per message) |
+| `oneof` | on an `Option<E>` where `E: Oneof` (no tag) |
+| `unknown` | on one `UnknownFields` field: keep and re-emit undeclared fields |
+| `skip` | not encoded; `Default` on decode |
+
+The shape follows the Rust type: `T` implicit presence, `Option<T>` explicit
+presence, `Vec<T>` repeated (`Vec<u8>` is `bytes`), a map type `map<K, V>`,
+`Box<M>` for recursion. `Oneof` variants take `tag = N` and a type;
+`Enumeration` variants take `name = "…"` (their `.proto` name).
+
+What the derive emits: one call per field and direction into
+`ferroly::proto::__private` (for example
+`encode_implicit::<SInt32, _>(2, &self.offset, buf, cache)` and
+`merge_value::<SInt32, _>(wire_type, &mut self.offset, reader)` inside a
+`match` on the field number), so all wire logic lives in the runtime and the
+expansion stays small. Fields are written in declaration order. Methods of
+`UnknownFields` and the reader are called by fully qualified path, so a trait
+in scope with a method of the same name cannot take the call. A message with
+oneofs also gets a `const` assertion that the oneof's field numbers do not
+collide with the message's, and an `Enumeration` one per variant that its
+discriminant fits in `i32`.
+
+Compile errors: a missing, zero, reserved (19000–19999), too large or
+duplicate field number; unknown or repeated keys; two type attributes;
+`packed` on a singular, string, bytes or message field; a map key that is a
+float, bytes, message or enum; `required` on an `Option`, `Vec` or map; `oneof`
+on a non-`Option` field or with a tag; generics; protobuf-less integer types
+such as `u8`; data-carrying or duplicate-named `Enumeration` variants, or a
+discriminant outside `i32`; more than 64 `required` fields. The full
+attribute reference, the wire format and `.proto` code generation are in the
+[proto guide](proto.md).
+
 ## How the two paths fit together
 
 For `Encode`/`Decode`, the generated `encode` / `decode` methods build or read a
@@ -848,10 +976,23 @@ for whichever codec you call.
 
   | Error | When |
   | --- | --- |
-  | `Expected(..)` | the wrong container shape (object, array of N elements, string, `null`, single-key object, string tag) |
+  | `TypeMismatch { expected, found }` | a value of the wrong type: not an object for a named struct, not an array for a tuple struct, not `null` for a unit struct or unit variant, not a string for a unit-only enum or a tag (`expected object, found number`) |
+  | `Expected(..)` | the right type in the wrong shape: an array of the wrong length, an object without exactly one key for an externally tagged enum, a data-carrying variant named as a bare string |
   | `MissingField(key)` | a required field — or an internally tagged enum's tag — is absent |
   | `UnknownVariant(name)` | a variant name or tag value that matches no variant |
   | `Message(..)` | an unknown key under `deny_unknown_fields`; no matching variant of an untagged enum |
+
+  An error raised inside a field is wrapped in `CodecError::At`, whose path
+  names where it happened: a named field adds the key the input used (the wire
+  name after `rename` / `rename_all`, or the matching alias), a tuple field its
+  index, and an externally tagged variant its variant key. Newtypes, `flatten`
+  fields and internally tagged or untagged variants add no segment. So
+  `{"a":{"b":[1,"x"]}}` into `struct { a: struct { b: Vec<u32> } }` fails with
+  `a.b[1]: expected unsigned integer, found string`, and a missing field reads
+  `a: missing field: b`. Use `err.root_cause()` to match the underlying
+  variant, and `err.path()` / `err.path_string()` for the location; see
+  [Field paths](codec.md#field-paths). The path is attached with `map_err`
+  only as an error propagates, so a successful decode costs nothing extra.
 
 - Derived `FerrolyError` types implement `std::error::Error`, so they compose
   with `?` and `Box<dyn Error>` like any hand-written error.
@@ -877,9 +1018,11 @@ for whichever codec you call.
   (`#[error("{}", expr)]`), and a field named `source` is **not** treated as the
   source unless it is marked `#[source]`.
 - Compile-fail behavior is covered by doctests in `ferroly-derive` that run
-  against a small stand-in for `ferroly::codec` (the proc-macro crate cannot
-  depend on `ferroly`); the generated code is exercised end-to-end by the
-  `derive_*` integration tests in `ferroly`.
+  against small stand-ins for `ferroly::codec` and `ferroly::proto` (the
+  proc-macro crate cannot depend on `ferroly`); the generated code is exercised
+  end-to-end by the `derive_*` and `proto_*` integration tests in `ferroly`.
+- The protobuf derives do not support generic types, and derived messages own
+  their strings and bytes (no borrowing from the input).
 
 ## See also
 
@@ -888,3 +1031,5 @@ for whichever codec you call.
 - [schema](schema.md) — validate the values you decode into these types.
 - [errutils](errutils.md) — runtime error utilities that pair with
   `FerrolyError`.
+- [proto](proto.md) — the protobuf runtime, `.proto` parser and code
+  generator behind the protobuf derives.

@@ -8,6 +8,10 @@
 //!   passwords prefer a dedicated algorithm (Argon2id, scrypt, bcrypt), none
 //!   of which ferroly implements.
 //!
+//! Intermediate values (the HKDF pseudorandom key and blocks, the PBKDF2
+//! `U_i` chain and accumulator) are overwritten with zeros before returning;
+//! the keyed [`Hmac`] states wipe themselves on drop.
+//!
 //! ```
 //! use ferroly::hash::kdf;
 //!
@@ -74,14 +78,18 @@ pub fn hkdf_expand<H: HashAlgorithm>(
     let mut previous: Option<H::Output> = None;
     for (index, chunk) in okm.chunks_mut(H::OUTPUT_LEN).enumerate() {
         let mut mac = keyed.clone();
-        if let Some(prev) = &previous {
+        if let Some(prev) = &mut previous {
             mac.update(prev.as_ref());
+            H::wipe_output(prev);
         }
         mac.update(info);
         mac.update(&[(index + 1) as u8]);
         let block = mac.finalize();
         chunk.copy_from_slice(&block.as_ref()[..chunk.len()]);
         previous = Some(block);
+    }
+    if let Some(last) = &mut previous {
+        H::wipe_output(last);
     }
     Ok(())
 }
@@ -93,8 +101,10 @@ pub fn hkdf<H: HashAlgorithm>(
     info: &[u8],
     okm: &mut [u8],
 ) -> Result<(), KdfError> {
-    let prk = hkdf_extract::<H>(salt, ikm);
-    hkdf_expand::<H>(prk.as_ref(), info, okm)
+    let mut prk = hkdf_extract::<H>(salt, ikm);
+    let result = hkdf_expand::<H>(prk.as_ref(), info, okm);
+    H::wipe_output(&mut prk);
+    result
 }
 
 /// HKDF-SHA256 (RFC 5869): derives `okm.len()` bytes (at most 8160) from the
@@ -126,12 +136,15 @@ pub fn pbkdf2_hmac<H: HashAlgorithm>(
         for _ in 1..iterations {
             let mut mac = keyed.clone();
             mac.update(u.as_ref());
+            H::wipe_output(&mut u);
             u = mac.finalize();
             for (a, b) in acc.iter_mut().zip(u.as_ref()) {
                 *a ^= b;
             }
         }
         chunk.copy_from_slice(&acc[..chunk.len()]);
+        H::wipe_output(&mut u);
+        super::wipe(acc.as_mut_slice());
     }
     Ok(())
 }

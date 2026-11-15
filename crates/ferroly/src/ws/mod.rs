@@ -31,6 +31,8 @@ mod frame;
 mod handshake;
 mod hub;
 mod message;
+#[cfg(feature = "metrics")]
+mod metrics;
 mod observer;
 mod options;
 mod rand;
@@ -43,6 +45,8 @@ pub use conn::WsSender;
 pub use error::WsError;
 pub use hub::{Hub, HubMember, SlowConsumerPolicy};
 pub use message::{close_code, Message};
+#[cfg(feature = "metrics")]
+pub use metrics::MetricsObserver;
 pub use observer::{TimeoutKind, WsEvent, WsObserver};
 pub use options::{WsOptions, WsServerConfig, DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_MESSAGE_SIZE};
 pub use reconnect::{ReconnectOptions, ReconnectingClient};

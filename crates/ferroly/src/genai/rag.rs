@@ -60,6 +60,18 @@ pub struct RagDocument {
     pub metadata: Value,
 }
 
+/// A loaded chunk becomes a document under the chunk's id, with its
+/// metadata (source, offsets, heading).
+impl From<ferroly::vectorstore::TextChunk> for RagDocument {
+    fn from(chunk: ferroly::vectorstore::TextChunk) -> Self {
+        RagDocument {
+            id: chunk.id,
+            text: chunk.text,
+            metadata: chunk.metadata,
+        }
+    }
+}
+
 impl RagDocument {
     /// A document with no extra metadata.
     pub fn new(id: impl Into<String>, text: impl Into<String>) -> Self {

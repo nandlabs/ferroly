@@ -1,0 +1,1 @@
+{% set ns = namespace(n=0) %}{% for v in x %}{% set ns.n = ns.n + 1 %}{% endfor %}{% set a, b = 1, 2 %}{{ ns.n }}{{ a }}{{ b }}

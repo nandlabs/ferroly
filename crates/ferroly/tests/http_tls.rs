@@ -409,3 +409,40 @@ async fn https_through_a_connect_tunnel() {
         "{err:?}"
     );
 }
+
+/// HTTP-12: shutting the server down closes a connection stuck in its TLS
+/// handshake, instead of leaving it to outlive `serve` until the head
+/// timeout.
+#[tokio::test]
+async fn shutdown_closes_a_connection_in_its_tls_handshake() {
+    let config = ServerConfig {
+        head_timeout: Duration::from_secs(30),
+        drain_timeout: Duration::from_millis(200),
+        ..ServerConfig::default()
+    };
+    let tls = TlsConfig::from_pem(SERVER_CERT, SERVER_KEY).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let shutdown = async {
+            let _ = stopped.await;
+        };
+        serve_tls_with_config(listener, Arc::new(Describe), shutdown, config, tls).await
+    });
+    // A TCP connection that never sends its ClientHello.
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("serve returned")
+        .unwrap()
+        .unwrap();
+    let mut buf = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(2), sock.read_to_end(&mut buf)).await;
+    assert!(
+        closed.is_ok(),
+        "the connection outlived serve, still in its TLS handshake"
+    );
+}

@@ -6,31 +6,32 @@
 //! construct, so a failure can only come from the derive refusing that
 //! construct — not from an unrelated error in the snippet.
 //!
-//! Every snippet is prefixed with `mock_codec.rs`, a stand-in for
-//! `ferroly::codec`, because this crate cannot depend on `ferroly`. The exact
+//! Every snippet is prefixed with `mock_codec.rs` and `mock_proto.rs`,
+//! stand-ins for `ferroly::codec` and `ferroly::proto`, because this crate
+//! cannot depend on `ferroly`. The exact
 //! error messages are asserted by the unit tests next to each expansion.
 
 /// `accepts` must compile; `rejects` (optional) must not. `runs` is a whole
 /// program (it brings its own `main`) that must compile and exit cleanly.
 macro_rules! case {
     ($name:ident, runs: $program:literal) => {
-        #[doc = concat!("```\n", include_str!("mock_codec.rs"), "\n", $program, "\n```")]
+        #[doc = concat!("```\n", include_str!("mock_codec.rs"), "\n", include_str!("mock_proto.rs"), "\n", $program, "\n```")]
         #[allow(dead_code)]
         struct $name;
     };
     ($name:ident, accepts: $good:literal) => {
         #[doc = concat!(
-            "```\n", include_str!("mock_codec.rs"), "\n", $good, "\nfn main() {}\n```"
+            "```\n", include_str!("mock_codec.rs"), "\n", include_str!("mock_proto.rs"), "\n", $good, "\nfn main() {}\n```"
         )]
         #[allow(dead_code)]
         struct $name;
     };
     ($name:ident, accepts: $good:literal, rejects: $bad:literal) => {
         #[doc = concat!(
-            "```\n", include_str!("mock_codec.rs"), "\n", $good, "\nfn main() {}\n```"
+            "```\n", include_str!("mock_codec.rs"), "\n", include_str!("mock_proto.rs"), "\n", $good, "\nfn main() {}\n```"
         )]
         #[doc = concat!(
-            "```compile_fail\n", include_str!("mock_codec.rs"), "\n", $bad, "\nfn main() {}\n```"
+            "```compile_fail\n", include_str!("mock_codec.rs"), "\n", include_str!("mock_proto.rs"), "\n", $bad, "\nfn main() {}\n```"
         )]
         #[allow(dead_code)]
         struct $name;
@@ -687,5 +688,183 @@ struct E { a: u8, b: u8 }
 #[derive(ferroly_derive::FerrolyError)]
 #[error("failed")]
 union E { a: u8, b: u8 }
+"##
+);
+
+// ---- protobuf: Message / Oneof / Enumeration -------------------------------
+
+case!(
+    ProtoAllShapes,
+    accepts: r##"
+use std::collections::{BTreeMap, HashMap};
+use ferroly::proto::{EnumValue, UnknownFields};
+
+#[derive(Clone, Copy, ferroly_derive::ProtoEnumeration)]
+enum Color { #[proto(name = "COLOR_RED")] Red = 0, Green = 1, r#Blue = -2 }
+
+#[derive(ferroly_derive::ProtoOneof)]
+enum Choice {
+    #[proto(tag = 20)] Name(String),
+    #[proto(tag = 21, sint64)] Id(i64),
+    #[proto(tag = 22)] Sub(Box<Msg>),
+    #[proto(tag = 23)] Raw(Vec<u8>),
+}
+
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct Msg {
+    #[proto(tag = 1)] a: i32,
+    #[proto(tag = 2, sint64)] b: i64,
+    #[proto(tag = 3, fixed32)] c: u32,
+    #[proto(tag = 4)] d: Option<String>,
+    #[proto(tag = 5)] e: Vec<u64>,
+    #[proto(tag = 6, packed = false)] f: Vec<i32>,
+    #[proto(tag = 7)] g: Vec<String>,
+    #[proto(tag = 8)] h: Vec<u8>,
+    #[proto(tag = 9, map(key = "string", value = "message"))] i: BTreeMap<String, Msg>,
+    #[proto(tag = 10)] j: HashMap<u32, bool>,
+    #[proto(tag = 11)] k: Option<Box<Msg>>,
+    #[proto(tag = 12)] l: EnumValue<Color>,
+    #[proto(tag = 13, required)] m: f64,
+    #[proto(tag = 14)] r#type: f32,
+    #[proto(oneof)] choice: Option<Choice>,
+    #[proto(skip)] cache: u8,
+    #[proto(unknown)] unknown: UnknownFields,
+}
+
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct Empty {}
+"##
+);
+
+case!(
+    ProtoDuplicateTag,
+    accepts: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 1)] a: i32, #[proto(tag = 2)] b: i32 }
+"##,
+    rejects: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 1)] a: i32, #[proto(tag = 1)] b: i32 }
+"##
+);
+
+case!(
+    ProtoTagZero,
+    accepts: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 1)] a: i32 }
+"##,
+    rejects: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 0)] a: i32 }
+"##
+);
+
+case!(
+    ProtoReservedTag,
+    accepts: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 18999)] a: i32 }
+"##,
+    rejects: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 19000)] a: i32 }
+"##
+);
+
+case!(
+    ProtoMissingTag,
+    accepts: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 1)] a: i32, #[proto(skip)] b: i32 }
+"##,
+    rejects: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 1)] a: i32, b: i32 }
+"##
+);
+
+case!(
+    ProtoPackedString,
+    accepts: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 1, packed = false)] a: Vec<String> }
+"##,
+    rejects: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 1, packed)] a: Vec<String> }
+"##
+);
+
+case!(
+    ProtoUnknownAttribute,
+    accepts: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 1, sint32)] a: i32 }
+"##,
+    rejects: r##"
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 1, zigzag)] a: i32 }
+"##
+);
+
+case!(
+    ProtoOneofOverlapsMessage,
+    accepts: r##"
+#[derive(ferroly_derive::ProtoOneof)]
+enum O { #[proto(tag = 2)] A(i32) }
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 1)] a: i32, #[proto(oneof)] o: Option<O> }
+"##,
+    rejects: r##"
+#[derive(ferroly_derive::ProtoOneof)]
+enum O { #[proto(tag = 1)] A(i32) }
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(tag = 1)] a: i32, #[proto(oneof)] o: Option<O> }
+"##
+);
+
+case!(
+    ProtoOneofNotOption,
+    accepts: r##"
+#[derive(ferroly_derive::ProtoOneof)]
+enum O { #[proto(tag = 2)] A(i32) }
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(oneof)] o: Option<O> }
+"##,
+    rejects: r##"
+#[derive(ferroly_derive::ProtoOneof)]
+enum O { #[proto(tag = 2)] A(i32) }
+impl Default for O { fn default() -> Self { O::A(0) } }
+#[derive(Default, ferroly_derive::ProtoMessage)]
+struct M { #[proto(oneof)] o: O }
+"##
+);
+
+case!(
+    ProtoEnumWithData,
+    accepts: r##"
+#[derive(Clone, Copy, ferroly_derive::ProtoEnumeration)]
+enum E { A = 0, B = 1 }
+"##,
+    rejects: r##"
+#[derive(Clone, Copy, ferroly_derive::ProtoEnumeration)]
+enum E { A, B(i32) }
+"##
+);
+
+// A discriminant outside i32 would be truncated by `as i32`, colliding with
+// another value; a const assertion per variant rejects it.
+case!(
+    ProtoEnumOutOfRange,
+    accepts: r##"
+#[derive(Clone, Copy, ferroly_derive::ProtoEnumeration)]
+#[repr(i64)]
+enum E { A = 0, B = -2_147_483_648, C = 2_147_483_647 }
+"##,
+    rejects: r##"
+#[derive(Clone, Copy, ferroly_derive::ProtoEnumeration)]
+#[repr(i64)]
+enum E { A = 0, B = 4_294_967_296 }
 "##
 );

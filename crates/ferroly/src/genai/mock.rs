@@ -45,7 +45,7 @@ pub enum MockReply {
 /// # async fn main() {
 /// let mock = MockProvider::new("mock");
 /// mock.push_text("first answer");
-/// mock.push_error(GenAiError::Api { status: 503, message: "busy".into() });
+/// mock.push_error(GenAiError::api(503, "busy"));
 ///
 /// let request = CompletionRequest::builder("any-model")
 ///     .message(Message::user("hello"))

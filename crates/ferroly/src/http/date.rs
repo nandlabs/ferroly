@@ -55,6 +55,79 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
     (year, month, day)
 }
 
+/// Parses a `Retry-After` value (delay seconds, or an IMF-fixdate converted
+/// against `now_unix`; a past date is a zero delay). Shared by
+/// `clients::parse_retry_after` and the OTLP exporter.
+#[cfg(any(feature = "clients", feature = "obs"))]
+pub(crate) fn parse_retry_after_at(value: &str, now_unix: u64) -> Option<std::time::Duration> {
+    use std::time::Duration;
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return value.parse().ok().map(Duration::from_secs);
+    }
+    let at = parse_imf_fixdate(value)?;
+    Some(Duration::from_secs(at.saturating_sub(now_unix)))
+}
+
+/// Parses `"Sun, 06 Nov 1994 08:49:37 GMT"` into Unix seconds.
+#[cfg(any(feature = "clients", feature = "obs"))]
+fn parse_imf_fixdate(value: &str) -> Option<u64> {
+    let mut fields = value.split(' ');
+    let weekday = fields.next()?;
+    if weekday.len() != 4 || !weekday.ends_with(',') {
+        return None;
+    }
+    let day = two_digits(fields.next()?)?;
+    let month = match fields.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year = fields.next()?;
+    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: u64 = year.parse().ok()?;
+    let mut clock = fields.next()?.split(':');
+    let hour = two_digits(clock.next()?)?;
+    let minute = two_digits(clock.next()?)?;
+    let second = two_digits(clock.next()?)?;
+    if clock.next().is_some() || fields.next() != Some("GMT") || fields.next().is_some() {
+        return None;
+    }
+    if year < 1970 || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 (the civil-from-days algorithm, inverted).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y / 400;
+    let year_of_era = y % 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = (era * 146_097 + day_of_era).checked_sub(719_468)?;
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+#[cfg(any(feature = "clients", feature = "obs"))]
+fn two_digits(text: &str) -> Option<u64> {
+    if text.len() == 2 && text.bytes().all(|b| b.is_ascii_digit()) {
+        text.parse().ok()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

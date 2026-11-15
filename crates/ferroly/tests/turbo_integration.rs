@@ -417,6 +417,7 @@ async fn trace_context_propagates_trace_id() {
 
 #[cfg(feature = "auth")]
 #[tokio::test]
+#[allow(deprecated)] // the legacy jwt_auth / encode_hs256 pair
 async fn jwt_auth_guards_routes() {
     use ferroly::auth::encode_hs256;
     use ferroly::codec::Value;

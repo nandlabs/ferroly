@@ -185,6 +185,8 @@ pub enum Body {
 pub enum Derive {
     Encode,
     Decode,
+    /// `#[derive(JsonSchema)]`.
+    Schema,
 }
 
 pub struct Container {
@@ -289,9 +291,13 @@ impl Container {
     /// per type parameter that an encoded/decoded field mentions.
     pub fn generics_for(&self, derive: Derive) -> Generics {
         let mut generics = self.generics.clone();
+        let inferred = None;
         let (explicit, trait_path) = match derive {
             Derive::Encode => (&self.bound_encode, quote! { ::ferroly::codec::Encode }),
             Derive::Decode => (&self.bound_decode, quote! { ::ferroly::codec::Decode }),
+            // `bound = "..."` names `Encode`/`Decode` predicates, which say
+            // nothing about `JsonSchema`: always infer.
+            Derive::Schema => (&inferred, quote! { ::ferroly::codec::schema::JsonSchema }),
         };
         let mut predicates: Vec<WherePredicate> = Vec::new();
         match explicit {
@@ -335,12 +341,15 @@ impl Keys {
     }
 }
 
+/// Why `deny_unknown_fields` and `flatten` are refused together.
+const DENY_FLATTEN: &str =
+    "`deny_unknown_fields` cannot be combined with a `flatten` field: the flattened field \
+             receives every key the struct does not name, so no key is ever unknown; remove one \
+             of the two, or put `deny_unknown_fields` on the flattened type instead";
+
 fn check_deny_flatten(fields: &FieldSet, deny: Option<Span>) -> syn::Result<()> {
     match deny {
-        Some(span) if fields.has_flatten() => Err(syn::Error::new(
-            span,
-            "`deny_unknown_fields` cannot be combined with a `flatten` field",
-        )),
+        Some(span) if fields.has_flatten() => Err(syn::Error::new(span, DENY_FLATTEN)),
         _ => Ok(()),
     }
 }
@@ -755,7 +764,7 @@ mod tests {
                 #[ferroly(deny_unknown_fields)]
                 struct S { #[ferroly(flatten)] rest: Rest }
             }),
-            "`deny_unknown_fields` cannot be combined with a `flatten` field"
+            DENY_FLATTEN
         );
         // `skip` may name the function that supplies the value.
         assert!(parse(parse_quote! {

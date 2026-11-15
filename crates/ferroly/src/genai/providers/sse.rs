@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::Sender;
 
-use super::common::{map_http_error, CallGuard};
+use super::common::{map_body_error, CallGuard};
 use ferroly::genai::{CompletionChunk, GenAiError, TimeoutPhase};
 use ferroly::http::Response;
 
@@ -329,7 +329,7 @@ async fn read_chunk(
         },
         None => read.await,
     };
-    result.map_err(|e| map_http_error(e, TimeoutPhase::StreamIdle))
+    result.map_err(|e| map_body_error(e, TimeoutPhase::StreamIdle))
 }
 
 /// Reads a streaming HTTP response chunk by chunk, decodes it with `parser`

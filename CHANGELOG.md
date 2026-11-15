@@ -5,6 +5,716 @@ All notable changes to this project are documented here. The format is based on
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
 
+## [0.6.0]
+
+New-capability and hardening release. It closes 21 issues: HTTP/2 and gRPC,
+Protocol Buffers with `.proto` code generation, verify-only Ed25519 (`sig`), a
+content-addressed artifact cache with S3, Hugging Face and OCI adapters
+(`store`), a sandboxed Jinja2-subset template engine (`template`), JSON-Schema
+`pattern`, a bridge from the `log` facade crate, configuration layers,
+unknown-key checks, config file discovery and secret references, typed
+argument merging and dynamic cli flags, cli occurrences and indices, decode
+errors that name the failing field, shortest `f32` output, a plain-text span
+exporter, real memory mapping on Windows, byte sizes, and an opt-out `ring`
+crypto backend. It also automates publishing to crates.io (#90), and fixes
+every finding of two deep reviews of the crate, many of them security fixes
+(see "Security"). No public item was removed, but several behaviours and a few
+types changed: **read "Breaking / behaviour changes" before upgrading from
+0.5.**
+
+### Breaking / behaviour changes
+
+**Upgrading from 0.5:**
+
+- **auth**: HMAC secrets must meet the RFC 7518 per-algorithm minimum: 32 bytes
+  for HS256, 48 for HS384 and 64 for HS512 (it was 16 for all three).
+  `MIN_SECRET_LEN` is now 32 and `Algorithm::min_secret_len()` gives each
+  minimum; a shorter secret is `JwtError::WeakSecret`. Rotate short secrets;
+  until then only the deprecated legacy functions accept them.
+- **auth**: the `auth` feature now implies `sig` (EdDSA JWTs verify through
+  `ferroly::sig`).
+- **auth / turbo**: `auth::encode_hs256` / `decode_hs256`, `turbo::Router::jwt_auth`
+  and `JwtAuth::legacy_hs256` are deprecated in favour of the validating API
+  (`encode_hmac`, `decode_hs256_with`, `JwtAuth::hs256(secret, Validation::new())`,
+  `Router::jwt_auth_with`). `encode_hs256` with an empty secret now returns an
+  empty string (no token).
+- **auth**: `RemoteJwks` refuses a non-`https://` key-set or issuer URL with
+  `JwtError::KeyFetch`, sending nothing, unless `allow_insecure_http(true)` is
+  set; it used to fetch `http://` URLs silently. A failed first fetch is
+  retried at most once per `min_refresh_interval`, and a key set older than
+  `max_stale` is no longer served.
+- **turbo**: a token that cannot be checked (`JwtError::KeyFetch`,
+  `NoCryptoProvider`) is answered `503 authentication unavailable` instead of
+  `401`. A request with more than one `Authorization` header (or API-key
+  header) is answered `401`, even by an optional authenticator.
+- **turbo / rest**: `Router::serve*` validates the router before binding. A
+  malformed pattern, conflicting routes or an unusable middleware configuration
+  now stops start-up with `HttpError::Io` (`InvalidInput`) wrapping the
+  `RouteError`, where the first route used to win silently.
+  `rest::ServerBuilder::build` validates too; `ServerBuilder::build_lenient` and
+  `Router::into_handler` keep the lenient behaviour.
+- **codec**: a decode error below the root is wrapped in
+  `CodecError::At { path, source }`, so code that matched a nested error's
+  variant should match `err.root_cause()`. `Display` gains the path
+  (`messages[1].role: expected string, found number`).
+- **codec**: a value of the wrong type is the new
+  `CodecError::TypeMismatch { expected, found }` on both decode paths, where it
+  was `Expected("string")`, `Expected("integer")` and so on; `Expected` remains
+  for a value of the right type that does not fit (`1.9` for an integer).
+  Malformed JSON is always `Parse`, also on the streaming path. See the
+  migration notes in `docs/codec.md`.
+- **codec**: an `f32` encodes as the shortest text that reads back as the same
+  `f32`, in JSON, YAML, TOML and XML (`0.1`, not `0.10000000149011612`), and
+  `Value::from(f32)` holds the `f64` nearest that text. `f64` output is
+  unchanged.
+- **codec**: a JSON integer literal wider than 64 bits decodes into `i128` /
+  `u128` exactly or fails. On the `Value` path, where such a literal is already
+  a float, a float at or beyond 2^53 is rejected instead of decoding as a
+  rounded number.
+- **codec / turbo**: schema validation stops after `DEFAULT_MAX_VIOLATIONS`
+  (100; `Schema::with_max_violations`) and appends a truncation marker
+  (`Violation::is_truncation`); turbo's `422` problem lists at most that many
+  and adds `"truncated": true`. Violation paths escape property names as JSON
+  Pointer tokens.
+- **hash**: `HashAlgorithm` gains a provided `wipe_output` method (a no-op by
+  default) that `Hmac` and the KDFs use to wipe intermediate digests. A hash
+  implemented outside the crate compiles unchanged, but should override it.
+- **hash / http**: a PEM body accepts `=` only as final padding; it used to be
+  dropped wherever it appeared.
+- **genai**: `GenAiError::Api` is a `#[non_exhaustive]` variant with new
+  `error_type` and `retry_after` fields. Match it with
+  `GenAiError::Api { status, .. }` and build it with
+  `GenAiError::api(status, message)` plus `with_error_type` /
+  `with_retry_after`.
+- **genai**: a transport failure after the connection was established
+  (`GenAiError::Transport`) is no longer retried, and the router treats it like
+  a response timeout (no fail-over unless `fallback_on_timeout`), so a billed
+  completion is never repeated. A failure before any byte was sent is the new
+  `GenAiError::Connect` and stays retryable; the decision uses
+  `HttpError::is_connect_failure`, not the error's text.
+- **genai**: an `Image` part with a non-image MIME type, and a non-image
+  `FileRef` sent to OpenAI (previously sent as text), are refused with
+  `GenAiError::Config` before anything is sent. An empty `2xx` stream is a
+  `ResponseParse` failure. The OpenAI catalog follows the 2026-11-15 model
+  list, which can change the model the router picks.
+- **ws**: `WsServerConfig::tls` is now `Option<ReloadableTlsConfig>` (it was
+  `Option<TlsConfig>`), read once per accepted connection so `reload()` rotates
+  the certificate. The `tls(..)` builder accepts either type; code that assigns
+  the field directly converts with `.into()`.
+- **config**: `Config::extract` reports a decode error inside a field as
+  `ConfigError::InvalidValue { key, source }`, with the full key path and the
+  root cause; `Config::get` joins the section path and the key. Errors about the
+  root stay `ConfigError::Codec`.
+- **config**: a key of more than 128 segments, from args, cli flags,
+  environment variables, secret directories or `.properties` files, is ignored
+  like a key with an empty segment.
+- **lifecycle**: `RestartPolicy` is `#[non_exhaustive]`; build it with
+  `RestartPolicy::new` and `with_backoff` / `reset_after`.
+- **clients**: `RetryDecision::RetryAfter(d)` and `ErrorClass::retry_after(d)` wait
+  `max(d, planned backoff)` instead of exactly `d`, so `Retry-After: 0` or a date
+  in the past keeps the jittered backoff instead of firing the remaining retries
+  at once.
+- **vectorstore**: `MemoryStore`'s async `search` scans a namespace of at least
+  `offload_threshold` (documents x dimension, default
+  `DEFAULT_OFFLOAD_THRESHOLD` = 2^20) on a shared worker pool. At most 256
+  offloaded searches may be queued or running; beyond that, `search` fails at
+  once with `VectorStoreError::Backend` ("the search pool is saturated").
+- **errutils**: module errors classify themselves, and several kinds change.
+  `JwtError` is no longer always `Unauthenticated` (`KeyFetch` is `Unavailable`,
+  `WeakSecret` `InvalidInput`, `InvalidKey` `Internal`, `NoCryptoProvider`
+  `Unsupported`); `WsError` is no longer always `Unavailable` (a timeout is
+  `Timeout`, a rejected upgrade takes its HTTP status's kind, `Protocol` is
+  `Internal`); an `HttpError` connect timeout is `Timeout` and a handler panic
+  `Internal`.
+- **obs**: the OTLP exporter no longer retries TLS failures, and honours a
+  `Retry-After` given as an HTTP date.
+- **Struct literals**: `http::ServerConfig` gains `http2` and `proxy_protocol`,
+  `genai::router::Task` gains `tenant`, and `RoutingConfig` gains `tenants`. A
+  struct literal without `..Default::default()` no longer compiles.
+- **http**: ferroly no longer selects a rustls crypto backend for its
+  consumers. With `tls-ring` on (the default), a provider the application
+  installs as the process default now takes precedence over `ring`, and
+  `default-features = false` also turns `tls-ring` off: add it, or install a
+  provider, if you use HTTPS.
+- **http**: the default client builds its TLS configuration at the first
+  `https` handshake, not in `build()`; with no crypto provider, TLS setup
+  returns `HttpError::Tls` instead of panicking.
+- **http**: the client keeps an HTTP/1.1 chunked trailer section (previously
+  discarded) and reports it through `Response::trailers`.
+- **codec**: `schema::validate` now enforces `pattern` (previously ignored) and
+  reports an invalid pattern as a `schema error:` violation. Patterns follow the
+  strict ECMA-262 u-flag rules, so an unescaped `}` or `\-` outside a class is
+  an error.
+- **New variants**: `ferroly::Error` gains `Sig`, `Store`, `Proto`, `Grpc` and
+  `Template`; `JwtError` gains `NoCryptoProvider` and `Replayed`; `GenAiError`
+  gains `Connect`; `Algorithm` and `KeyType` gain the new JWT algorithms and key
+  types. All these enums are `#[non_exhaustive]`.
+
+**Within the features new in 0.6** (changed since the first 0.6 preview in
+PR #102, or defaults worth knowing):
+
+- **config**: `${file:}` / `${env:}` interpolation is refused in values from
+  the environment, arguments or cli unless trusted with `interpolate_with`;
+  with a schema, cli arguments outside it are dropped, not reported.
+- **http2**: `max_keep_alive_requests` no longer caps HTTP/2 connections; use
+  `Http2Config::max_streams_per_connection`, which closes with the two-phase
+  GOAWAY of RFC 9113 §6.8.
+- **http2**: an HTTP/2 failure is `HttpError::Http2(Http2Error)` with a
+  structured `Http2Cause`, not `HttpError::Protocol(String)`.
+- **http**: over HTTP/1.1, a handler that returns `true` from
+  `wants_body_stream` runs as soon as the request head arrives and reads the
+  body as it is sent. A failed or abandoned body closes the connection after
+  the response.
+- **store**: a Hugging Face token is never sent to an `http://` endpoint unless
+  `HfClient::plain_http(true)` is set.
+- **store**: `StoreError::Protocol` is classified `InvalidInput`; a body that
+  ends short is the new `StoreError::Interrupted` (`Unavailable`, retryable).
+- **store**: the S3, HF and OCI adapters turn off the caller's client redirect
+  following and decompression and apply their own rules (S3 follows no
+  redirect); OCI `pull` requires an image manifest (`Manifest::is_image`); S3
+  corrects clock skew only after `403 RequestTimeTooSkewed`, at most 24 hours,
+  and by default only over `https://` (`S3ClientBuilder::correct_clock_skew`).
+- **grpc**: generated code moves into `<service>_server` (trait and adapter)
+  and `<service>_client` submodules. `GrpcServer::serve` uses
+  `GrpcServer::server_config()` (no stall timeout, no per-connection stream
+  cap, a 10 ms rapid-reset threshold). `Channel::from_client` returns a
+  `ChannelBuilder` and requires a client with HTTP/2 enabled. A response
+  without a gRPC content type is an error.
+- **proto**: decoding charges `Limits::max_decoded_bytes` (default 256 MiB) for
+  the memory it creates; generated struct fields follow field-number order;
+  Rust name clashes in generated code are an `IdlError`; the parser rejects a
+  proto3 field of a proto2 enum, a non-bool `packed`, enum values clashing in
+  one scope, `allow_alias` without aliases and octal escapes above `\377`.
+- **sig**: `SigError::MalformedSignature` is classified `Unauthenticated`, like
+  `VerificationFailed`.
+- **vectorstore**: the new `load_file` / `load_dir` loaders are bounded by
+  default `LoadOptions`: 16 MiB per file; 256 MiB, 10 000 files and depth 32
+  per directory load. They read only regular files.
+- **genai**: in routing configuration, a present `allowed_providers` or
+  `allowed_models` list, even `[]`, is an allow-list (`[]` allows nothing).
+
+### Added
+
+- **http2**: new `http2` feature: hand-rolled HTTP/2 (RFC 9113) for the `http`
+  server and client: ALPN `h2` over TLS, h2c with prior knowledge, HPACK
+  (RFC 7541), connection and stream flow control, multiplexing,
+  SETTINGS / PING / GOAWAY / RST_STREAM, and a graceful GOAWAY on drain. Existing
+  handlers, `turbo` routers and `rest` servers serve HTTP/2 unchanged (#7).
+- **http2**: defences against rapid reset (CVE-2023-44487), MadeYouReset,
+  CONTINUATION flood (CVE-2024-27316), HPACK bombs and SETTINGS / PING /
+  PRIORITY / empty-DATA floods, tunable through `Http2Config`.
+- **http2**: `ServerConfig::http2`, `ClientBuilder::http2` /
+  `http2_prior_knowledge` / `http2_config`; the client multiplexes over a
+  connection per origin, opens more (up to `max_connections_per_origin`) when
+  one is saturated, and falls back to HTTP/1.1 when ALPN selects it.
+- **http2**: new `Http2Config` limits: `rapid_reset_threshold`,
+  `max_cancels_per_window` (client resets of incomplete streams of any age),
+  `max_buffered_body_bytes` (a per-connection body budget),
+  `max_streams_per_connection`, `stream_stall_timeout`, `keepalive_interval` /
+  `keepalive_timeout` (PINGs, plus a SETTINGS ACK timeout) and
+  `max_connections_per_origin`.
+- **http2**: structured errors: `HttpError::Http2(Http2Error)` with
+  `Http2Cause` (`Reset`, `Refused`, `GoAway`, `ConnectionClosed`, `Io`,
+  `Timeout`, `LocalLimit`, `LocalReset`, `Protocol`), `Http2ErrorCode` and
+  `HttpError::http2_cause()`. The server passes all 146 h2spec 2.6.0 cases.
+- **http**: trailers: `HttpResponse::trailer` / `with_trailers` / `trailers`,
+  `Response::trailers` / `bytes_with_trailers` (HTTP/2 trailing HEADERS and the
+  HTTP/1.1 chunked trailer section).
+- **http**: streamed bodies in both directions: `body_channel`, `BodySender`,
+  `BodyStream`, `HttpResponse::body_stream`, `HttpHandler::wants_body_stream` with
+  `Request::take_body_stream`, and `Client::send_body_stream`. Over HTTP/1.1 a
+  streaming handler receives `Content-Length` and chunked bodies piece by piece
+  under the existing caps, chunked request trailers included.
+- **http**: `Protocol`, `Request::protocol` and `Response::protocol`;
+  `BodySender::closed()`, so a producer notices that its reader went away.
+- **http**: PROXY protocol v1 and v2 on the server listener:
+  `ServerConfig::proxy_protocol` with a `ProxyProtocol` allow-list of trusted
+  networks (`new`, `trust`, `trust_ip`, `from_cidrs`). The header's source and
+  destination become `Request::peer_addr` / `local_addr`; untrusted sources are
+  served directly and never parsed.
+- **http**: `ClientBuilder::pool_max_active_per_host` caps the HTTP/1.1
+  connections to one host, queueing requests in order (default unlimited);
+  `Client::with_max_redirects` and `Client::with_decompress`, per-client
+  overrides that keep the pool; `HttpError::is_connect_failure`, true only when
+  no request byte was sent.
+- **http**: `tls-ring` feature (on by default, in `full`) supplying `ring` as the
+  rustls crypto backend (#58).
+- **grpc**: new `grpc` feature and `ferroly::grpc` module: gRPC over the
+  in-house HTTP/2 stack with `proto` messages. `GrpcServer` is an `HttpHandler`
+  served by the `http` server over h2c or TLS + ALPN, with unary,
+  server-streaming, client-streaming and bidirectional calls (#9).
+- **grpc**: `Channel` client with per-call and default deadlines (sent as
+  `grpc-timeout` and enforced locally), cancellation by dropping, multiplexed
+  connections, and no silent fall back to HTTP/1.1.
+- **grpc**: `Status` with the 17 standard codes, percent-encoded `grpc-message`,
+  `grpc-status-details-bin` and the spec's HTTP-to-gRPC mapping; `Metadata` with
+  ASCII and binary (`-bin`) keys and reserved-key filtering; typed
+  `Streaming` / `StreamSender` streams; 4 MiB message limits checked before
+  allocation.
+- **grpc**: `codegen::GrpcGenerator` for `proto::codegen::Config::service_generator`,
+  emitting a server trait, a `…Server` adapter (which accepts an
+  `Arc<dyn Trait>`) and a typed `…Client` per service.
+- **grpc**: the standard health service `grpc.health.v1.Health` (Check and
+  Watch, `HealthReporter::shutdown`, run by `serve` on shutdown), and
+  `GrpcServer::fallback` to serve gRPC and plain HTTP (for example a `turbo`
+  router) on one port.
+- **grpc**: transparent retry of refused calls (`REFUSED_STREAM`, beyond a
+  GOAWAY's last stream id): once at once, then once after a random 25 to 75 ms
+  pause, with the remaining `grpc-timeout`; unary and server-streaming requests
+  are replayable, and streamed uploads keep up to 256 KiB for replay.
+- **grpc**: the `Interceptor` trait, on `ChannelBuilder` and `GrpcServer`; request
+  deadlines (`with_deadline`, `set_deadline`, `inherit_deadline`); `gzip` /
+  `deflate` messages decoded on both sides; a per-message decoded-memory budget
+  (`max_decoded_bytes` on the server and `ChannelBuilder`);
+  `GrpcServer::server_config` and `require_te_trailers`;
+  `Streaming::next` / `collect` / `poll_message` (cancel-safe) and a lazy
+  `from_messages`.
+- **sig**: new `sig` feature and `ferroly::sig` module: verify-only Ed25519
+  (RFC 8032), hand-rolled on `hash`'s SHA-512: `Ed25519PublicKey::{from_bytes,
+  from_slice, verify, verify_ctx, verify_ph, verify_prehashed}`,
+  `Ed25519Signature`, and the fail-closed `verify_ed25519(key, msg, sig) -> bool`
+  (#6).
+- **sig**: streaming verifiers `Ed25519Verifier` (pure Ed25519, signature known
+  up front) and `Ed25519phVerifier` (Ed25519ph with an optional context).
+- **sig**: strict verification: `S >= L`, non-canonical or off-curve `A` / `R`
+  and small-order `A` / `R` are rejected, with the cofactorless equation;
+  `SigError` (`MalformedKey`, `MalformedSignature`, `InvalidContext`,
+  `VerificationFailed`) is `#[non_exhaustive]`. Tested against every RFC 8032
+  Ed25519 / Ed25519ctx / Ed25519ph vector, Wycheproof and the 12 speccheck edge
+  cases.
+- **sig**: keys from SPKI DER and PEM (RFC 8410) and OpenSSH lines (RFC 8709):
+  `Ed25519PublicKey::from_spki_der` / `to_spki_der`, `from_pem` and
+  `from_openssh`.
+- **store**: new `store` feature and `ferroly::store::Cache`: a SHA-256-keyed
+  artifact cache that verifies before committing (atomic rename), resumes
+  interrupted downloads with range requests, is a no-op on a hit, deletes and
+  reports mismatched content, and is safe for concurrent fetches of the same
+  digest within and across processes. Also `Digest` (`sha256:<hex>`), `Fetched`
+  / `ByteStream` / `fetch_http`, `insert`, `verify` and `purge_temp` (#8).
+- **store**: `Cache::with_stall_timeout`, `with_fetch_timeout`, `with_progress`,
+  `usage` and `evict_to` (`Evicted`); the directory is fsynced after a commit.
+- **store**: `store-s3`: an S3-compatible client signed with AWS Signature
+  Version 4 (checked against the AWS documentation examples): GetObject
+  (streaming, ranges), HeadObject and ListObjectsV2 with continuation tokens;
+  virtual-hosted and path-style addressing and endpoint override (MinIO,
+  LocalStack, R2); static, session-token or environment credentials, redacted in
+  `Debug`; `download` into the cache; `If-Match` between HEAD and GET;
+  `ObjectMeta::checksum_type`; `sigv4::canonical_path`.
+- **store**: `store-hf`: Hugging Face Hub files (models, datasets, spaces):
+  revision resolution, `HF_ENDPOINT` / `HF_TOKEN`, a token never sent to the CDN,
+  LFS files keyed by `X-Linked-Etag`, downloads pinned to `X-Repo-Commit`.
+- **store**: `store-oci`: OCI Distribution v2 pull: the `WWW-Authenticate`
+  Bearer token flow (anonymous or basic credentials) with token caching,
+  manifests by tag or digest verified against `Docker-Content-Digest`, blobs
+  verified into the cache through registry redirects, `Reference` parsing with
+  Docker Hub defaults.
+- **proto**: new `protobuf` feature and `ferroly::proto` module: the Protocol
+  Buffers wire format (varint, zig-zag, fixed, length-delimited, packed and
+  unpacked repeated, maps, oneof, open enums, proto3 implicit and explicit
+  presence, proto2 optional / required) with unknown fields preserved across a
+  decode and re-encode (#9).
+- **proto**: `#[derive(ferroly::proto::Message)]`, `Oneof` and `Enumeration`,
+  with compile errors for duplicate, zero or reserved field numbers and for
+  discriminants outside `i32`.
+- **proto**: bounded decoding through `proto::Limits` (depth, input size, field
+  count, and `max_decoded_bytes`, the in-memory size of what decoding creates,
+  charged before allocating); `Message::decode_length_delimited_with`.
+- **proto**: `proto::idl`, a `.proto` parser (proto3 and the common proto2
+  subset) with import resolution through `FsLoader` / `MemoryLoader` / closures,
+  built-in well-known types, and errors with line and column; `proto::codegen`,
+  a Rust code generator for `build.rs` (no `protoc`) that emits a
+  `ServiceDescriptor` per service and has a `ServiceGenerator` hook (with
+  `reserved_names`). Generated code builds under `#![deny(missing_docs)]`,
+  rustdoc and clippy, and `compile_to_file` prints `cargo:rerun-if-changed` for
+  every file it read (`FsLoader::locate`).
+- **derive**: `ProtoMessage`, `ProtoOneof` and `ProtoEnumeration` derives
+  (re-exported as `ferroly::proto::{Message, Oneof, Enumeration}`), and
+  `JsonSchema`.
+- **template**: new `template` feature (in `full`, needs only `codec`) and
+  `ferroly::template` module: a sandboxed Jinja2-subset engine built to run LLM
+  chat templates. `Template::parse(source, &Options)` once into an immutable,
+  `Send + Sync` `Template`, then `render(&Value)` concurrently (#91).
+- **template**: output, `if` / `elif` / `else`, `for` (filters, `else`, tuple
+  unpacking, `break` / `continue`, `loop.*`), `set` (names, tuples, namespace
+  attributes, blocks), macros, `raw`, comments, whitespace control with
+  `trim_blocks` / `lstrip_blocks` on by default, Jinja2 operator precedence,
+  lenient undefined values, the usual tests and filters, string, map and list
+  methods, `range`, `namespace`, `dict`, `raise_exception`, and host functions
+  (`Options::function`). `tojson` follows the Hugging Face convention.
+- **template**: syntax errors, unknown filters, tests, functions and
+  statements, and unsupported constructs (`include`, `import`, `extends`,
+  `block`, `call`, …) fail at parse time with a `TemplateError`
+  (`TemplateErrorKind`, byte offset, line and column); `Limits` cap source size,
+  nesting depth, iterations, calls, output and allocated bytes.
+  `ferroly::Error::Template`. Nine chat templates render byte for byte as
+  reference Jinja2 3.1.4 does.
+- **codec**: the JSON-Schema `pattern` keyword, with a built-in linear-time
+  regex engine (Thompson NFA / Pike VM, no backtracking, so no ReDoS) for the
+  interoperable ECMA-262 subset under u-flag rules. Unsupported syntax
+  (backreferences, lookaround, flags, `\p{}`, unknown escapes) is a schema error;
+  pattern length, nesting depth and compiled size are capped (#57).
+- **codec**: `schema::Schema::compile` / `Schema::validate` compile a schema,
+  every `pattern` included, once for repeated validation;
+  `schema::SchemaError` names the offending keyword by JSON Pointer.
+- **codec**: `#[derive(JsonSchema)]` and the `schema::JsonSchema` trait (with
+  std impls) describe a type's encoded form from the same derive model as
+  `Encode` / `Decode` (renames, optional and default fields, skip, flatten,
+  `deny_unknown_fields`, all three enum representations); `Schema::of::<T>()`
+  compiles it.
+- **codec**: decode errors name the failing field: `CodecError::At` with
+  `PathSegment` (`Key` / `Index`), and the helpers `in_field`, `in_index`,
+  `path`, `path_string`, `root_cause` and `type_mismatch`. The derive adds the
+  key the input used (after renames, or the matching alias), tuple indexes and
+  externally tagged variant keys; std collections add the element index or
+  entry key. A successful decode allocates nothing extra (#92).
+- **codec**: shortest round-trip `f32` encoding, through the new defaulted
+  `Encoder::encode_f32` (#97).
+- **codec**: `codec::DateTime`, an RFC 3339 instant with its UTC offset
+  (nanosecond precision, years 0000 to 9999, calendar components), and
+  `SystemTime` `Encode` / `Decode` (RFC 3339 UTC out; RFC 3339, a
+  `{secs, nanos}` object or epoch seconds in).
+- **codec**: `Limits::reject_duplicate_keys` (`with_reject_duplicate_keys`)
+  makes a repeated JSON or YAML object key a parse error with its position.
+- **codec**: exact `i128` / `u128` decoding of wide JSON literals (new defaulted
+  `Decoder::decode_i128` / `decode_u128`); `xml::encode_pretty`, an indented
+  writer; `Format::decode_value`.
+- **codec**: runnable encode / decode examples in the `toml`, `json`, `yaml` and
+  `xml` module docs (#20).
+- **turbo**: `Ctx::validate_with` / `Ctx::read_valid_with` validate request
+  bodies against a compiled `Schema`; `read_valid*` decode from the validated
+  `Value` instead of parsing the body twice.
+- **turbo**: API-key authentication: `ApiKeyAuth` reads `X-API-Key` (or a
+  configured header, optionally a bearer token), looks up the key's SHA-256
+  digest in an `ApiKeyStore`, compares in constant time and checks scopes
+  (`401` / `403` / `503`). `ApiKey` (`generate` from the OS CSPRNG),
+  `MemoryApiKeyStore`, `Router::api_key` / `Group::api_key`,
+  `require_api_key_scopes` and `Ctx::api_key`, behind `hash`.
+- **turbo**: `Router::etag` (also on `Group` and `Route`) tags `200` GET / HEAD
+  responses with a strong or weak digest of the body, keeps a handler-set
+  `ETag`, and answers a matching `If-None-Match` with a bodiless `304`.
+- **auth**: JWT algorithms `RS384`, `RS512`, `PS256` / `PS384` / `PS512`, `ES384`,
+  `ES512` and `EdDSA` (Ed25519 JWKs, RFC 8037, through `ferroly::sig`);
+  `Jwk::algorithms` / `accepts` / `verify_signature_with`,
+  `from_ec_coordinates`, `from_ed25519_bytes`, `with_algorithm`,
+  `From<Ed25519PublicKey>`; `KeyType::{EcP384, EcP521, Ed25519}`.
+- **auth**: OIDC discovery with `RemoteJwks::from_issuer` (exact issuer match,
+  no https downgrade, discovered issuer required on tokens), `discover()` /
+  `issuer()`, `allow_insecure_http` and `max_stale`.
+- **auth**: `jti` replay protection: `Validation::replay_cache` with the
+  `ReplayCache` trait and a bounded `MemoryReplayCache` (`fail_closed`);
+  `JwtError::Replayed`.
+- **auth**: `JwtError::NoCryptoProvider`; `Algorithm::min_secret_len` and
+  `recommended_secret_len`.
+- **config**: `Layer`, a `#[non_exhaustive]` declarative list of configuration
+  sources (`Value`, `File`, `OptionalFile`, `Profile`, `Env`, `EnvWith`, `Args`,
+  `ArgsWith`, `SecretDir`, `OptionalSecretDir`, and `Cli` / `CliWith` /
+  `CliDefaults` with `cli`);
+  `ConfigBuilder::layers` and `Config::from_layers` apply it in order, with the
+  same provenance and errors as the matching `merge_*` call (#55).
+- **config**: unknown keys: `ConfigBuilder::schema`, `lenient` and
+  `build_checked` check each layer against a schema value as it is merged; an
+  `UnknownKey` names its source, its own spelling (dotted, `APP_X__Y`,
+  `--x.y`, file path) and a suggestion; `Config::ignored_keys` lists them in
+  lenient mode (#93).
+- **config**: file discovery: `config::search` (`user_config_dir`,
+  `default_dirs`, `find_first`, `macos_native`, `Platform`, and injectable
+  `_from` / `_for` forms) and `ConfigBuilder::merge_found`; `Source::is_file`
+  (#95).
+- **config**: secret references: `SecretRef` (feature `hash`) decodes
+  `env:NAME` / `file:/path`, refuses literals without showing more than two
+  characters, and resolves to a `hash::Secret`; `Config::redact_literals`;
+  `${env:NAME}` and `${file:/path}` interpolation, with file values always
+  masked (#96).
+- **config**: typed argument merging: `ArgsOptions` (`types(&schema)`,
+  `value_follows()`), `ConfigBuilder::merge_args_with`, `merge_cli_with` and
+  `dynamic_arity`; `merge_cli` also merges the cli's dynamic flags (#94).
+- **config**: mounted secret directories (Kubernetes and Docker secret volumes):
+  `merge_secret_dir` / `merge_secret_dir_optional` and `Layer::secret_dir` /
+  `optional_secret_dir`, values always masked (`Source::SecretDir`);
+  `SharedConfig::watch_files` (`ConfigWatcher`) and `SharedConfig::reload_on`
+  (with `lifecycle`) for hot reload.
+- **cli**: `Matches::occurrences()` (every flag in command-line order),
+  `indices_of(name)` and `subcommand_index()` (#98).
+- **cli**: dynamic flags: `Command::dynamic_flags(predicate)` and
+  `dynamic_flags_with` with `DynamicArity` (`Switch`, `Value`, `Optional`), read
+  back with `Matches::dynamic()` / `dynamic_indices()` (#94).
+- **cli**: fish and PowerShell completion scripts (`Shell::Fish`,
+  `Shell::PowerShell`).
+- **log**: `log-bridge` feature with `ferroly::log::bridge::{install,
+  install_global, is_installed, BridgeError, MAX_KV_FIELDS}`: records from the
+  `log` facade crate flow into a ferroly `Logger` with level, target and
+  per-target filtering, `module`, `caller` and typed key-value fields; the
+  facade's max level follows ferroly's filters (#56). `bridge::stats()` returns
+  `BridgeStats { forwarded, reentrant, truncated }`.
+- **obs**: `obs::PlainExporter`, a plain-text span exporter: one line per
+  finished span and an indented line per event, with `with_ids`,
+  `with_parent`, `min_duration`, `time_precision`, `utc_offset` and, with
+  `log`, `redact`; spans from many threads never interleave (#99).
+- **obs**: `OtlpBuilder::tls`, `proxy`, `http_client` and `protocol` with
+  `OtlpProtocol::{HttpJson, HttpProtobuf, Grpc}` (protobuf with `protobuf`,
+  gRPC with `grpc`).
+- **obs**: `obs::TraceInterceptor`, a client span per request of an
+  `http::Client` with `traceparent` injection; open spans are bounded, and an
+  evicted span carries `EVICTED_ATTRIBUTE` (`evicted_spans()`).
+- **messaging**: `messaging::Traced<P>` (with `obs`): producer and consumer
+  spans around any `Producer`, `Receiver` or `Provider`, with the `Ack` recorded
+  as `messaging.ack`.
+- **ws**: `ws::MetricsObserver` (with `metrics`): connections, messages, bytes,
+  closes, protocol errors, timeouts, rejected handshakes and full queues, with
+  bounded labels; wss certificate rotation through `ReloadableTlsConfig`.
+- **metrics**: the process collector reports CPU time, resident and virtual
+  memory and open descriptors on macOS and Windows, threads and the descriptor
+  limit on macOS, and the real start time on all three;
+  `Registry::register_collector_while` and `collector_count`.
+- **clients**: `CircuitBreaker::export_metrics` and
+  `CircuitBreakerRegistry::export_metrics` (with `metrics`) mirror breaker
+  state into `circuit_breaker_*` series, holding only weak references.
+- **lifecycle**: `ComponentOptions::watch_liveness(LivenessWatch)` polls a
+  component's `health()` and reports a failure to the restart policy after
+  `failure_threshold` `Down` answers (`initial_delay`);
+  `RestartPolicy::reset_after`.
+- **genai**: `MessagePart::Document` (`add_document_part`, `document`, `binary`)
+  for inline documents; `GenAiError::Connect`; `GenAiError::api`,
+  `with_error_type`, `with_retry_after` and `error_type()`.
+- **genai**: `DefaultRouter::reload_config` applies a reloaded `RoutingConfig`
+  atomically; per-tenant policies with `Task::tenant` and `TenantPolicy`
+  (`new`, `deny_all`, `allow_provider`, `allow_model`, strategy and priority
+  overrides), from code (`RouterBuilder::tenant_policy`) or `routing.tenants`;
+  `require_tenant_policy(true)` refuses unknown tenants; the
+  `EmbeddingRouter` applies tenant policies too.
+- **vectorstore**: `MemoryStore::offload_threshold`; `load_file` / `load_dir`
+  (and `_with` forms taking `LoadOptions`) read plain-text and Markdown into
+  `LoadedText`, whose `chunks()` gives `TextChunk`s that convert into
+  `RagDocument`s.
+- **fsutils**: `FileLock`, an OS file lock (`flock` / `LockFileEx`) released
+  by the kernel when its holder dies: `acquire`, `try_acquire`,
+  `acquire_timeout`, `acquire_wait`, `owner`, `release`.
+- **fsutils**: `fsutils::size`: `format_bytes` (KiB to EiB) and
+  `format_bytes_si` (kB to EB) with `Precision`, and `ByteSize` parsing `1024`,
+  `64KiB`, `1.5 MiB`, `2G` or `500MB`, with `Encode` / `Decode` and
+  `JsonSchema` under `codec` (#101).
+- **fsutils**: `Mmap::map` really maps files on 64-bit Windows
+  (`CreateFileMappingW` + `MapViewOfFile`); `Mmap::map_supported()` is true
+  there (#100).
+- **hash**: `hash::random` works on Windows (`BCryptGenRandom`); it was
+  `Unsupported`.
+- **errutils**: `Classify` on `HttpError`, `VfsError`, `GenAiError`,
+  `JwtError`, `WsError` and `MessagingError`; `ferroly::Error` delegates to
+  them.
+- **crate root**: `ferroly::Error` gains `Sig`, `Store`, `Proto`, `Grpc` and
+  `Template` variants, each classified under `errutils`.
+- **ci**: crates.io publish automation: `publish.yml` (verify, then publish
+  from the protected `crates-io` environment, with a dry run, an index wait,
+  optional trusted publishing and a dispatch input to publish an existing tag),
+  `tag-on-merge` that tags the merged head for any merge method, the daily
+  `crates-io-drift` check with an alerting issue, and
+  `.github/scripts/check-release-version.sh` (Refs #90).
+- **ci**: an `Interop` workflow with required h2spec, grpc-go (both
+  directions) and Go `net/http` jobs; MSRV test runs, i686 checks, an
+  `rt`-without-tokio consumer, and SHA-pinned actions.
+- **fuzz**: new targets `h2_frames`, `h2_conn`, `grpc_frames`, `regex_match`,
+  `ed25519_verify`, `ed25519_structured`, `proto_decode`, `www_authenticate`
+  and `template_jinja`, and a seed corpus for `template_render`.
+
+### Changed
+
+- **build**: the optional `log` crate (no transitive dependencies) is the one
+  exception to the dependency budget, and only with `log-bridge`.
+- **build**: with tokio present, `obs` enables tokio's `rt-multi-thread`, so
+  `obs` + `http` builds without default features.
+- **genai**: the model-router YAML policy in `docs/model-router.md`, the
+  `RoutingConfig` rustdoc and the router tests use compact YAML
+  (`- provider: openai`, `capabilities: [text, chat]`); a test pins that it
+  decodes the same as the verbose form (#24).
+- **hash**: one always-compiled base64 implementation; `hash::base64`
+  re-exports it unchanged.
+- **docs**: the `errutils` classification list is brought up to date; new
+  `docs/{sig,store,proto,grpc,template}.md`; the MSRV policy and the crates.io
+  release process in `CONTRIBUTING.md`; supported versions in `SECURITY.md`.
+
+### Deprecated
+
+- **auth**: `encode_hs256` and `decode_hs256`.
+- **turbo**: `Router::jwt_auth` and `JwtAuth::legacy_hs256`.
+
+### Fixed
+
+- **http**: applications that use `aws-lc-rs` (for example for FIPS) or another
+  rustls provider can use ferroly without `ring` (#58). A provider installed
+  after the first `https` request or JWK verification now takes over instead of
+  the `ring` fallback found earlier.
+- **http2**: review fixes H2-1 to H2-17 and HTTP-1 to HTTP-14: a handler task
+  aborted before its first poll freed no stream slot; closed-stream rules and
+  lower unused stream ids (h2spec 5.1); `:authority` / `:scheme` / control
+  character validation; trimmed header values on send; HEADERS no longer wait
+  behind the connection window; buffered bodies are admitted to the budget in
+  arrival order, and concurrent uploads beyond it finish; frames for recently
+  closed streams are not counted as floods (Go's client no longer gets
+  `ENHANCE_YOUR_CALM`); write and stall timers measure the right intervals;
+  drain covers the PROXY header and TLS handshake; idempotent requests on a
+  dead reused connection are retried; per-host slots are released; an idle
+  streamed upload stops when its stream is reset.
+- **http2**: a refused HTTP/2 request (or one lost on a reused connection) is
+  retried on another connection, dialing a new one while the origin is below
+  `max_connections_per_origin`, instead of going back to the connection that
+  refused it, so uploads refused for the per-connection body budget finish.
+- **grpc**: review fixes GRPC-1 to GRPC-15 and RPC-3 to RPC-12: one
+  structured `HttpError` to `Code` mapping (no message matching); a failure
+  after the deadline is `DEADLINE_EXCEEDED`; a refused attempt is stopped
+  before its replay; a panic in the response-stream pump or a server
+  interceptor ends the call with `INTERNAL`; a draining health service keeps
+  reporting `NOT_SERVING`; generated code compiles for rpcs named `Clone`,
+  `Deref` or `AsRef`, for messages named like generated items, and for clashing
+  client method names.
+- **proto**: review fixes PB-1 to PB-14 and RPC-1, RPC-2, RPC-9: required
+  fields are checked once every occurrence is merged (linear in the input),
+  `Message::merge` into a complete message works, a replaced oneof variant no
+  longer counts; encoding is linear at any depth; block-comment lexing is
+  linear; dotted names resolve as `protoc` does; the derive calls its helpers
+  fully qualified; generated code matches `protoc` byte for byte.
+- **store**: review fixes ST-1 to ST-17: `purge_temp` never removes a file a
+  fetch is using; cancelled waiters no longer leak; a cancelled claim always
+  parks its bytes again; the one retry from byte 0 happens only when the
+  content still began with the parked prefix; `fetch_http` turns off
+  decompression; `with_basic_auth` gets its own token cache; S3 checksums that
+  are not `FULL_OBJECT` are not used as digests; SigV4 canonicalises the path.
+- **sig**: review fixes SIG-1 to SIG-8: `Ed25519Verifier` keeps the `S`
+  validated in `new()`; addition chains for inversion and the square root
+  (about 10% faster verification); corrected strictness docs.
+- **codec**: review fixes MISC-RX-2 to MISC-RX-5, MISC-TV-2, CORE-1, CORE-9 to
+  CORE-15 and CDC-3 to CDC-10: a counted repetition such as
+  `^[a-z0-9]{1,255}$` costs about what `+` does; `is_match` reuses its
+  scratch; a lone surrogate escape matches nothing instead of failing to
+  compile; group names may repeat across alternatives; `#[derive(JsonSchema)]`
+  of a recursive type terminates; `Option<enum>` schemas accept `null`;
+  `DateTime::with_offset`, `to_utc` and `to_system_time` return `None` instead
+  of overflowing; a `SystemTime` far before the epoch keeps its sign; rendered
+  paths escape control and bidi characters and cap keys at 64 characters.
+- **config**: review fixes CORE-3 to CORE-8, CLI-1 to CLI-10, CDC-1 and CDC-2:
+  `watch_files` reloads once a change has settled, notices edits made before
+  it started, returns `Result<ConfigWatcher, ConfigError>`, and hashes at most
+  1 MiB per file; reloads never overlap; one bounded reader for every secret
+  file; a secret directory is read from one revision; typed
+  `merge_args_with` never takes `--` as a value, collects every occurrence of
+  a list key and reads the cli boolean spellings; settings merge in linear
+  time; `SecretRef` literal errors name the field.
+- **config** (config review, CFG-1 to CFG-11 and CFG-13):
+  - `${file:}` and `${env:}` expand only in trusted layers (files, values,
+    secret files and directories); in a value from the environment, the
+    arguments or the cli they are an `Interpolation` error and no file is
+    opened. Opt in with `ConfigBuilder::interpolate_with(InterpolateOptions::new().trust_env())`
+    or `.trust_args()`. A `${key}` reference expands as its own layer allows.
+  - With a schema, declared cli arguments outside it (`--config`, `-v`) are
+    dropped instead of reported as unknown; keys below a scalar or list leaf
+    (`--server.port.x`, `APP_PORT__X`) are unknown.
+  - Unknown-key suggestions are bounded in cost (banded distance, candidate
+    and work caps), the `UnknownKeys` message lists at most 50 keys, and a
+    literal dotted key is told to nest (`UnknownKey::dotted`).
+  - Secret taint survives odd key spellings and a second `interpolate()`;
+    `${env:}` values are masked; only well-formed `env:`/`file:` references
+    are shown in the redacted dump, and `to_redacted_string_with`'s
+    predicate is final.
+  - `config::search` refuses an `app` name that is not one path component
+    and a relative `HOME`/`APPDATA`; an unusable candidate (dangling link,
+    unreadable directory) is returned and fails on load instead of falling
+    through.
+  - Secret files are re-checked after opening (a regular file with the same
+    identity) and read from the handle.
+- **cli**: dynamic-flag arity (`DynamicArity`); names with an empty `.`
+  segment are never dynamic; `-` alone is an optional value.
+- **template** (template review, TPL-1 to TPL-14): `[] * n` no longer
+  spins; `sort`/`dictsort` use a total order (NaN last) and never panic;
+  checked arithmetic in slices, `range`, `split`, `center` and repetition;
+  `map('map', …)` counts against `max_depth`; `for` no longer copies the
+  list, so `break` cannot dodge the iteration budget; unpacking and string
+  slicing build only what they return; maps, scopes and argument lists are
+  indexed, so large inputs stay linear; `map(attribute=…, default=…)` and
+  macros defined in loops follow Jinja2; integer literals, `round`, `0 ** -n`,
+  `int` signs and undefined arguments to `int`/`float`/`indent` follow Jinja2.
+  New `Limits::max_steps` (default 10^8) bounds total work;
+  `DEFAULT_MAX_SOURCE_BYTES` is now 256 KiB.
+- **genai / vectorstore / obs**: review fixes SVC-2, SVC-3, SVC-5, SVC-6 and
+  SVC-9 to SVC-15, SVC-17: connect errors are decided by phase; an abandoned offloaded search is cancelled before it
+  starts; a configured tenant is laid over a code-registered one instead of
+  replacing it; an evicted client span is marked instead of failed; OTLP over
+  gRPC retries the specification's codes; a breaker's collector is removed with
+  its series; `Traced` keeps the consumer span current while the handler's
+  future is created and ends it on a panic; `ws_handshakes_rejected_total`
+  folds rare statuses into their class.
+- **lifecycle / turbo / errutils**: review fixes CORE-18 to CORE-23: the
+  liveness watchdog clamps its settings and charges a failure only to the
+  instance it sampled; an explicit HEAD whose body differs from GET gets no
+  computed `ETag`; `If-None-Match` is parsed as entity-tags; every `errutils`
+  variant is listed, and new ones default to `Unknown`.
+- **fsutils**: review fixes CORE-2, CORE-24, CORE-25 and FSO-1 to FSO-10:
+  `FileLock` keeps foreign file content, refuses links and reparse points, and
+  survives unlink races and `Duration::MAX`; `ByteSize` honours width and
+  alignment, requires a whole plain byte count and no longer treats bare `P`
+  and `E` as units; `PlainExporter` prints a failed span's status and marks
+  standalone events.
+- **ci**: release-workflow review fixes (REL-1 to REL-11, SVC-1, SVC-4, SVC-7,
+  SVC-8, SVC-16):
+  `publish.yml` runs from `main` only, checks out the SHA it verified, passes
+  no caller secrets and refuses an unprotected or tag-deployable `crates-io`
+  environment; one release-version check for every workflow; tag-on-merge
+  handles squash, merge-commit, rebase and fast-forward merges; the interop
+  jobs are required checks.
+
+### Security
+
+- **template**: untrusted templates can no longer hang (TPL-1), panic
+  (TPL-2, TPL-3), overflow the stack (TPL-4) or get around the iteration,
+  memory and time budgets (TPL-5 to TPL-8); `Limits::max_steps` caps total work.
+- **config**: an environment variable or argument can no longer read an
+  arbitrary file into a configuration value through `${file:}` (CFG-1), and
+  unknown-key suggestions can no longer be made to run for seconds (CFG-3).
+- **Denial of service**: HTTP/2 stream-slot leak (H2-1), rapid-reset and
+  cancel budgets (GRPC-1, GRPC-2, RPC-4), MadeYouReset (H2-3) and a
+  per-connection buffered-body budget (H2-2); protobuf memory amplification
+  (4 MiB of empty sub-messages expanded to a gigabyte; PB-1, RPC-9) and
+  quadratic encoding, block-comment lexing and required-field tracking (PB-5,
+  PB-10, RPC-1); a gRPC per-message decoded-memory budget; regex counted
+  repetition (MISC-RX-2); a stack overflow on a ~60k-segment config key
+  (CLI-9) and on recursive `JsonSchema` types (CORE-1); a panic in the OCI
+  challenge parser on a multi-byte quoted pair (ST-1); `DateTime` overflow
+  panics (CORE-11, CORE-14); unbounded secret-file reads (CORE-7); unbounded
+  vectorstore loader reads and a FIFO that blocked them; an unbounded
+  vectorstore search queue.
+- **Amplification**: an 8 MiB body of failing items became millions of schema
+  violations and a 200 to 500 MB `422` response (MISC-TV-1); a pattern
+  violation copied the whole pattern (MISC-RX-1).
+- **Credentials**: the OCI adapter answered an auth challenge from blob
+  storage and sent credentials to its realm (ST-2); the store adapters
+  followed the caller's redirects and decompression (ST-3, ST-4, ST-13); an HF
+  token went to `http://` endpoints (ST-15); S3 clock skew could be forged to
+  get requests signed for later (SEC-3); weak ETags in `If-Match` (SEC-2);
+  `RemoteJwks` over plain http, blocking during a fetch, and serving stale
+  sets forever (SEC-4, SEC-5, SEC-6); `jti` replay entries that expired before
+  the token (SEC-1, SEC-8); `KeyFetch` answered as `401` (SEC-7); ambiguous
+  repeated `Authorization` and API-key headers (SEC-11); cache directories
+  left group- or world-readable (ST-17, SEC-12); a crypto provider installed
+  late was bypassed (MISC-TLS-1); HMAC secrets below the RFC 7518 minimum.
+- **Key material**: hasher, HMAC, HKDF / PBKDF2 and SigV4 intermediate state is
+  wiped (checked by an allocator-based test, also in an optimised build;
+  SEC-9, SEC-10); `hash::random` and WebSocket mask seeds use the OS CSPRNG on
+  Windows too.
+- **Injection and spoofing**: completion scripts escaped control characters
+  and no longer use bash's `compgen -W`, which ran a `$(...)` choice at
+  completion time (CORE-16, CORE-17); the PROXY protocol header is parsed only
+  from trusted networks; `FileLock` refuses symbolic links and reparse points,
+  and `load_dir` refuses entries swapped for a link (CORE-24, CORE-25); decode
+  error paths escape control and bidi characters (CDC-4); the protobuf derive
+  calls its helpers fully qualified, so a trait in scope cannot hijack them
+  (PB-8); `genai` refuses an image part whose MIME type is not an image.
+- **`unsafe`**: the crate has four audited `unsafe` regions, all FFI, each an
+  `#[allow(unsafe_code)]` module with `SAFETY` comments: `fsutils/mmap.rs`
+  (POSIX and now Windows mappings, behind `unsafe fn Mmap::map`),
+  `fsutils/oslock.rs` (`flock` / `LockFileEx` behind `FileLock`),
+  `hash/random/windows.rs` (one `BCryptGenRandom` call), and the read-only
+  macOS and Windows process-statistics calls in `metrics/process.rs`. CI checks
+  the FFI declarations on i686 Linux and i686 Windows. Everything else is
+  compiled with `unsafe_code = "deny"`.
+
 ## [0.5.0]
 
 Extension-readiness release for `messaging` and `vfs`: typed message

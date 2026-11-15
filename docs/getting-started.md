@@ -13,7 +13,7 @@ Ferroly is one crate with many optional modules. **Nothing but `codec` and
 ```toml
 [dependencies]
 # Everything (simplest while exploring):
-ferroly = { version = "0.5", features = ["full"] }
+ferroly = { version = "0.6", features = ["full"] }
 ```
 
 Once you know what you need, trim it:
@@ -21,7 +21,7 @@ Once you know what you need, trim it:
 ```toml
 [dependencies]
 # A JSON API server that talks to OpenAI and does vector search:
-ferroly = { version = "0.5", default-features = false, features = ["rest", "openai", "vectorstore"] }
+ferroly = { version = "0.6", default-features = false, features = ["rest", "openai", "vectorstore"] }
 ```
 
 Most async modules also need a runtime; add `tokio` yourself when you write
@@ -35,7 +35,7 @@ See the **[feature matrix](README.md#feature-matrix)** for what each feature pul
 in and whether it needs `tokio`/TLS. Rule of thumb:
 
 - **std-only (no tokio):** `codec`, `errutils`, `fsutils`, `config`, `auth`,
-  `log`, `vectorstore`.
+  `log`, `vectorstore`, `template`.
 - **needs `tokio`:** `lifecycle`, `messaging`, `vfs`.
 - **needs `tokio` + TLS:** `http`, `clients`, `turbo`, `rest`, `ws`, `genai`.
 
@@ -156,6 +156,7 @@ async fn main() -> Result<(), ferroly::Error> {
 - **[codec](codec.md)** — the data model, derives, JSON/XML/YAML, schema validation.
 - **[turbo](turbo.md)** / **[rest](rest.md)** — HTTP servers and middleware.
 - **[genai](genai.md)** / **[vectorstore](vectorstore.md)** — LLMs and vector search.
+- **[template](template.md)** — Jinja2 chat templates, sandboxed and bounded.
 - **[messaging](messaging.md)** / **[vfs](vfs.md)** — async infrastructure.
 - **[lifecycle](lifecycle.md)** / **[log](log.md)** / **[config](config.md)** — ops glue.
 - **[Crate README](../crates/ferroly/README.md)** — security posture and what is deliberately not included.

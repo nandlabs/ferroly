@@ -12,7 +12,8 @@ use super::error::RouterError;
 use super::strategy::{RoutingStrategy, RuleBasedStrategy};
 use super::strategy_capability::CapabilityStrategy;
 use super::strategy_composite::CompositeStrategy;
-use super::task::TaskKind;
+use super::task::{Priority, TaskKind};
+use super::tenant::TenantPolicy;
 use ferroly::genai::Capability;
 
 /// A routing rule: tasks of `kind` and/or carrying `tags` go to
@@ -137,6 +138,59 @@ pub(crate) fn parse_capabilities(
         .collect()
 }
 
+/// The routing policy of one tenant (`routing.tenants[]`), applied to tasks
+/// whose [`tenant`](super::Task::tenant) is `name`. See
+/// [`TenantPolicy`] for the semantics.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TenantConfig {
+    /// The tenant name, matched against [`Task::tenant`](super::Task::tenant).
+    pub name: String,
+    /// Providers whose every model the tenant may use. `None` (the key is
+    /// absent) sets no allow-list; `Some`, even empty, turns it on, so
+    /// `allowed_providers: []` without `allowed_models` allows nothing.
+    pub allowed_providers: Option<Vec<String>>,
+    /// Individual models the tenant may use; `None` and `Some` as for
+    /// `allowed_providers`.
+    pub allowed_models: Option<Vec<ModelRef>>,
+    /// The strategy for the tenant's calls (`capability`, `rule_based` or
+    /// `composite`, built over this config's `rules` and `default_model`).
+    pub strategy: Option<String>,
+    /// The priority for the tenant's calls (`quality`, `speed` or `cost`).
+    pub priority: Option<String>,
+}
+
+impl TenantConfig {
+    /// Builds the [`TenantPolicy`] this entry describes; `config` supplies the
+    /// rules a rule-based strategy uses.
+    pub fn to_policy(&self, config: &RoutingConfig) -> Result<TenantPolicy, RouterError> {
+        let ctx = || format!("tenant '{}'", self.name);
+        let mut policy = if self.allowed_providers.is_some() || self.allowed_models.is_some() {
+            TenantPolicy::deny_all()
+        } else {
+            TenantPolicy::new()
+        };
+        for provider in self.allowed_providers.iter().flatten() {
+            policy = policy.allow_provider(provider);
+        }
+        for m in self.allowed_models.iter().flatten() {
+            policy = policy.allow_model(&m.provider, &m.model);
+        }
+        if let Some(name) = &self.strategy {
+            policy = policy.strategy(config.build_strategy(name, &ctx())?);
+        }
+        if let Some(name) = &self.priority {
+            let priority = Priority::parse(name).ok_or_else(|| {
+                RouterError::Config(format!(
+                    "{}: unknown priority '{name}' (expected quality, speed or cost)",
+                    ctx()
+                ))
+            })?;
+            policy = policy.priority(priority);
+        }
+        Ok(policy)
+    }
+}
+
 /// The `genai.routing` configuration overlay. Every field is optional; an empty
 /// document yields an empty config.
 ///
@@ -146,22 +200,24 @@ pub(crate) fn parse_capabilities(
 ///     default_strategy: composite
 ///     fallback_depth: 2
 ///     rules:
-///       -
-///         kind: codegen
+///       - kind: codegen
 ///         provider: claude
 ///         model: claude-opus-5-5
-///       -
-///         tags:
-///           - sensitive
+///       - tags: [sensitive]
 ///         provider: ollama
 ///         model: llama3
 ///     default_model:
 ///       provider: openai
-///       model: gpt-4o-mini
+///       model: gpt-6.1-terra
+///     tenants:
+///       - name: acme
+///         allowed_providers: [ollama]
+///         allowed_models:
+///           - provider: claude
+///             model: claude-haiku-5-5
+///         strategy: capability
+///         priority: cost
 /// ```
-///
-/// (ferroly's YAML codec is block-style: put the `-` of a list item on its
-/// own line and use block sequences rather than `[a, b]`.)
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RoutingConfig {
     /// The strategy to build: `capability`, `rule_based` or `composite`
@@ -187,6 +243,8 @@ pub struct RoutingConfig {
     /// After how many days a compiled-in price is reported as stale
     /// (default 180). `0` disables the check.
     pub cost_staleness_days: Option<u32>,
+    /// Per-tenant routing policies.
+    pub tenants: Vec<TenantConfig>,
 }
 
 /// The age, in days, beyond which a compiled-in price is reported as stale.
@@ -282,6 +340,18 @@ impl RoutingConfig {
                 Ok(cm)
             })?,
             cost_staleness_days: o.opt_u32("cost_staleness_days")?,
+            tenants: o.list("tenants", |item, ctx| {
+                let mut t = Obj::new(item, ctx)?;
+                let tenant = TenantConfig {
+                    name: t.str("name")?,
+                    allowed_providers: t.opt_str_list("allowed_providers")?,
+                    allowed_models: t.opt_list("allowed_models", model_ref)?,
+                    strategy: t.opt_str("strategy")?,
+                    priority: t.opt_str("priority")?,
+                };
+                t.finish()?;
+                Ok(tenant)
+            })?,
         };
         o.finish()?;
         cfg.validate()?;
@@ -319,6 +389,20 @@ impl RoutingConfig {
         for cm in &self.custom_models {
             cm.to_model_info()?;
         }
+        let mut names: Vec<&str> = Vec::new();
+        for tenant in &self.tenants {
+            if tenant.name.trim().is_empty() {
+                return Err(RouterError::Config("a tenant has an empty name".into()));
+            }
+            if names.contains(&tenant.name.as_str()) {
+                return Err(RouterError::Config(format!(
+                    "tenant '{}' is configured twice",
+                    tenant.name
+                )));
+            }
+            names.push(&tenant.name);
+            tenant.to_policy(self)?;
+        }
         let has_rules = !self.rules.is_empty() || self.default_model.is_some();
         match self.default_strategy.as_deref() {
             Some("capability") if has_rules => Err(RouterError::Config(
@@ -343,6 +427,35 @@ impl RoutingConfig {
             None if has_rules => "composite",
             None => "capability",
         };
+        self.build_strategy(name, "default_strategy")
+    }
+
+    /// The per-tenant policies this configuration describes, by tenant name.
+    pub fn tenant_policies(&self) -> Result<Vec<(String, TenantPolicy)>, RouterError> {
+        self.tenants
+            .iter()
+            .map(|t| Ok((t.name.clone(), t.to_policy(self)?)))
+            .collect()
+    }
+
+    /// Builds the strategy `name` over this config's rules.
+    fn build_strategy(
+        &self,
+        name: &str,
+        context: &str,
+    ) -> Result<Box<dyn RoutingStrategy>, RouterError> {
+        if !STRATEGIES.contains(&name) {
+            return Err(RouterError::Config(format!(
+                "{context}: unknown strategy '{name}' (expected one of: {})",
+                STRATEGIES.join(", ")
+            )));
+        }
+        let has_rules = !self.rules.is_empty() || self.default_model.is_some();
+        if name == "rule_based" && !has_rules {
+            return Err(RouterError::Config(format!(
+                "{context}: strategy 'rule_based' needs rules or a default_model"
+            )));
+        }
         let rule_based = || -> Result<RuleBasedStrategy, RouterError> {
             let mut strategy = RuleBasedStrategy::new();
             for rule in &self.rules {
@@ -475,15 +588,22 @@ impl<'a> Obj<'a> {
     }
 
     fn str_list(&mut self, key: &'a str) -> Result<Vec<String>, RouterError> {
+        Ok(self.opt_str_list(key)?.unwrap_or_default())
+    }
+
+    /// Like [`str_list`](Self::str_list), telling an absent key (`None`)
+    /// from an empty list.
+    fn opt_str_list(&mut self, key: &'a str) -> Result<Option<Vec<String>>, RouterError> {
         match self.take(key) {
-            None => Ok(Vec::new()),
+            None => Ok(None),
             Some(Value::Array(items)) => items
                 .iter()
                 .map(|item| match item {
                     Value::Str(text) => Ok(text.clone()),
                     _ => Err(self.err(key, "expected a list of strings")),
                 })
-                .collect(),
+                .collect::<Result<_, _>>()
+                .map(Some),
             Some(_) => Err(self.err(key, "expected a list of strings")),
         }
     }
@@ -493,13 +613,24 @@ impl<'a> Obj<'a> {
         key: &'a str,
         parse: impl Fn(&'a Value, &str) -> Result<T, RouterError>,
     ) -> Result<Vec<T>, RouterError> {
+        Ok(self.opt_list(key, parse)?.unwrap_or_default())
+    }
+
+    /// Like [`list`](Self::list), telling an absent key (`None`) from an
+    /// empty list.
+    fn opt_list<T>(
+        &mut self,
+        key: &'a str,
+        parse: impl Fn(&'a Value, &str) -> Result<T, RouterError>,
+    ) -> Result<Option<Vec<T>>, RouterError> {
         match self.take(key) {
-            None => Ok(Vec::new()),
+            None => Ok(None),
             Some(Value::Array(items)) => items
                 .iter()
                 .enumerate()
                 .map(|(i, item)| parse(item, &format!("{}.{key}[{i}]", self.ctx)))
-                .collect(),
+                .collect::<Result<_, _>>()
+                .map(Some),
             Some(_) => Err(self.err(key, "expected a list")),
         }
     }
@@ -585,5 +716,61 @@ mod tests {
             ..cfg
         };
         assert_eq!(rb.strategy().unwrap().name(), "rule_based");
+    }
+
+    #[test]
+    fn tenants_parse_and_validate() {
+        let cfg = parse(
+            "    tenants:\n      -\n        name: acme\n        allowed_providers:\n          - ollama\n        allowed_models:\n          -\n            provider: claude\n            model: claude-haiku-5-5\n        strategy: capability\n        priority: cost\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tenants.len(), 1);
+        let policies = cfg.tenant_policies().unwrap();
+        let (name, policy) = &policies[0];
+        assert_eq!(name, "acme");
+        assert!(policy.permits("ollama", "anything"));
+        assert!(policy.permits("claude", "claude-haiku-5-5"));
+        assert!(!policy.permits("claude", "claude-opus-5-5"));
+        assert_eq!(policy.priority_override(), Some(Priority::Cost));
+        assert_eq!(policy.strategy_override().unwrap().name(), "capability");
+
+        // An empty allow-list allows nothing; an absent one allows all.
+        let cfg = parse(
+            "    tenants:\n      -\n        name: none\n        allowed_providers: []\n      -\n        name: open\n        priority: cost\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tenants[0].allowed_providers, Some(Vec::new()));
+        assert_eq!(cfg.tenants[0].allowed_models, None);
+        let policies = cfg.tenant_policies().unwrap();
+        assert!(policies[0].1.is_restricted());
+        assert!(!policies[0].1.permits("ollama", "anything"));
+        assert!(!policies[1].1.is_restricted());
+        assert!(policies[1].1.permits("ollama", "anything"));
+
+        for (yaml, needle) in [
+            (
+                "    tenants:\n      -\n        name: a\n        priority: fastest\n",
+                "unknown priority 'fastest'",
+            ),
+            (
+                "    tenants:\n      -\n        name: a\n        strategy: magic\n",
+                "unknown strategy 'magic'",
+            ),
+            (
+                "    tenants:\n      -\n        name: a\n        strategy: rule_based\n",
+                "needs rules",
+            ),
+            (
+                "    tenants:\n      -\n        name: a\n      -\n        name: a\n",
+                "configured twice",
+            ),
+            (
+                "    tenants:\n      -\n        name: a\n        budget: 3\n",
+                "unknown key 'budget'",
+            ),
+        ] {
+            let err = parse(yaml).unwrap_err().to_string();
+            assert!(err.contains(needle), "{yaml:?} gave {err:?}");
+        }
     }
 }

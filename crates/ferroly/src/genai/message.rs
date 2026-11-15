@@ -36,12 +36,36 @@ impl Role {
 pub enum MessagePart {
     /// Plain text.
     Text(String),
-    /// Inline binary data (e.g. an image), with its MIME type.
+    /// An inline image, with its MIME type. The MIME type must be an
+    /// `image/*` type: providers reject any other with
+    /// [`GenAiError::Config`](crate::genai::GenAiError::Config) instead of
+    /// sending, say, a PDF as an image. Send documents as
+    /// [`Document`](MessagePart::Document).
     Image {
         /// Raw bytes.
         data: Vec<u8>,
         /// MIME type, e.g. `image/png`.
         mime_type: String,
+    },
+    /// An inline document, e.g. a PDF, with its MIME type.
+    ///
+    /// | Provider | `application/pdf` | `text/*` | other |
+    /// |---|---|---|---|
+    /// | Claude | `document` block, base64 source | `document` block, text source | rejected |
+    /// | OpenAI | `file` content part (`file_data` data URL) | text part | rejected |
+    /// | Ollama | rejected | text part | rejected |
+    ///
+    /// A rejected document fails the call with
+    /// [`GenAiError::Config`](crate::genai::GenAiError::Config) before
+    /// anything is sent; a `text/*` document must be UTF-8.
+    Document {
+        /// Raw bytes.
+        data: Vec<u8>,
+        /// MIME type, e.g. `application/pdf`.
+        mime_type: String,
+        /// A file name or title for the document, when known (Claude's
+        /// `title`, OpenAI's `filename`).
+        name: Option<String>,
     },
     /// A reference to an external file (not inlined), e.g. `gs://bucket/doc.pdf`.
     FileRef {
@@ -79,6 +103,44 @@ pub enum MessagePart {
     },
 }
 
+impl MessagePart {
+    /// An [`Image`](MessagePart::Image) for an `image/*` MIME type, else a
+    /// [`Document`](MessagePart::Document) with no name.
+    pub fn binary(data: Vec<u8>, mime_type: String) -> MessagePart {
+        if is_image_mime(&mime_type) {
+            MessagePart::Image { data, mime_type }
+        } else {
+            MessagePart::Document {
+                data,
+                mime_type,
+                name: None,
+            }
+        }
+    }
+}
+
+/// Whether `mime_type` names an image (`image/…`, ignoring case).
+pub(crate) fn is_image_mime(mime_type: &str) -> bool {
+    mime_type
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+}
+
+/// The essence of a MIME type: lower-cased, parameters dropped
+/// (`Text/Plain; charset=utf-8` → `text/plain`).
+#[cfg_attr(
+    not(any(feature = "openai", feature = "claude", feature = "ollama")),
+    allow(dead_code)
+)]
+pub(crate) fn mime_essence(mime_type: &str) -> String {
+    mime_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
 /// A role-tagged, multi-part message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
@@ -100,7 +162,9 @@ impl Message {
         }
     }
 
-    /// Creates a binary (e.g. image) message.
+    /// Creates a binary message: an [`Image`](MessagePart::Image) part for
+    /// an `image/*` MIME type, a [`Document`](MessagePart::Document) part
+    /// (with no name) for anything else.
     pub fn binary(
         role: Role,
         id: impl Into<String>,
@@ -110,9 +174,24 @@ impl Message {
         Self {
             role,
             id: Some(id.into()),
-            parts: vec![MessagePart::Image {
+            parts: vec![MessagePart::binary(bytes, mime_type.into())],
+        }
+    }
+
+    /// Creates a message carrying one inline document (a PDF, a text file).
+    pub fn document(
+        role: Role,
+        bytes: Vec<u8>,
+        mime_type: impl Into<String>,
+        name: Option<String>,
+    ) -> Self {
+        Self {
+            role,
+            id: None,
+            parts: vec![MessagePart::Document {
                 data: bytes,
                 mime_type: mime_type.into(),
+                name,
             }],
         }
     }
@@ -244,11 +323,25 @@ impl Message {
         self
     }
 
-    /// Appends a binary part.
+    /// Appends a binary part: an [`Image`](MessagePart::Image) for an
+    /// `image/*` MIME type, a [`Document`](MessagePart::Document) otherwise.
     pub fn add_binary_part(&mut self, bytes: Vec<u8>, mime_type: impl Into<String>) -> &mut Self {
-        self.parts.push(MessagePart::Image {
+        self.parts
+            .push(MessagePart::binary(bytes, mime_type.into()));
+        self
+    }
+
+    /// Appends an inline document part.
+    pub fn add_document_part(
+        &mut self,
+        bytes: Vec<u8>,
+        mime_type: impl Into<String>,
+        name: Option<String>,
+    ) -> &mut Self {
+        self.parts.push(MessagePart::Document {
             data: bytes,
             mime_type: mime_type.into(),
+            name,
         });
         self
     }
@@ -277,6 +370,24 @@ mod tests {
         msg.add_binary_part(vec![0x89, 0x50], "image/png");
         assert_eq!(msg.parts.len(), 2);
         assert_eq!(msg.text_content(), "describe this");
+    }
+
+    #[test]
+    fn binary_parts_split_images_from_documents() {
+        let mut msg = Message::binary(Role::User, "m", vec![1], "application/pdf");
+        assert!(matches!(
+            &msg.parts[0],
+            MessagePart::Document { mime_type, name: None, .. } if mime_type == "application/pdf"
+        ));
+        msg.add_binary_part(vec![2], "IMAGE/PNG");
+        assert!(matches!(msg.parts[1], MessagePart::Image { .. }));
+        msg.add_document_part(vec![3], "text/plain", Some("notes.txt".into()));
+        assert!(matches!(
+            &msg.parts[2],
+            MessagePart::Document { name: Some(n), .. } if n == "notes.txt"
+        ));
+        assert_eq!(mime_essence("Text/Plain; charset=utf-8"), "text/plain");
+        assert!(!is_image_mime("img"));
     }
 
     #[test]

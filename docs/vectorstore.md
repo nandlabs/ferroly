@@ -317,6 +317,7 @@ map. `Clone` (a cheap handle on shared data), `Default`, `Debug`,
 | `len()`, `is_empty()`, `dimension()` | this namespace's size and vector dimension |
 | `clear()` | remove everything in this namespace and forget its dimension |
 | `upsert_sync`, `search_sync`, `delete_sync`, `get_sync`, `count_sync`, `delete_where_sync`, `list_sync` | synchronous forms of the trait methods |
+| `offload_threshold(Option<usize>) -> MemoryStore` | from what size (documents × dimension) the async `search` scans on a worker thread; default `DEFAULT_OFFLOAD_THRESHOLD` (2²⁰), `Some(0)` always, `None` never |
 | `save(path)`, `MemoryStore::load(path)` | snapshot to / from a JSON file |
 | `to_snapshot_json()`, `MemoryStore::from_snapshot_json(text)` | the same, to / from a string |
 
@@ -370,11 +371,33 @@ data.
 
 #### Blocking work and the `*_sync` methods
 
-This module depends on no async runtime, so `MemoryStore` cannot hand work to a
-blocking pool by itself: the async trait methods do everything inside the
-future's first poll, with no `.await` inside. For small collections that is
-fine. For a large one, a search holds an executor thread for the whole scan —
-run the synchronous form on your runtime's blocking pool instead (the handle is
+The async `search` moves a large scan off the executor by itself: once the
+namespace holds at least `offload_threshold` vector components (documents ×
+dimension, default `DEFAULT_OFFLOAD_THRESHOLD` = 2²⁰, about a millisecond of
+scanning), or while a writer holds the lock, the scan runs on a worker thread
+of a small built-in pool (at most four threads, started on first use) and the
+future waits for it. This module depends on no async runtime, so the pool is
+plain threads rather than tokio's `spawn_blocking`. A smaller namespace is
+scanned inline, where a thread hand-off would cost more than the scan. The
+scan still holds the store's read lock, so writers wait for it either way.
+
+The pool is shared by the whole process and sheds load. Dropping a `search`
+future (a caller's timeout fired) before its scan starts cancels the scan and
+frees the query, so abandoned searches do not delay later ones. At most 256
+offloaded searches may be queued or running at once; past that, `search`
+returns `VectorStoreError::Backend` ("the search pool is saturated") at once
+instead of growing the queue.
+
+```rust
+use ferroly::vectorstore::MemoryStore;
+
+let store = MemoryStore::new().offload_threshold(Some(100_000));  // or None: never offload
+# let _ = store;
+```
+
+The other async methods (upserts, deletes, filtered counts and lists) run
+inline in the future's first poll. To control the threads yourself, run the
+synchronous forms on your runtime's blocking pool (the handle is
 `Clone + Send + 'static`):
 
 ```rust
@@ -542,6 +565,75 @@ The splitters are punctuation heuristics, not language models:
 - `split_paragraphs` splits at one or more blank (empty or whitespace-only)
   lines, with `\n` or `\r\n` line endings.
 
+## Document loaders
+
+Plain-text and Markdown files, or whole directories of them, are read into
+`LoadedText` and cut into `TextChunk`s with a `Chunker`:
+
+```rust
+pub fn load_file(path: impl AsRef<Path>) -> Result<LoadedText, VectorStoreError>;
+pub fn load_dir(dir: impl AsRef<Path>) -> Result<Vec<LoadedText>, VectorStoreError>;
+pub fn load_file_with(path: impl AsRef<Path>, opts: &LoadOptions) -> Result<LoadedText, VectorStoreError>;
+pub fn load_dir_with(dir: impl AsRef<Path>, opts: &LoadOptions) -> Result<Vec<LoadedText>, VectorStoreError>;
+
+// Defaults: 16 MiB per file, 256 MiB and 10 000 files per directory load, depth 32.
+pub struct LoadOptions { /* private */ }
+impl LoadOptions {
+    pub fn new() -> Self;
+    pub fn max_file_bytes(self, bytes: u64) -> Self;
+    pub fn max_total_bytes(self, bytes: u64) -> Self;
+    pub fn max_files(self, files: usize) -> Self;
+    pub fn max_depth(self, depth: usize) -> Self;
+}
+
+#[non_exhaustive]
+pub enum TextFormat { Plain, Markdown }
+
+pub struct LoadedText { pub source: String, pub format: TextFormat, pub text: String }
+impl LoadedText {
+    pub fn new(source: impl Into<String>, format: TextFormat, text: impl Into<String>) -> Self;
+    pub fn chunks(&self, chunker: &Chunker) -> Vec<TextChunk>;
+}
+
+pub struct TextChunk { pub id: String, pub text: String, pub metadata: Value }
+```
+
+- `load_file` reads one UTF-8 file; `.md` / `.markdown` are Markdown,
+  everything else plain text. `source` is the path as given.
+- `load_dir` reads every `.txt`, `.text`, `.md` and `.markdown` file under the
+  directory, recursively and in path order, skipping hidden entries (names
+  starting with `.`) and symbolic links. A file that is not UTF-8 is
+  `VectorStoreError::InvalidInput`; an I/O failure is `Io`.
+- Both are bounded by `LoadOptions` (the plain forms use the defaults): a file
+  over `max_file_bytes`, a directory load past `max_total_bytes` or
+  `max_files`, or a sub-directory deeper than `max_depth` is `InvalidInput`.
+  Only regular files are read: a FIFO or device is refused before it is
+  opened, so it cannot block the load. `load_file` follows a link given as its
+  path; `load_dir` never does, and on Unix an entry swapped for a link between
+  the listing and the read is refused (device and inode are compared).
+- `chunks` drops empty chunks. Each chunk's `id` is `"<source>#<index>"` and
+  its `metadata` an object with `source`, `format` (`"text"` / `"markdown"`),
+  `chunk`, `start` and `end` (byte offsets into the text) and, for Markdown,
+  `heading`: the nearest ATX heading (`#` … `######`) at or above where the
+  chunk's content begins, ignoring fenced code blocks.
+- The loaders do not embed. With the `genai` feature, a `TextChunk` converts
+  into a `RagDocument` for `RagIndex::upsert`:
+
+```rust
+use ferroly::vectorstore::{load_dir, Boundary, Chunker};
+# #[cfg(feature = "genai")]
+# async fn demo(index: &ferroly::genai::rag::RagIndex) -> Result<(), Box<dyn std::error::Error>> {
+use ferroly::genai::rag::RagDocument;
+
+let chunker = Chunker::new(800).overlap(100).boundary(Boundary::Paragraph);
+let mut docs = Vec::new();
+for file in load_dir("handbook/")? {
+    docs.extend(file.chunks(&chunker).into_iter().map(RagDocument::from));
+}
+index.upsert(docs).await?;
+# Ok(()) }
+```
+
 ## In depth
 
 ### Choosing a metric
@@ -601,10 +693,14 @@ assert!(store.upsert(vec![Doc::new("c", vec![f32::NAN, 0.0, 0.0])]).await.is_err
 ### End-to-end: chunk → embed → store → search
 
 Combined with [genai](genai.md) embeddings, `vectorstore` is the storage half of
-a retrieval pipeline. Embeddings require a configured provider, so this sketch is
-**conceptual** — substitute the real genai embedding call for `embed`. (There
-is no built-in helper tying an `Embedder` to a store; that glue would span two
-features.)
+a retrieval pipeline. With both features on, **`genai::rag::RagIndex`** is the
+built-in helper tying an `Embedder` to a store — embed-and-upsert and
+query-by-text in one object, so both sides use the same model and dimension
+(see [RAG helper](genai.md#rag-helper-vectorstore-feature)); the
+[document loaders](#document-loaders) feed it directly. The sketch below does
+the same by hand, to show the moving parts. Embeddings require a configured
+provider, so it is **conceptual** — substitute the real genai embedding call
+for `embed`.
 
 ```rust
 use ferroly::codec::Value;
@@ -675,11 +771,15 @@ composes with the crate's [errutils](errutils.md) helpers and `?` in
 - `MemoryStore` is **brute force** — search is O(n · dim) per query and the whole
   corpus lives in RAM. Fine for tests and small collections; it is not an ANN
   index, and none is bundled.
-- **No async runtime integration.** Scans run on the polling thread; use the
-  `*_sync` methods on a blocking pool for large collections.
+- **Only `search` leaves the executor.** A large async search scans on the
+  built-in worker pool (see [Blocking work](#blocking-work-and-the-_sync-methods));
+  the scan still holds the read lock, and the other async methods run inline.
 - **Persistence is a whole-store snapshot**, written on demand. No incremental
   log, no automatic save, and metadata is limited to what JSON represents.
-- **No hybrid (keyword + vector) search**, and no built-in embedding glue.
+- **No hybrid (keyword + vector) search.** Embedding glue lives in
+  `genai::rag::RagIndex` (both features).
+- **Loaders read plain text and Markdown only** (no PDF, HTML or office
+  formats); Markdown is not rendered, only its headings are tracked.
 - **Chunking is heuristic** — character counts, not tokens; punctuation-based
   sentence detection.
 - The free metric functions do not validate inputs; only the store does.

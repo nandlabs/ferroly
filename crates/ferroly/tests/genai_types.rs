@@ -155,10 +155,7 @@ fn error_display_covers_every_variant() {
             capability: Capability::Vision,
         },
         GenAiError::Transport("x".into()),
-        GenAiError::Api {
-            status: 500,
-            message: "boom".into(),
-        },
+        GenAiError::api(500, "boom"),
         GenAiError::ResponseParse("bad".into()),
         GenAiError::Config("cfg".into()),
         GenAiError::Timeout {

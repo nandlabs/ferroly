@@ -8,7 +8,7 @@ mean" suggestions, and shell completion.
 Enable with the `cli` feature:
 
 ```toml
-ferroly = { version = "0.5", features = ["cli"] }
+ferroly = { version = "0.6", features = ["cli"] }
 ```
 
 ```rust
@@ -37,6 +37,8 @@ assert_eq!(m.get_as::<u16>("port").unwrap(), Some(9090));
 | | `subcommand(Command)` | nest a subcommand |
 | | `subcommand_required()` | fail when no subcommand is given |
 | | `group(Group)` | add a cross-argument rule (see [Groups](#groups)) |
+| | `dynamic_flags(predicate)` | accept undeclared `--name[=value]` flags whose name satisfies `predicate` (see [Dynamic flags](#dynamic-flags)) |
+| | `dynamic_flags_with(arity)` | the same, with `arity(name) -> Option<DynamicArity>` also saying whether each flag is a `Switch`, takes a `Value` or has an `Optional` one ([arity](#dynamic-flags)) |
 | | `parse(args)` / `parse_env()` | parse; returns [`Matches`](#reading-results) |
 | | `parse_or_exit(args)` / `parse_env_or_exit()` / `run(args, handler)` | parse and apply the [exit-code convention](#exit-codes) |
 | | `help()` | render the usage/help text |
@@ -198,6 +200,143 @@ assert_eq!(serve.get("port"), Some("8000"));
 Required positionals of a command are not enforced once one of its subcommands
 has been dispatched.
 
+### Dynamic flags
+
+A command can accept a whole family of flags it does not declare, typically "any
+configuration key may be overridden as `--<section>.<key> <value>`".
+`Command::dynamic_flags(predicate)` accepts every undeclared **long** flag whose name
+(without `--`) satisfies `predicate`; `Matches::dynamic()` returns them in
+command-line order as `(name, Option<value>)`.
+
+```rust
+use ferroly::cli::{Arg, CliError, Command};
+
+let sections = ["engine", "server"];
+let cmd = Command::new("app")
+    .flag(Arg::new("config").long("config"))
+    .dynamic_flags(move |name| name.split_once('.').is_some_and(|(s, _)| sections.contains(&s)))
+    .subcommand(Command::new("serve"));
+
+// app --engine.threads 4 serve --server.port=9000 --engine.deterministic
+let m = cmd.parse(
+    ["--engine.threads", "4", "serve", "--server.port=9000", "--engine.deterministic"]
+        .map(String::from),
+).unwrap();
+assert_eq!(m.dynamic()[0], ("engine.threads".into(), Some("4".into())));
+assert_eq!(m.dynamic()[1], ("server.port".into(), Some("9000".into())));
+assert_eq!(m.dynamic()[2], ("engine.deterministic".into(), None));
+
+// Anything else undeclared is still refused, with its suggestion.
+let err = cmd.parse(["--confg", "x"].map(String::from)).unwrap_err();
+assert!(matches!(err, CliError::UnknownFlag { suggestion: Some(_), .. }));
+```
+
+- **Value:** `--name=value` always; `--name value` when the next token does not start
+  with `-` (a negative number such as `-1`, and `-` alone, count as values) and does
+  not select a subcommand of this command; otherwise the flag is a switch (`None`).
+  Write `--name=value` for a value that looks like a flag or a subcommand name.
+- **Limitation:** without an arity the parser cannot tell a switch from a value, so a
+  dynamic switch written directly before a positional takes it:
+  `app --engine.deterministic file.txt` gives
+  `("engine.deterministic", Some("file.txt"))` and no positional. Write `--name=true`,
+  put the switch last, or declare the arity with `dynamic_flags_with` (below).
+- **Names:** a name with an empty `.`-separated segment (`--engine.`, `--a..b`,
+  `--.x`) is never dynamic: it is `UnknownFlag`, whatever the predicate says.
+- **Precedence:** declared flags, `--help` and `--version` win over the predicate;
+  short flags are never dynamic; tokens after `--` are positionals.
+- **Subcommands** inherit the predicate (unless they set their own), so the flags may
+  be written before or after the subcommand name. The top-level `Matches::dynamic()`
+  holds all of them; a subcommand's holds its own level and below.
+- **Positions:** `Matches::dynamic_indices()` is parallel to `dynamic()`: the `argv`
+  index of each flag's value token (`--name value`), or of the flag's own token
+  (`--name=value`, a switch), numbered like `indices_of` and `subcommand_index`
+  ([order](#command-line-order)), so a dynamic flag can be placed among the declared
+  ones and its command level recovered.
+- **Help** is unchanged: dynamic flags are not listed.
+- [`ConfigBuilder::merge_cli`](config.md#merge_cli--parsed-command-lines) merges
+  them as configuration keys.
+
+**Arity.** `dynamic_flags_with(arity)` takes `Fn(&str) -> Option<DynamicArity>`:
+`None` refuses the name (`UnknownFlag`), `Some(a)` accepts it and says how
+`--name next` reads:
+
+| `DynamicArity` | `--name next` | `--name=value` |
+|---|---|---|
+| `Switch` | never takes `next` (`None`), so a positional or subcommand after it stays one | a boolean word (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`), reported as `"true"` / `"false"`; anything else is `InvalidValue` |
+| `Value` | always takes `next`, even `-1`, `-x` or a subcommand name, but never a token starting with `--`; with none, `MissingValue` | the value |
+| `Optional` | the rule above (what `dynamic_flags` uses for every name) | the value |
+
+```rust
+use ferroly::cli::{Arg, Command, DynamicArity};
+
+let cmd = Command::new("app")
+    .dynamic_flags_with(|name| match name {
+        "engine.deterministic" => Some(DynamicArity::Switch),
+        "engine.threads" | "model.context" => Some(DynamicArity::Value),
+        _ => None,
+    })
+    .subcommand(Command::new("serve").positional(Arg::new("file")));
+
+// app serve --engine.deterministic a.txt --model.context -1
+let m = cmd.parse(
+    ["serve", "--engine.deterministic", "a.txt", "--model.context", "-1"].map(String::from),
+).unwrap();
+assert_eq!(m.dynamic()[0], ("engine.deterministic".into(), None));
+assert_eq!(m.dynamic()[1], ("model.context".into(), Some("-1".into())));
+assert_eq!(m.subcommand().unwrap().1.get("file"), Some("a.txt"));
+```
+
+With the `config` feature, `ferroly::config::dynamic_arity(&schema)` builds the arity
+function from an encoded default configuration (boolean → `Switch`, other scalar or
+list → `Value`, `null` → `Optional`, section or absent → refused); see
+[`merge_cli`](config.md#merge_cli--parsed-command-lines).
+
+### Command-line order
+
+`get_all` returns one argument's values; when the interleaving of **different**
+flags matters (`--input` / `--tokens` pairs, `--include` / `--exclude` rules,
+ordered `--set` / `--unset`), read the positions too:
+
+```rust
+use ferroly::cli::{Arg, Command};
+
+let cmd = Command::new("tool").subcommand(
+    Command::new("embed")
+        .flag(Arg::new("input").long("input").multiple())
+        .flag(Arg::new("tokens").long("tokens").multiple()),
+);
+let argv: Vec<String> = ["embed", "--input", "first", "--tokens=1,2,3", "--input", "second", "--tokens", "7"]
+    .map(String::from).to_vec();
+let m = cmd.parse(argv.clone()).unwrap();
+let (_, sub) = m.subcommand().unwrap();
+
+let ordered: Vec<(&str, &str)> = sub.occurrences().collect();
+assert_eq!(ordered, [("input", "first"), ("tokens", "1,2,3"), ("input", "second"), ("tokens", "7")]);
+
+assert_eq!(sub.indices_of("input"), &[2, 5]);
+assert_eq!(sub.indices_of("tokens"), &[3, 7]);
+let i = m.subcommand_index().unwrap();
+assert_eq!(&argv[i + 1..], &argv[1..]); // the subcommand's raw tail
+```
+
+- **Indices** are into the `Vec<String>` given to `parse` (so with
+  `parse(std::env::args().skip(1).collect())` they index that vector), at every
+  subcommand level.
+- `indices_of(name)` is parallel to `get_all(name)`: `--flag value` / `-f value`
+  report the index of `value`; `--flag=value`, `-fvalue`, `-f=value` the index of
+  that token. A delimiter-split token repeats its index for each value; a repeated
+  single-valued option keeps only the last value and index. Positionals report each
+  token (a variadic one, one per value). Switches and counters report one index per
+  occurrence (`-vv`: the same index twice). Env/default values have no index (empty).
+- `occurrences()` lists every flag written **at that command level**, in order, as
+  `(name, value-as-written)`; switches and counters yield `""` (or their `=value`),
+  one entry per occurrence, so `-vv` yields two. Positionals, anything after `--`,
+  env/default values and dynamic flags (see `dynamic_indices()`) are not occurrences; a global flag written
+  after the subcommand belongs to the subcommand's matches.
+- `subcommand_index()` is the index of the token that selected the subcommand. A flag
+  value equal to the subcommand's name is a value: `tool --config embed embed` gives
+  `2`.
+
 ## Validation
 
 Values are checked at parse time, whichever source they came from:
@@ -276,6 +415,11 @@ assert_eq!(err.to_string(), "--user requires --password");
 | `names()` | `Vec<&str>` — every argument that has a value, sorted |
 | `positionals()` | `&[String]` |
 | `subcommand()` / `subcommand_name()` | `Option<(&str, &Matches)>` / `Option<&str>` (the declared name, even when an alias was typed) |
+| `subcommand_index()` | `Option<usize>` — `argv` index of the token that selected the subcommand ([order](#command-line-order)) |
+| `indices_of(name)` | `&[usize]` — `argv` index of each command-line value, parallel to `get_all` ([order](#command-line-order)) |
+| `occurrences()` | `impl Iterator<Item = (&str, &str)>` — every flag of this level in command-line order ([order](#command-line-order)) |
+| `dynamic()` | `&[(String, Option<String>)]` — the [dynamic flags](#dynamic-flags), in order, across subcommands |
+| `dynamic_indices()` | `&[usize]` — `argv` index of each dynamic flag, parallel to `dynamic()` ([dynamic flags](#dynamic-flags)) |
 
 ```rust
 use ferroly::cli::{Arg, Command};
@@ -412,8 +556,12 @@ let cmd = Command::new("app")
 
 let bash = cmd.completions(Shell::Bash);
 let zsh = cmd.completions(Shell::Zsh);
+let fish = cmd.completions(Shell::Fish);
+let pwsh = cmd.completions(Shell::PowerShell);
 assert!(bash.contains("complete -F"));
 assert!(zsh.starts_with("#compdef app"));
+assert!(fish.contains("complete -c 'app'"));
+assert!(pwsh.contains("Register-ArgumentCompleter -Native -CommandName 'app'"));
 ```
 
 Typical wiring is a hidden subcommand or flag that prints the script:
@@ -424,10 +572,33 @@ source <(app completions bash)
 
 # zsh: save as _app somewhere on $fpath, or
 source <(app completions zsh)
+
+# fish: save as ~/.config/fish/completions/app.fish, or
+app completions fish | source
+
+# PowerShell (5.1 and 7+): add to $PROFILE
+app completions powershell | Out-String | Invoke-Expression
 ```
 
-Option values without `choices` fall back to file-name completion. Other shells
-(fish, PowerShell) are not generated.
+| `Shell` | Mechanism |
+|---|---|
+| `Bash` | a `complete -F` function |
+| `Zsh` | a `#compdef` function using `_describe` |
+| `Fish` | `complete -c` lines, conditioned on a helper function that tracks the subcommand |
+| `PowerShell` | `Register-ArgumentCompleter -Native` for `app` and `app.exe` |
+
+Every shell completes the same things: flags and their aliases, subcommands (and their
+aliases), global flags inside subcommands, and `choices` as values. Option values
+without `choices` fall back to file-name completion. The subcommand is found by
+matching the words before the cursor against subcommand names, so an option value
+spelled like a subcommand is taken for one.
+
+Every name, alias, choice and help text is quoted for the target shell, so sourcing
+the script never runs any of them, and candidates are offered literally (a bash choice
+spelled `$(…)` or `*` is not expanded). Control characters are written as escapes, so
+a program name taken from `argv[0]` cannot break out of a comment or a quoted word.
+Commands whose names differ only in punctuation (`sub-cmd` and `sub_cmd`) are kept
+apart.
 
 ## Errors
 
@@ -476,13 +647,16 @@ let cfg = Config::builder()
     .build();
 ```
 
+`merge_cli` also merges the [dynamic flags](#dynamic-flags) as configuration keys;
+`merge_cli_with(&m, ArgsOptions::default().types(&schema))` types them from a schema.
+
 ## Limitations
 
 - **Builder-based, not a `#[derive]`** — describe the command with `Arg` /
   `Command`; there is no attribute-macro form.
 - **No space-separated multi-values** — use repetition or a delimiter.
-- **Completion for bash and zsh only**; value completion is limited to `choices`
-  and file names.
+- **Completion for bash, zsh, fish and PowerShell only** (no elvish or nushell);
+  value completion is limited to `choices` and file names.
 - **Help width is fixed at 80 columns**; the terminal width is not probed.
 - **One subcommand level dispatched per parse step** — nest `Command`s for deeper
   trees; each `Matches::subcommand()` descends one level.

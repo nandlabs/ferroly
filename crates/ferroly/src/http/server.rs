@@ -16,13 +16,15 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::time::timeout;
 
+use super::body::{BodySender, BodyStream};
 use super::core::{split_target, TransferCoding};
 use super::date::format_http_date;
 use super::form::normalize_path;
 use super::io::{self, ChunkedReader, HeadError, HeadLimits, RequestHead, Version};
 use super::message::{ConnInfo, Request};
+use super::proxy_protocol;
 use super::transport::{self, Conn, ReloadableTlsConfig};
-use super::{HeaderMap, HttpError, Method, StatusCode, Uri};
+use super::{HeaderMap, HttpError, Method, Protocol, StatusCode, Uri};
 
 /// A boxed, `Send` future — the manual `async fn`-in-trait desugaring so
 /// [`HttpHandler`] stays object-safe.
@@ -105,9 +107,14 @@ pub struct ServerConfig {
     pub body_timeout: Duration,
     /// On shutdown, how long to wait for in-flight connections to finish before
     /// returning (connection draining for graceful rolling deploys).
+    /// Connections still open when it expires are dropped — their handlers
+    /// and streams (HTTP/2, server-sent events) stopped — so nothing outlives
+    /// `serve`.
     pub drain_timeout: Duration,
-    /// Maximum number of requests served on a single kept-alive connection
-    /// before it is closed. Bounds per-connection resource lifetime.
+    /// Maximum number of requests served on a single kept-alive HTTP/1.1
+    /// connection before it is closed. Bounds per-connection resource
+    /// lifetime. HTTP/2 connections are not capped by it; see
+    /// `Http2Config::max_streams_per_connection` (feature `http2`).
     pub max_keep_alive_requests: usize,
     /// Whether connections are kept alive between requests at all. `false`
     /// answers every request with `Connection: close`.
@@ -145,6 +152,20 @@ pub struct ServerConfig {
     /// Receives errors that are otherwise invisible to the application; see
     /// [`ErrorHook`].
     pub on_error: Option<ErrorHook>,
+    /// Serve HTTP/2 as well as HTTP/1.1 (`None`, the default, serves
+    /// HTTP/1.1 only). When set, a TLS server advertises `h2` and `http/1.1`
+    /// with ALPN and speaks HTTP/2 to clients that select `h2`; a cleartext
+    /// server speaks HTTP/2 (h2c) to clients that open with the HTTP/2
+    /// connection preface ("prior knowledge"). Everything else is served as
+    /// HTTP/1.1. The h2c `Upgrade` mechanism is not supported (RFC 9113
+    /// deprecates it). Requires the `http2` feature.
+    #[cfg(feature = "http2")]
+    pub http2: Option<super::Http2Config>,
+    /// Accept the PROXY protocol (v1 and v2) from these trusted sources, so
+    /// that behind a layer-4 load balancer [`Request::peer_addr`] is the real
+    /// client. `None` (the default) never reads a PROXY header. See
+    /// [`ProxyProtocol`](super::ProxyProtocol).
+    pub proxy_protocol: Option<super::ProxyProtocol>,
 }
 
 impl Default for ServerConfig {
@@ -165,6 +186,9 @@ impl Default for ServerConfig {
             max_line_bytes: io::DEFAULT_MAX_LINE_BYTES,
             normalize_paths: false,
             on_error: None,
+            #[cfg(feature = "http2")]
+            http2: None,
+            proxy_protocol: None,
         }
     }
 }
@@ -179,7 +203,7 @@ impl ServerConfig {
         }
     }
 
-    fn report(&self, peer: Option<SocketAddr>, error: &HttpError) {
+    pub(crate) fn report(&self, peer: Option<SocketAddr>, error: &HttpError) {
         if let Some(hook) = &self.on_error {
             hook.call(peer, error);
         }
@@ -208,6 +232,33 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
     /// A chunked body stream, if any.
     stream: Option<mpsc::Receiver<Vec<u8>>>,
+    /// A body stream and trailers, when set (boxed: most responses have
+    /// neither, and handlers pass responses around by value).
+    extra: Option<Box<ResponseExtra>>,
+}
+
+/// The less common parts of an [`HttpResponse`].
+#[derive(Debug, Default)]
+struct ResponseExtra {
+    /// A body stream with optional trailers.
+    body_stream: Option<BodyStream>,
+    /// Trailer fields sent after the body.
+    trailers: HeaderMap,
+}
+
+/// The body of a response, as the server writes it.
+pub(crate) enum ResponseBody {
+    Fixed(Vec<u8>),
+    Chunks(mpsc::Receiver<Vec<u8>>),
+    Stream(BodyStream),
+}
+
+/// A response taken apart for writing.
+pub(crate) struct ResponseParts {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: ResponseBody,
+    pub(crate) trailers: HeaderMap,
 }
 
 impl HttpResponse {
@@ -218,6 +269,7 @@ impl HttpResponse {
             headers: HeaderMap::new(),
             body: Vec::new(),
             stream: None,
+            extra: None,
         }
     }
 
@@ -229,6 +281,87 @@ impl HttpResponse {
             headers: HeaderMap::new(),
             body: Vec::new(),
             stream: Some(chunks),
+            extra: None,
+        }
+    }
+
+    /// A response whose body is read from `body` — typically the reading
+    /// half of a [`body_channel`](super::body_channel) fed by another task.
+    /// Each chunk is sent as it arrives; trailers the sender ends the body
+    /// with ([`BodySender::send_trailers`](super::BodySender::send_trailers))
+    /// are sent after it, together with any set by
+    /// [`trailer`](Self::trailer).
+    ///
+    /// Over HTTP/2 the body is DATA frames followed by a trailing HEADERS
+    /// frame; over HTTP/1.1 it is chunked, with the trailers in the chunked
+    /// trailer section (an HTTP/1.0 client gets the body without them). If
+    /// the stream fails (its sender is dropped without finishing) the
+    /// response is cut off: the HTTP/2 stream is reset, the HTTP/1.1
+    /// connection closed before the final chunk.
+    pub fn body_stream(status: StatusCode, body: BodyStream) -> Self {
+        let mut resp = Self::new(status);
+        resp.extra_mut().body_stream = Some(body);
+        resp
+    }
+
+    fn extra_mut(&mut self) -> &mut ResponseExtra {
+        self.extra.get_or_insert_with(Box::default)
+    }
+
+    fn has_body_stream(&self) -> bool {
+        self.extra.as_ref().is_some_and(|e| e.body_stream.is_some())
+    }
+
+    /// Adds a trailer field, sent after the body (see
+    /// [`with_trailers`](Self::with_trailers)).
+    pub fn trailer(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_mut().trailers.append(name, value);
+        self
+    }
+
+    /// Sets the trailer fields sent after the body.
+    ///
+    /// Over HTTP/2 they are a trailing HEADERS frame — what gRPC uses for
+    /// `grpc-status`. Over HTTP/1.1 a response with trailers is sent chunked
+    /// with a trailer section; an HTTP/1.0 client, a `HEAD` request and
+    /// `204`/`304` responses get no trailers.
+    pub fn with_trailers(mut self, trailers: HeaderMap) -> Self {
+        self.extra_mut().trailers = trailers;
+        self
+    }
+
+    /// The trailer fields set so far.
+    pub fn trailers(&self) -> &HeaderMap {
+        static NONE: HeaderMap = HeaderMap::empty();
+        match &self.extra {
+            Some(extra) => &extra.trailers,
+            None => &NONE,
+        }
+    }
+
+    /// Whether the body is a stream rather than the fixed [`body`](Self::body).
+    #[cfg_attr(not(feature = "turbo"), allow(dead_code))]
+    pub(crate) fn has_stream(&self) -> bool {
+        self.stream.is_some() || self.extra.as_ref().is_some_and(|e| e.body_stream.is_some())
+    }
+
+    /// Takes the response apart for the protocol writers.
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    pub(crate) fn into_parts(self) -> ResponseParts {
+        let ResponseExtra {
+            body_stream,
+            trailers,
+        } = self.extra.map(|e| *e).unwrap_or_default();
+        let body = match (body_stream, self.stream) {
+            (Some(s), _) => ResponseBody::Stream(s),
+            (None, Some(rx)) => ResponseBody::Chunks(rx),
+            (None, None) => ResponseBody::Fixed(self.body),
+        };
+        ResponseParts {
+            status: self.status,
+            headers: self.headers,
+            body,
+            trailers,
         }
     }
 
@@ -311,6 +444,33 @@ impl HttpResponse {
 pub trait HttpHandler: Send + Sync {
     /// Handles one request.
     fn handle(&self, req: Request) -> BoxFuture<'_, HttpResponse>;
+
+    /// Whether this request's body should be streamed to the handler instead
+    /// of buffered. Called with the request head (the body is still empty)
+    /// before [`handle`](Self::handle).
+    ///
+    /// The default, `false`, buffers the body into [`Request::body`] (bounded
+    /// by [`ServerConfig::max_body_bytes`]). Returning `true` leaves
+    /// `Request::body` empty and hands the body over as a [`BodyStream`]
+    /// through [`Request::take_body_stream`]. The handler then runs as soon
+    /// as the request head arrives and reads the body as it comes,
+    /// concurrently with writing its response.
+    ///
+    /// - Over HTTP/2 this is bidirectional streaming on one stream; the size
+    ///   cap and the body timeout do not apply (the handler decides how much
+    ///   to read).
+    /// - Over HTTP/1.1 a `Content-Length` or chunked body is read piece by
+    ///   piece as it arrives, still under the server's caps: a chunked body
+    ///   past `max_body_bytes` fails the stream with
+    ///   [`HttpError::BodyTooLarge`] (a larger `Content-Length` is refused
+    ///   with `413` before the handler runs), and `body_timeout` bounds the
+    ///   total time spent waiting for the client (not for the handler). A
+    ///   failed or abandoned body closes the connection after the response;
+    ///   a fully read one leaves it reusable.
+    fn wants_body_stream(&self, req: &Request) -> bool {
+        let _ = req;
+        false
+    }
 }
 
 /// Serves connections from `listener` with `handler` until `shutdown` resolves,
@@ -409,20 +569,51 @@ where
     // Signals kept-alive connections to close promptly on shutdown so draining
     // does not wait `drain_timeout` for *idle* keep-alive connections.
     let (drain_tx, drain_rx) = watch::channel(false);
+    // Stops every connection task still running when `drain_timeout`
+    // expires, so nothing (an HTTP/2 stream, server-sent events, a gRPC
+    // stream) outlives `serve`.
+    let (kill_tx, kill_rx) = watch::channel(false);
 
+    let accept = accept_loop(
+        listener,
+        handler,
+        config.clone(),
+        limit.clone(),
+        tls,
+        drain_rx,
+        kill_rx,
+    );
     tokio::select! {
-        r = accept_loop(listener, handler, config.clone(), limit.clone(), tls, drain_rx) => r,
+        r = accept => r,
         _ = shutdown => {
             // Tell idle keep-alive connections to stop, then wait for in-flight
             // requests to finish: acquiring *every* permit means all connection
             // tasks released their slot. Bounded by `drain_timeout`.
             let _ = drain_tx.send(true);
-            let _ = timeout(
-                config.drain_timeout,
-                limit.acquire_many(max_conns as u32),
-            )
-            .await;
+            let all = limit.clone().acquire_many_owned(max_conns as u32);
+            if timeout(config.drain_timeout, all).await.is_err() {
+                let _ = kill_tx.send(true);
+                // The tasks stop at their next poll; give them a moment to
+                // release their sockets before returning.
+                let _ = timeout(
+                    Duration::from_millis(100),
+                    limit.acquire_many(max_conns as u32),
+                )
+                .await;
+            }
             Ok(())
+        }
+    }
+}
+
+/// Resolves once `kill` is set (or its sender is gone).
+async fn killed(kill: &mut watch::Receiver<bool>) {
+    loop {
+        if *kill.borrow_and_update() {
+            return;
+        }
+        if kill.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -434,7 +625,12 @@ async fn accept_loop(
     limit: Arc<Semaphore>,
     tls: Option<ReloadableTlsConfig>,
     drain: watch::Receiver<bool>,
+    kill: watch::Receiver<bool>,
 ) -> Result<(), HttpError> {
+    // The ALPN-enabled copy of the current TLS configuration, rebuilt only
+    // when the configuration is reloaded.
+    #[cfg(feature = "http2")]
+    let mut alpn_cache: Option<(super::TlsConfig, super::TlsConfig)> = None;
     loop {
         let permit = limit
             .clone()
@@ -459,39 +655,95 @@ async fn accept_loop(
         // Snapshot the TLS configuration now, so a reload affects exactly the
         // connections accepted after it.
         let tls = tls.as_ref().map(ReloadableTlsConfig::current);
+        #[cfg(feature = "http2")]
+        let tls = match (tls, &config.http2) {
+            (Some(tls), Some(_)) => Some(alpn_tls(&mut alpn_cache, tls)),
+            (tls, _) => tls,
+        };
         let drain = drain.clone();
+        let mut kill = kill.clone();
         tokio::spawn(async move {
-            let mut info = ConnInfo {
-                peer_addr: Some(peer),
-                local_addr: sock.local_addr().ok(),
-                tls: tls.is_some(),
-                peer_certs: Arc::new(Vec::new()),
-            };
-            // For HTTPS, complete the TLS handshake first (bounded by the head
-            // timeout so a stalled handshake can't pin the connection).
-            let conn: Conn = match &tls {
-                Some(tls) => {
-                    match timeout(config.head_timeout, transport::accept_tls(sock, tls)).await {
-                        Ok(Ok((conn, certs))) => {
-                            info.peer_certs = Arc::new(certs);
-                            conn
-                        }
-                        Ok(Err(e)) => {
-                            config.report(Some(peer), &e);
-                            drop(permit);
-                            return;
-                        }
-                        Err(_) => {
-                            config.report(Some(peer), &HttpError::Timeout);
-                            drop(permit);
-                            return;
+            let mut draining = drain.clone();
+            let run = async {
+                let setup = async {
+                    let mut info = ConnInfo {
+                        peer_addr: Some(peer),
+                        local_addr: sock.local_addr().ok(),
+                        tls: tls.is_some(),
+                        peer_certs: Arc::new(Vec::new()),
+                    };
+                    // Behind a trusted load balancer the connection opens with
+                    // a PROXY header naming the real client (before any TLS).
+                    let mut sock = sock;
+                    if let Some(pp) = config.proxy_protocol.as_ref() {
+                        if pp.is_trusted(peer.ip()) {
+                            let header = proxy_protocol::read_header(&mut sock);
+                            match timeout(config.head_timeout, header).await {
+                                Ok(Ok(Some((source, destination)))) => {
+                                    info.peer_addr = Some(source);
+                                    info.local_addr = Some(destination);
+                                }
+                                Ok(Ok(None)) => {}
+                                Ok(Err(e)) => {
+                                    config.report(Some(peer), &e);
+                                    return None;
+                                }
+                                Err(_) => {
+                                    config.report(Some(peer), &HttpError::Timeout);
+                                    return None;
+                                }
+                            }
                         }
                     }
+                    let peer = info.peer_addr.unwrap_or(peer);
+                    // For HTTPS, complete the TLS handshake first (bounded by
+                    // the head timeout so a stalled handshake can't pin the
+                    // connection).
+                    let mut alpn_h2 = false;
+                    let conn: Conn = match &tls {
+                        Some(tls) => {
+                            let handshake = transport::accept_tls_alpn(sock, tls);
+                            match timeout(config.head_timeout, handshake).await {
+                                Ok(Ok((conn, certs, alpn))) => {
+                                    info.peer_certs = Arc::new(certs);
+                                    alpn_h2 = alpn.as_deref() == Some(b"h2".as_slice());
+                                    conn
+                                }
+                                Ok(Err(e)) => {
+                                    config.report(Some(peer), &e);
+                                    return None;
+                                }
+                                Err(_) => {
+                                    config.report(Some(peer), &HttpError::Timeout);
+                                    return None;
+                                }
+                            }
+                        }
+                        None => Box::new(sock) as Conn,
+                    };
+                    Some((conn, info, alpn_h2, peer))
+                };
+                let setup = tokio::select! {
+                    s = setup => s,
+                    // Shutting down: a connection still sending its PROXY
+                    // header or in its TLS handshake has sent no request, so
+                    // it is closed like an idle keep-alive connection rather
+                    // than served.
+                    _ = killed(&mut draining) => None,
+                };
+                let Some((conn, info, alpn_h2, peer)) = setup else {
+                    return;
+                };
+                if let Err(e) = serve_conn(conn, handler, &config, drain, info, alpn_h2).await {
+                    config.report(Some(peer), &e);
                 }
-                None => Box::new(sock) as Conn,
             };
-            if let Err(e) = serve_conn(conn, handler, &config, drain, info).await {
-                config.report(Some(peer), &e);
+            tokio::select! {
+                () = run => {}
+                // `drain_timeout` expired: drop the connection (and, for
+                // HTTP/2, its handler tasks) instead of letting it run on,
+                // whatever phase it is in.
+                _ = killed(&mut kill) => {}
             }
             drop(permit); // release the slot only once the connection is done
         });
@@ -509,23 +761,79 @@ enum After {
     Linger,
 }
 
+/// The TLS configuration with `h2` + `http/1.1` ALPN, reusing the copy made
+/// for the same configuration last time.
+#[cfg(feature = "http2")]
+fn alpn_tls(
+    cache: &mut Option<(super::TlsConfig, super::TlsConfig)>,
+    tls: super::TlsConfig,
+) -> super::TlsConfig {
+    if let Some((base, alpn)) = cache.as_ref() {
+        if base.same_as(&tls) {
+            return alpn.clone();
+        }
+    }
+    let alpn = tls.with_h2_alpn();
+    *cache = Some((tls, alpn.clone()));
+    alpn
+}
+
 async fn serve_conn(
     conn: Conn,
     handler: Arc<dyn HttpHandler>,
-    config: &ServerConfig,
+    config: &Arc<ServerConfig>,
     mut drain: watch::Receiver<bool>,
     info: ConnInfo,
+    alpn_h2: bool,
 ) -> Result<(), HttpError> {
+    #[cfg(feature = "http2")]
+    if let (Some(h2), true) = (&config.http2, alpn_h2) {
+        let reader = BufReader::new(conn);
+        return super::h2::server::serve(reader, handler, config.clone(), drain, info, h2).await;
+    }
+    #[cfg(not(feature = "http2"))]
+    let _ = alpn_h2;
     let mut reader = BufReader::new(conn);
+    // Wait for the first byte of the first request (head timeout).
+    match wait_for_request(&mut reader, config.head_timeout, &mut drain).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = timeout(config.write_timeout, reader.shutdown()).await;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    }
+    // A cleartext connection that opens with the HTTP/2 preface is h2c
+    // with prior knowledge.
+    #[cfg(feature = "http2")]
+    if !info.tls {
+        if let Some(h2) = &config.http2 {
+            match sniff_preface(reader, config.head_timeout).await {
+                Ok((next, true)) => {
+                    return super::h2::server::serve(
+                        next,
+                        handler,
+                        config.clone(),
+                        drain,
+                        info,
+                        h2,
+                    )
+                    .await;
+                }
+                Ok((next, false)) => reader = next,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    // HTTP/1.1 from here on. The connection is split so that a streamed
+    // request body can still be read while the response is being written.
+    let (read_half, mut writer) = tokio::io::split(reader);
+    let mut reader = BufReader::new(read_half);
     let limits = config.head_limits();
     // HTTP/1.1 keep-alive: serve successive requests on the same connection.
     let mut served = 0usize;
     let mut linger = false;
     let result = loop {
-        // If shutdown has already been signalled, close this idle connection.
-        if *drain.borrow() {
-            break Ok(());
-        }
         // Wait for the first byte of the next request. A new connection gets
         // the head timeout; a kept-alive one the idle timeout.
         let idle = if served == 0 {
@@ -533,17 +841,10 @@ async fn serve_conn(
         } else {
             config.idle_timeout
         };
-        tokio::select! {
-            r = timeout(idle, reader.fill_buf()) => match r {
-                // Idle timeout or a clean close between requests is normal.
-                Err(_) => break Ok(()),
-                Ok(Ok([])) => break Ok(()),
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => break Err(e.into()),
-            },
-            // Server is draining for shutdown — close this (between-requests) idle
-            // connection promptly instead of waiting out the idle timeout.
-            _ = drain.changed() => break Ok(()),
+        match wait_for_request(&mut reader, idle, &mut drain).await {
+            Ok(true) => {}
+            Ok(false) => break Ok(()),
+            Err(e) => break Err(e),
         }
 
         let mut started = false;
@@ -556,22 +857,40 @@ async fn serve_conn(
                 // Malformed or over-limit: say why, then close. The framing of
                 // whatever follows cannot be trusted.
                 linger = true;
+                // A cleartext peer that opens with something that is not an
+                // HTTP/1.x request line on an HTTP/2-enabled server may be a
+                // broken HTTP/2 client: an HTTP/1.1 answer would only look
+                // like garbage frames to it, so just close (RFC 9113 §3.4).
+                #[cfg(feature = "http2")]
+                if served == 0
+                    && !info.tls
+                    && config.http2.is_some()
+                    && reason == "missing or malformed HTTP version"
+                {
+                    break Err(HttpError::Protocol(reason.into()));
+                }
                 let resp = HttpResponse::text(status, reason);
-                let sent = write_response(&mut reader, resp, &CLOSE, config.write_timeout).await;
+                let sent = write_response(&mut writer, resp, &CLOSE, config.write_timeout).await;
                 break sent.and(Err(HttpError::Protocol(reason.into())));
             }
             Err(_) => {
                 if started {
                     linger = true;
                     let resp = HttpResponse::text(StatusCode::REQUEST_TIMEOUT, "request timeout");
-                    let _ = write_response(&mut reader, resp, &CLOSE, config.write_timeout).await;
+                    let _ = write_response(&mut writer, resp, &CLOSE, config.write_timeout).await;
                 }
                 break Err(HttpError::Timeout);
             }
         };
         served += 1;
         let last = served >= config.max_keep_alive_requests;
-        match handle_one(&mut reader, &handler, config, &limits, head, &info, last).await {
+        let conn = Http1 {
+            reader: &mut reader,
+            writer: &mut writer,
+            limits: &limits,
+            info: &info,
+        };
+        match handle_one(conn, &handler, config, head, last).await {
             Ok(After::KeepAlive) => {}
             Ok(After::Close) => break Ok(()),
             Ok(After::Linger) => {
@@ -582,7 +901,7 @@ async fn serve_conn(
         }
     };
     // Close the write side cleanly (emits TLS `close_notify`).
-    let _ = timeout(config.write_timeout, reader.shutdown()).await;
+    let _ = timeout(config.write_timeout, writer.shutdown()).await;
     // Closing a socket that still holds unread input makes the kernel reset
     // the connection, which can destroy a response the client has not read
     // yet. So when the client sent more than was consumed (pipelined requests
@@ -591,6 +910,32 @@ async fn serve_conn(
         let _ = timeout(LINGER_TIMEOUT, discard_input(&mut reader)).await;
     }
     result
+}
+
+/// Waits for the first byte of the next request: `Ok(true)` once one has
+/// arrived, `Ok(false)` when the connection should close quietly (the wait
+/// timed out, the client closed between requests, or the server is draining).
+async fn wait_for_request<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    idle: Duration,
+    drain: &mut watch::Receiver<bool>,
+) -> Result<bool, HttpError> {
+    // If shutdown has already been signalled, close this idle connection.
+    if *drain.borrow() {
+        return Ok(false);
+    }
+    tokio::select! {
+        r = timeout(idle, reader.fill_buf()) => match r {
+            // Idle timeout or a clean close between requests is normal.
+            Err(_) => Ok(false),
+            Ok(Ok([])) => Ok(false),
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(e)) => Err(e.into()),
+        },
+        // Server is draining for shutdown — close this (between-requests) idle
+        // connection promptly instead of waiting out the idle timeout.
+        _ = drain.changed() => Ok(false),
+    }
 }
 
 /// Reads and drops up to [`LINGER_BYTES`] of input, until EOF or an error.
@@ -629,21 +974,50 @@ async fn refuse<W: AsyncWrite + Unpin>(
     Ok(After::Linger)
 }
 
+/// One HTTP/1.1 connection as [`handle_one`] sees it: the buffered read half,
+/// the write half, and what is known about it.
+struct Http1<'a, R, W> {
+    reader: &'a mut R,
+    writer: &'a mut W,
+    limits: &'a HeadLimits,
+    info: &'a ConnInfo,
+}
+
+/// How a request body is delimited on the wire.
+#[derive(Debug, Clone, Copy)]
+enum BodyFraming {
+    /// No body.
+    Empty,
+    /// Exactly this many bytes (`Content-Length`).
+    Sized(u64),
+    /// `Transfer-Encoding: chunked`.
+    Chunked,
+}
+
+/// How many decoded pieces of a streamed request body may wait for the
+/// handler before the server stops reading from the client.
+const STREAM_QUEUE: usize = 4;
+
 /// Handles one request on a (possibly kept-alive) connection and says what to
 /// do with the connection next. An I/O error writing the response propagates
 /// and closes the connection.
-async fn handle_one<R>(
-    reader: &mut R,
+async fn handle_one<R, W>(
+    conn: Http1<'_, R, W>,
     handler: &Arc<dyn HttpHandler>,
     config: &ServerConfig,
-    limits: &HeadLimits,
     head: RequestHead,
-    info: &ConnInfo,
     last: bool,
 ) -> Result<After, HttpError>
 where
-    R: AsyncBufRead + AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
+    let Http1 {
+        reader,
+        writer,
+        limits,
+        info,
+    } = conn;
     let RequestHead {
         method,
         target,
@@ -659,7 +1033,7 @@ where
     let hosts = headers.get_all("host").count();
     if hosts > 1 || (hosts == 0 && !http10) {
         let message = "missing or duplicate Host header";
-        return refuse(reader, config, peer, bad, message).await;
+        return refuse(writer, config, peer, bad, message).await;
     }
 
     // Request-smuggling guards. Every framing a front-end proxy and this
@@ -669,7 +1043,7 @@ where
     // headers together (CL.TE / TE.CL), and chunked from an HTTP/1.0 client.
     let content_length = match headers.content_length_checked() {
         Ok(cl) => cl,
-        Err(_) => return refuse(reader, config, peer, bad, "invalid Content-Length").await,
+        Err(_) => return refuse(writer, config, peer, bad, "invalid Content-Length").await,
     };
     let chunked = match headers.transfer_coding() {
         TransferCoding::Absent => false,
@@ -677,16 +1051,16 @@ where
         TransferCoding::Unsupported => {
             let status = StatusCode::NOT_IMPLEMENTED;
             let message = "unsupported Transfer-Encoding";
-            return refuse(reader, config, peer, status, message).await;
+            return refuse(writer, config, peer, status, message).await;
         }
     };
     if chunked && content_length.is_some() {
         let message = "conflicting Content-Length and Transfer-Encoding";
-        return refuse(reader, config, peer, bad, message).await;
+        return refuse(writer, config, peer, bad, message).await;
     }
     if chunked && http10 {
         let message = "Transfer-Encoding in an HTTP/1.0 request";
-        return refuse(reader, config, peer, bad, message).await;
+        return refuse(writer, config, peer, bad, message).await;
     }
 
     // Reject oversized bodies up front — before any allocation and before
@@ -694,8 +1068,15 @@ where
     let declared = content_length.unwrap_or(0);
     if declared > config.max_body_bytes as u64 {
         let status = StatusCode::PAYLOAD_TOO_LARGE;
-        return refuse(reader, config, peer, status, "payload too large").await;
+        return refuse(writer, config, peer, status, "payload too large").await;
     }
+    let framing = if chunked {
+        BodyFraming::Chunked
+    } else if declared > 0 {
+        BodyFraming::Sized(declared)
+    } else {
+        BodyFraming::Empty
+    };
 
     // Honor `Expect: 100-continue`: acknowledge before reading the body so a
     // client withholding a large upload knows to proceed (avoiding its stall).
@@ -704,61 +1085,26 @@ where
     if let Some(expect) = headers.get("expect") {
         if !expect.trim().eq_ignore_ascii_case("100-continue") {
             let status = StatusCode::EXPECTATION_FAILED;
-            return refuse(reader, config, peer, status, "unsupported Expect").await;
+            return refuse(writer, config, peer, status, "unsupported Expect").await;
         }
-        if (chunked || declared > 0) && !http10 {
+        if !matches!(framing, BodyFraming::Empty) && !http10 {
             write_all_timed(
-                reader,
+                writer,
                 b"HTTP/1.1 100 Continue\r\n\r\n",
                 config.write_timeout,
             )
             .await?;
-            flush_timed(reader, config.write_timeout).await?;
+            flush_timed(writer, config.write_timeout).await?;
         }
     }
 
-    let read = async {
-        if chunked {
-            read_chunked_body(reader, config.max_body_bytes, limits).await
-        } else {
-            read_sized_body(reader, declared as usize).await
-        }
-    };
-    let body = match timeout(config.body_timeout, read).await {
-        Ok(Ok(body)) => body,
-        Ok(Err(HttpError::BodyTooLarge(_))) => {
-            let status = StatusCode::PAYLOAD_TOO_LARGE;
-            return refuse(reader, config, peer, status, "payload too large").await;
-        }
-        // The reasons are fixed strings from the chunk parser, never an echo
-        // of what the client sent.
-        Ok(Err(HttpError::Protocol(reason))) => {
-            return refuse(reader, config, peer, bad, &reason).await;
-        }
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            let status = StatusCode::REQUEST_TIMEOUT;
-            return refuse(reader, config, peer, status, "request timeout").await;
-        }
-    };
-
     let (mut path, query) = split_target(&target);
+    let mut bad_path = false;
     if config.normalize_paths && target.starts_with('/') {
-        path = match normalize_path(&path) {
-            Ok(path) => path,
-            // The body was read in full, so the connection stays usable.
-            Err(_) => {
-                config.report(peer, &HttpError::Protocol("invalid request path".into()));
-                let resp = HttpResponse::text(bad, "invalid request path");
-                let opts = WriteOpts {
-                    head_request: matches!(method, Method::Head),
-                    keep_alive: false,
-                    http10,
-                };
-                write_response(reader, resp, &opts, config.write_timeout).await?;
-                return Ok(After::Close);
-            }
-        };
+        match normalize_path(&path) {
+            Ok(normalized) => path = normalized,
+            Err(_) => bad_path = true,
+        }
     }
     // An absolute-form target names the host itself and overrides `Host`.
     let host = authority.unwrap_or_else(|| headers.get("host").unwrap_or("").to_string());
@@ -779,33 +1125,77 @@ where
     let head_request = matches!(method, Method::Head);
     let mut req = Request::new(method, uri);
     req.headers = headers;
-    req.body = body;
     req.set_conn_info(info.clone());
+    req.set_protocol(if http10 {
+        Protocol::Http10
+    } else {
+        Protocol::Http11
+    });
+    // Asked with the head only: the body has not been read yet.
+    let streaming = !bad_path
+        && std::panic::catch_unwind(AssertUnwindSafe(|| handler.wants_body_stream(&req)))
+            .unwrap_or(false);
+    if streaming {
+        let stream = StreamedRequest {
+            framing,
+            head_request,
+            http10,
+            wants_keep_alive,
+        };
+        return handle_streamed(reader, writer, limits, handler, config, req, stream).await;
+    }
 
-    let resp = match run_handler(handler, req, config.handler_timeout).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            config.report(info.peer_addr, &e);
-            match e {
-                HttpError::Timeout => {
-                    HttpResponse::text(StatusCode::SERVICE_UNAVAILABLE, "handler timed out")
-                }
-                _ => HttpResponse::text(StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
-            }
+    let read = async {
+        match framing {
+            // A buffered handler gets no trailers; a streaming one gets them
+            // through `handle_streamed`.
+            BodyFraming::Chunked => read_chunked_body(reader, config.max_body_bytes, limits)
+                .await
+                .map(|(body, _trailers)| body),
+            BodyFraming::Sized(len) => read_sized_body(reader, len as usize).await,
+            BodyFraming::Empty => Ok(Vec::new()),
+        }
+    };
+    let body = match timeout(config.body_timeout, read).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(HttpError::BodyTooLarge(_))) => {
+            let status = StatusCode::PAYLOAD_TOO_LARGE;
+            return refuse(writer, config, peer, status, "payload too large").await;
+        }
+        // The reasons are fixed strings from the chunk parser, never an echo
+        // of what the client sent.
+        Ok(Err(HttpError::Protocol(reason))) => {
+            return refuse(writer, config, peer, bad, &reason).await;
+        }
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            let status = StatusCode::REQUEST_TIMEOUT;
+            return refuse(writer, config, peer, status, "request timeout").await;
         }
     };
 
-    // A streamed body cannot be delimited for an HTTP/1.0 client except by
-    // closing, and a handler may ask for the connection to be closed.
-    let keep_alive = wants_keep_alive
-        && !resp.headers.connection_has("close")
-        && !(http10 && resp.stream.is_some());
+    if bad_path {
+        // The body was read in full, so the connection stays usable.
+        config.report(peer, &HttpError::Protocol("invalid request path".into()));
+        let resp = HttpResponse::text(bad, "invalid request path");
+        let opts = WriteOpts {
+            head_request,
+            keep_alive: false,
+            http10,
+        };
+        write_response(writer, resp, &opts, config.write_timeout).await?;
+        return Ok(After::Close);
+    }
+    req.body = body;
+
+    let resp = respond(handler, req, config, peer).await;
+    let keep_alive = wants_keep_alive && response_allows_keep_alive(&resp, http10);
     let opts = WriteOpts {
         head_request,
         keep_alive,
         http10,
     };
-    write_response(reader, resp, &opts, config.write_timeout).await?;
+    write_response(writer, resp, &opts, config.write_timeout).await?;
     Ok(if keep_alive {
         After::KeepAlive
     } else {
@@ -813,9 +1203,229 @@ where
     })
 }
 
+/// Runs the handler and turns a panic or a handler timeout into an error
+/// response (reporting it).
+async fn respond(
+    handler: &Arc<dyn HttpHandler>,
+    req: Request,
+    config: &ServerConfig,
+    peer: Option<SocketAddr>,
+) -> HttpResponse {
+    match run_handler(handler, req, config.handler_timeout).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            config.report(peer, &e);
+            match e {
+                HttpError::Timeout => {
+                    HttpResponse::text(StatusCode::SERVICE_UNAVAILABLE, "handler timed out")
+                }
+                _ => HttpResponse::text(StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
+            }
+        }
+    }
+}
+
+/// Whether the response lets the connection stay open: the handler did not
+/// ask to close it, and it is not a stream to an HTTP/1.0 client (which can
+/// only be delimited by closing).
+fn response_allows_keep_alive(resp: &HttpResponse, http10: bool) -> bool {
+    !resp.headers.connection_has("close")
+        && !(http10 && (resp.stream.is_some() || resp.has_body_stream()))
+}
+
+/// What [`handle_streamed`] needs to know about the request beyond the
+/// [`Request`] itself.
+struct StreamedRequest {
+    framing: BodyFraming,
+    head_request: bool,
+    http10: bool,
+    wants_keep_alive: bool,
+}
+
+/// How reading a streamed request body ended.
+#[derive(Debug)]
+enum Pumped {
+    /// The whole body was read off the connection.
+    Complete,
+    /// The handler dropped the body stream before the end; the rest of the
+    /// body is still on the connection.
+    Abandoned,
+    /// Reading failed (too large, timed out, malformed or cut off); the error
+    /// was reported and handed to the handler.
+    Failed,
+}
+
+/// Serves a request whose handler streams the body: the handler runs as soon
+/// as the head is read while the body is read off the connection into its
+/// [`BodyStream`], piece by piece, and the response may be written while
+/// the body is still arriving.
+async fn handle_streamed<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    limits: &HeadLimits,
+    handler: &Arc<dyn HttpHandler>,
+    config: &ServerConfig,
+    mut req: Request,
+    stream: StreamedRequest,
+) -> Result<After, HttpError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let peer = req.peer_addr();
+    let (tx, rx) = super::body_channel(STREAM_QUEUE);
+    req.set_body_stream(rx);
+    let pump = pump_body(reader, stream.framing, tx, config, limits, peer);
+    tokio::pin!(pump);
+    let mut pumped: Option<Pumped> = None;
+
+    let handled = respond(handler, req, config, peer);
+    tokio::pin!(handled);
+    let resp = loop {
+        tokio::select! {
+            biased;
+            resp = &mut handled => break resp,
+            done = &mut pump, if pumped.is_none() => pumped = Some(done),
+        }
+    };
+    // A handler that dropped the body stream has made the pump finish by
+    // now; find out before choosing the `Connection` header.
+    if pumped.is_none() {
+        tokio::select! {
+            biased;
+            done = &mut pump => pumped = Some(done),
+            _ = std::future::ready(()) => {}
+        }
+    }
+
+    let unfinished_body = matches!(pumped, Some(Pumped::Abandoned | Pumped::Failed));
+    let keep_alive = stream.wants_keep_alive
+        && !unfinished_body
+        && response_allows_keep_alive(&resp, stream.http10);
+    let opts = WriteOpts {
+        head_request: stream.head_request,
+        keep_alive,
+        http10: stream.http10,
+    };
+    // Write the response while the rest of the body (if any) keeps arriving:
+    // a handler may answer as it reads.
+    let write = write_response(writer, resp, &opts, config.write_timeout);
+    tokio::pin!(write);
+    let mut written = false;
+    while !written || pumped.is_none() {
+        if written {
+            // The response is out but the body is not finished: give the
+            // handler (or whatever holds the body stream) one body timeout
+            // to finish with it, then close the connection.
+            let done = timeout(config.body_timeout, &mut pump).await;
+            pumped = Some(done.unwrap_or(Pumped::Abandoned));
+            break;
+        }
+        tokio::select! {
+            result = &mut write => {
+                result?;
+                written = true;
+            }
+            done = &mut pump, if pumped.is_none() => pumped = Some(done),
+        }
+    }
+    Ok(match pumped {
+        Some(Pumped::Complete) if keep_alive => After::KeepAlive,
+        Some(Pumped::Complete) => After::Close,
+        // The rest of the body may still be on its way: drain briefly so
+        // the response is not lost to a reset.
+        _ => After::Linger,
+    })
+}
+
+/// Reads a request body off the connection piece by piece into `tx`, with
+/// the same caps as a buffered body: [`ServerConfig::max_body_bytes`] for a
+/// chunked body, the chunk-line and trailer limits, and
+/// [`ServerConfig::body_timeout`] as the total time spent **waiting for the
+/// client** (time spent waiting for the handler to take a piece does not
+/// count). Trailers of a chunked body end the stream.
+async fn pump_body<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    framing: BodyFraming,
+    mut tx: BodySender,
+    config: &ServerConfig,
+    limits: &HeadLimits,
+    peer: Option<SocketAddr>,
+) -> Pumped {
+    let mut chunked = ChunkedReader::new(Some(config.max_body_bytes as u64));
+    let mut remaining = match framing {
+        BodyFraming::Sized(len) => len,
+        _ => 0,
+    };
+    let mut budget = config.body_timeout;
+    loop {
+        let waited = tokio::time::Instant::now();
+        let read = async {
+            match framing {
+                BodyFraming::Empty => Ok(None),
+                BodyFraming::Chunked => chunked.next(reader, limits).await,
+                BodyFraming::Sized(_) => read_sized_piece(reader, &mut remaining).await,
+            }
+        };
+        let piece = tokio::select! {
+            r = timeout(budget, read) => r.unwrap_or(Err(HttpError::Timeout)),
+            // The handler dropped the stream: stop reading. What is left of
+            // the body stays unread, so the connection closes.
+            _ = tx.closed() => return Pumped::Abandoned,
+        };
+        budget = budget.saturating_sub(waited.elapsed());
+        match piece {
+            Ok(Some(data)) => {
+                if tx.send(data).await.is_err() {
+                    return Pumped::Abandoned;
+                }
+            }
+            Ok(None) => {
+                // The body is fully read whether or not anyone still listens.
+                let _ = match chunked.take_trailers() {
+                    Some(trailers) => tx.send_trailers(trailers).await,
+                    None => tx.finish().await,
+                };
+                return Pumped::Complete;
+            }
+            Err(error) => {
+                config.report(peer, &error);
+                tx.fail(error).await;
+                return Pumped::Failed;
+            }
+        }
+    }
+}
+
+/// Reads the next piece of a `Content-Length` body, `None` once `remaining`
+/// is zero. The connection ending early is an error.
+async fn read_sized_piece<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    remaining: &mut u64,
+) -> Result<Option<Vec<u8>>, HttpError> {
+    if *remaining == 0 {
+        return Ok(None);
+    }
+    let piece = {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Err(HttpError::Protocol(
+                "request body truncated before Content-Length".into(),
+            ));
+        }
+        let n = (available.len() as u64)
+            .min(*remaining)
+            .min(io::BODY_PIECE_BYTES as u64) as usize;
+        available[..n].to_vec()
+    };
+    reader.consume(piece.len());
+    *remaining -= piece.len() as u64;
+    Ok(Some(piece))
+}
+
 /// Runs the handler with panic isolation and the optional deadline.
 /// `Err(HandlerPanic)` = it panicked; `Err(Timeout)` = it ran out of time.
-async fn run_handler(
+pub(crate) async fn run_handler(
     handler: &Arc<dyn HttpHandler>,
     req: Request,
     limit: Option<Duration>,
@@ -888,13 +1498,13 @@ async fn read_chunked_body<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max: usize,
     limits: &HeadLimits,
-) -> Result<Vec<u8>, HttpError> {
+) -> Result<(Vec<u8>, Option<HeaderMap>), HttpError> {
     let mut decoder = ChunkedReader::new(Some(max as u64));
     let mut body = Vec::new();
     while let Some(piece) = decoder.next(reader, limits).await? {
         body.extend_from_slice(&piece);
     }
-    Ok(body)
+    Ok((body, decoder.take_trailers()))
 }
 
 /// How one response is framed and what it says about the connection.
@@ -939,25 +1549,33 @@ async fn flush_timed<W: AsyncWrite + Unpin>(w: &mut W, limit: Duration) -> Resul
 
 async fn write_response<W: AsyncWrite + Unpin>(
     w: &mut W,
-    mut resp: HttpResponse,
+    resp: HttpResponse,
     opts: &WriteOpts,
     write_timeout: Duration,
 ) -> Result<(), HttpError> {
+    let ResponseParts {
+        status,
+        headers,
+        body,
+        trailers,
+    } = resp.into_parts();
     // Responses to HEAD, and 1xx/204/304, carry no message body — writing one
     // would desync framing on a kept-alive connection.
-    let code = resp.status.as_u16();
+    let code = status.as_u16();
     let no_content = matches!(code, 204 | 304) || (100..200).contains(&code);
     let bodyless = opts.head_request || no_content;
-    let streaming = resp.stream.is_some() && !bodyless;
+    let streaming = !matches!(body, ResponseBody::Fixed(_)) && !bodyless;
+    // Trailers need chunked framing, which needs HTTP/1.1.
+    let trailered = !trailers.is_empty() && !bodyless && !opts.http10;
     // Chunked needs HTTP/1.1; for a 1.0 client the stream ends at close.
-    let chunked = streaming && !opts.http10;
+    let chunked = (streaming && !opts.http10) || trailered;
 
     // Only a HEAD response may carry a handler-chosen Content-Length.
     let keep_length = opts.head_request && !no_content;
 
     let mut head = String::with_capacity(256);
-    head.push_str(&format!("HTTP/1.1 {} {}\r\n", code, resp.status.reason()));
-    for (k, v) in resp.headers.iter() {
+    head.push_str(&format!("HTTP/1.1 {} {}\r\n", code, status.reason()));
+    for (k, v) in headers.iter() {
         // The server owns the framing headers; see `HttpResponse`.
         if k.eq_ignore_ascii_case("transfer-encoding") {
             continue;
@@ -967,7 +1585,7 @@ async fn write_response<W: AsyncWrite + Unpin>(
         }
         head.push_str(&format!("{k}: {v}\r\n"));
     }
-    if !resp.headers.contains("date") {
+    if !headers.contains("date") {
         head.push_str(&format!(
             "Date: {}\r\n",
             format_http_date(SystemTime::now())
@@ -978,12 +1596,16 @@ async fn write_response<W: AsyncWrite + Unpin>(
     } else if !streaming && !no_content {
         // HEAD still advertises the entity length (with no body); 1xx/204/304
         // omit Content-Length entirely.
-        let advertised = opts.head_request && resp.headers.contains("content-length");
+        let advertised = opts.head_request && headers.contains("content-length");
         if !advertised {
-            head.push_str(&format!("Content-Length: {}\r\n", resp.body.len()));
+            let len = match &body {
+                ResponseBody::Fixed(b) => b.len(),
+                _ => 0,
+            };
+            head.push_str(&format!("Content-Length: {len}\r\n"));
         }
     }
-    if !resp.headers.contains("connection") {
+    if !headers.contains("connection") {
         head.push_str(if opts.keep_alive {
             "Connection: keep-alive\r\n"
         } else {
@@ -996,39 +1618,189 @@ async fn write_response<W: AsyncWrite + Unpin>(
     if bodyless {
         // Headers only — drop any stream/body the handler may have set.
         write_all_timed(w, &first, write_timeout).await?;
-    } else if let Some(mut chunks) = resp.stream.take() {
-        write_all_timed(w, &first, write_timeout).await?;
-        flush_timed(w, write_timeout).await?;
-        // Waiting for the handler's next chunk is not timed (an event stream
-        // may be quiet for long stretches); delivering each chunk is.
-        while let Some(chunk) = chunks.recv().await {
-            if chunk.is_empty() {
-                continue;
+        return flush_timed(w, write_timeout).await;
+    }
+    match body {
+        ResponseBody::Fixed(body) if chunked => {
+            if !body.is_empty() {
+                first.extend_from_slice(format!("{:X}\r\n", body.len()).as_bytes());
+                first.extend_from_slice(&body);
+                first.extend_from_slice(b"\r\n");
+            }
+            first.extend_from_slice(&last_chunk(&trailers));
+            write_all_timed(w, &first, write_timeout).await?;
+        }
+        ResponseBody::Fixed(body) => {
+            if body.len() <= WRITE_SLICE_BYTES {
+                // One write for small responses: head and body in one segment.
+                first.extend_from_slice(&body);
+                write_all_timed(w, &first, write_timeout).await?;
+            } else {
+                write_all_timed(w, &first, write_timeout).await?;
+                write_all_timed(w, &body, write_timeout).await?;
+            }
+        }
+        ResponseBody::Chunks(mut chunks) => {
+            write_all_timed(w, &first, write_timeout).await?;
+            flush_timed(w, write_timeout).await?;
+            // Waiting for the handler's next chunk is not timed (an event
+            // stream may be quiet for long stretches); delivering each chunk
+            // is.
+            while let Some(chunk) = chunks.recv().await {
+                write_chunk(w, &chunk, chunked, write_timeout).await?;
             }
             if chunked {
-                let mut frame = Vec::with_capacity(chunk.len() + 16);
-                frame.extend_from_slice(format!("{:X}\r\n", chunk.len()).as_bytes());
-                frame.extend_from_slice(&chunk);
-                frame.extend_from_slice(b"\r\n");
-                write_all_timed(w, &frame, write_timeout).await?;
-            } else {
-                write_all_timed(w, &chunk, write_timeout).await?;
+                write_all_timed(w, &last_chunk(&trailers), write_timeout).await?;
             }
-            // Flush per chunk so SSE clients see events live.
+        }
+        ResponseBody::Stream(mut stream) => {
+            write_all_timed(w, &first, write_timeout).await?;
             flush_timed(w, write_timeout).await?;
+            // A failed stream propagates as an error, so the connection
+            // closes before the final chunk and the client sees a truncated
+            // body rather than a complete one.
+            while let Some(chunk) = stream.chunk().await? {
+                write_chunk(w, &chunk, chunked, write_timeout).await?;
+            }
+            if chunked {
+                let mut all = trailers;
+                if let Some(more) = stream.take_trailers() {
+                    for (k, v) in more.iter() {
+                        all.append(k, v);
+                    }
+                }
+                write_all_timed(w, &last_chunk(&all), write_timeout).await?;
+            }
         }
-        if chunked {
-            write_all_timed(w, b"0\r\n\r\n", write_timeout).await?;
-        }
-    } else if resp.body.len() <= WRITE_SLICE_BYTES {
-        // One write for small responses: head and body in one segment.
-        first.extend_from_slice(&resp.body);
-        write_all_timed(w, &first, write_timeout).await?;
-    } else {
-        write_all_timed(w, &first, write_timeout).await?;
-        write_all_timed(w, &resp.body, write_timeout).await?;
     }
     flush_timed(w, write_timeout).await
+}
+
+/// Writes one piece of a streamed body (chunk-framed when `chunked`) and
+/// flushes it, so SSE clients see events live.
+async fn write_chunk<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    chunk: &[u8],
+    chunked: bool,
+    write_timeout: Duration,
+) -> Result<(), HttpError> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    if chunked {
+        let mut frame = Vec::with_capacity(chunk.len() + 16);
+        frame.extend_from_slice(format!("{:X}\r\n", chunk.len()).as_bytes());
+        frame.extend_from_slice(chunk);
+        frame.extend_from_slice(b"\r\n");
+        write_all_timed(w, &frame, write_timeout).await?;
+    } else {
+        write_all_timed(w, chunk, write_timeout).await?;
+    }
+    flush_timed(w, write_timeout).await
+}
+
+/// The terminating chunk with a trailer section.
+fn last_chunk(trailers: &HeaderMap) -> Vec<u8> {
+    let mut out = b"0\r\n".to_vec();
+    for (k, v) in trailers.iter() {
+        // Framing fields cannot be trailers.
+        if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
+        out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// Peeks at the start of a cleartext connection: is it the HTTP/2 preface?
+/// The bytes are left in place for whichever protocol serves the connection.
+#[cfg(feature = "http2")]
+async fn sniff_preface(
+    mut reader: BufReader<Conn>,
+    limit: Duration,
+) -> Result<(BufReader<Conn>, bool), HttpError> {
+    use super::h2::frame::PREFACE;
+    let buffered = reader.buffer();
+    if buffered.len() >= PREFACE.len() {
+        let is_h2 = buffered[..PREFACE.len()] == PREFACE[..];
+        return Ok((reader, is_h2));
+    }
+    if !PREFACE.starts_with(buffered) {
+        return Ok((reader, false));
+    }
+    // A short first segment that could start either protocol ("P" may be a
+    // POST): read until it is decided, then replay what was read.
+    let mut prefix = buffered.to_vec();
+    reader.consume(prefix.len());
+    let read_more = async {
+        while prefix.len() < PREFACE.len() && PREFACE.starts_with(&prefix) {
+            let more = reader.fill_buf().await?;
+            if more.is_empty() {
+                break;
+            }
+            let n = more.len().min(PREFACE.len() - prefix.len());
+            prefix.extend_from_slice(&more[..n]);
+            reader.consume(n);
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    match timeout(limit, read_more).await {
+        Ok(r) => r?,
+        Err(_) => return Err(HttpError::Timeout),
+    }
+    let is_h2 = prefix == PREFACE[..];
+    let rewound = Rewind {
+        prefix,
+        pos: 0,
+        inner: reader,
+    };
+    Ok((BufReader::new(Box::new(rewound) as Conn), is_h2))
+}
+
+/// A connection with already-read bytes put back in front of it.
+#[cfg(feature = "http2")]
+struct Rewind {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: BufReader<Conn>,
+}
+
+#[cfg(feature = "http2")]
+impl tokio::io::AsyncRead for Rewind {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.pos < self.prefix.len() {
+            let n = (self.prefix.len() - self.pos).min(buf.remaining());
+            let start = self.pos;
+            buf.put_slice(&self.prefix[start..start + n]);
+            self.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "http2")]
+impl AsyncWrite for Rewind {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 #[cfg(test)]
@@ -1078,7 +1850,7 @@ mod tls_tests {
                     .unwrap();
             }
         }
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = transport::provider().unwrap();
         let client_cfg = Arc::new(
             rustls::ClientConfig::builder_with_provider(provider)
                 .with_protocol_versions(versions)
@@ -1122,6 +1894,59 @@ mod tls_tests {
     }
 
     #[tokio::test]
+    async fn proxy_header_is_read_before_the_tls_handshake() {
+        struct Peer;
+        impl HttpHandler for Peer {
+            fn handle(&self, req: Request) -> BoxFuture<'_, HttpResponse> {
+                let peer = req.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+                Box::pin(async move { HttpResponse::text(StatusCode::OK, peer) })
+            }
+        }
+        let tls = TlsConfig::from_pem(CERT.as_bytes(), KEY.as_bytes()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig {
+            proxy_protocol: Some(super::super::ProxyProtocol::from_cidrs(["127.0.0.1"]).unwrap()),
+            ..ServerConfig::default()
+        };
+        tokio::spawn(async move {
+            let shutdown = std::future::pending::<()>();
+            let _ = serve_tls_with_config(listener, Arc::new(Peer), shutdown, config, tls).await;
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        for (label, der) in transport::pem_blocks(CERT.as_bytes()) {
+            if label == "CERTIFICATE" {
+                roots
+                    .add(rustls_pki_types::CertificateDer::from(der))
+                    .unwrap();
+            }
+        }
+        let client_cfg =
+            rustls::ClientConfig::builder_with_provider(transport::provider().unwrap())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let mut tcp = TcpStream::connect(addr).await.unwrap();
+        tcp.write_all(b"PROXY TCP4 203.0.113.9 198.51.100.1 40000 443\r\n")
+            .await
+            .unwrap();
+        let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let mut stream = connector.connect(name, tcp).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf).await;
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.ends_with("203.0.113.9:40000"), "{resp}");
+    }
+
+    #[tokio::test]
     async fn server_minimum_tls_version_is_enforced() {
         let tls = TlsConfig::builder()
             .cert_pem(CERT.as_bytes(), KEY.as_bytes())
@@ -1149,7 +1974,7 @@ mod tls_tests {
             .collect();
         let key = transport::pem_blocks(KEY.as_bytes()).remove(0).1;
         let key = rustls_pki_types::PrivateKeyDer::try_from(key).unwrap();
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = transport::provider().unwrap();
         let engine = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS12])
             .unwrap()

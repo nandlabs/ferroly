@@ -24,29 +24,45 @@
 
 #![deny(missing_docs)]
 
+mod body;
 mod client;
-mod core;
+pub(crate) mod core;
 mod date;
 mod download;
 mod error;
 mod form;
-mod inflate;
+#[cfg(feature = "http2")]
+pub(crate) mod h2;
+pub(crate) mod inflate;
 pub(crate) mod io;
 mod message;
 mod pool;
 mod proxy;
+mod proxy_protocol;
 mod server;
 pub mod sse;
 pub(crate) mod transport;
 
+pub use body::{body_channel, BodySender, BodyStream};
 pub use client::{Client, ClientBuilder, Interceptor};
-pub use core::{split_target, HeaderMap, Method, StatusCode, Uri};
+pub use core::{split_target, HeaderMap, Method, Protocol, StatusCode, Uri};
 pub use date::format_http_date;
+#[cfg(any(feature = "clients", feature = "obs"))]
+pub(crate) use date::parse_retry_after_at;
 pub use download::download_to_file;
-pub use error::HttpError;
+pub use error::{Http2Cause, Http2Error, Http2ErrorCode, HttpError};
 pub use form::{form_urlencode, normalize_path, percent_decode, percent_encode, Multipart};
+#[cfg(feature = "http2")]
+#[doc(hidden)]
+pub use h2::fuzz_connection as __fuzz_h2_connection;
+#[cfg(feature = "http2")]
+#[doc(hidden)]
+pub use h2::fuzz_frames as __fuzz_h2_frames;
+#[cfg(feature = "http2")]
+pub use h2::Http2Config;
 pub use message::{Request, RequestBuilder, Response};
 pub use proxy::Proxy;
+pub use proxy_protocol::ProxyProtocol;
 pub use server::{
     serve, serve_tls, serve_tls_reloadable, serve_tls_with_config, serve_with_config, BoxFuture,
     ErrorHook, HttpHandler, HttpResponse, ServerConfig,

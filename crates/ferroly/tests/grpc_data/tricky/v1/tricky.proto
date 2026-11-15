@@ -1,0 +1,50 @@
+// Names that trip up generated code: rpcs named after methods of `Arc`,
+// `Clone`, `Debug` and the client itself; messages named like the generated
+// server and client; a service named `Type`; and types from a nested
+// scope and from another package. `grpc_codegen_golden.rs` keeps
+// `tricky_generated.rs` in sync with it, and `grpc_codegen.rs` compiles it
+// under `#![deny(missing_docs)]`.
+syntax = "proto3";
+
+package tricky.v1;
+
+import "tricky/common.proto";
+
+// A plain message.
+message Word {
+  string text = 1;
+  // A nested type, generated in the `word` module.
+  message Inner {
+    int32 n = 1;
+  }
+}
+
+// Named like the generated server adapter.
+message TrickyServer {
+  int32 n = 1;
+}
+
+// Named like the generated client.
+message TrickyClient {
+  int32 n = 1;
+}
+
+service Tricky {
+  rpc Clone(Word) returns (Word);
+  rpc CloneFrom(Word) returns (Word);
+  rpc Deref(Word.Inner) returns (Word.Inner);
+  rpc AsRef(TrickyServer) returns (TrickyClient);
+  rpc Borrow(tricky.common.Empty) returns (tricky.common.Empty);
+  rpc Fmt(Word) returns (stream Word);
+  rpc New(stream Word) returns (Word);
+  rpc Channel(stream Word) returns (stream Word);
+  rpc Into(Word) returns (Word);
+  // Named against Rust's method-name conventions (`into_*`, `from_*`).
+  rpc IntoWords(Word) returns (Word);
+  rpc FromWords(Word) returns (Word);
+}
+
+// A service whose snake-case name is a keyword.
+service Type {
+  rpc Get(tricky.common.Empty) returns (Word);
+}

@@ -10,8 +10,9 @@ use ferroly::hash::base64;
 use ferroly::http::percent_encode;
 
 use super::common::{
-    f32_num, merge_custom, num_f32, obj, s, stream_failure, tool_result_text, u32_field, ErrorHint,
-    HttpCore, ProviderFailure,
+    check_image_mime, document_text, f32_num, is_image_mime, merge_custom, mime_essence, num_f32,
+    obj, s, stream_failure, tool_result_text, u32_field, unsupported_document, ErrorHint, HttpCore,
+    ProviderFailure,
 };
 use super::sse::{Framing, StreamParser};
 use super::ProviderOptions;
@@ -403,31 +404,80 @@ impl Embedder for OpenAiProvider {
 }
 
 /// The compiled-in OpenAI catalog. Ids, limits and prices are **defaults to
-/// override**: they were correct on the `as_of` date and are not updated
+/// override**: they were read from OpenAI's model and pricing pages on the
+/// `as_of` date (standard tier, short-context rates) and are not updated
 /// between releases.
+///
+/// Only values the published pages state are listed. `ToolUse` is left off
+/// the models whose pages do not confirm function calling over Chat
+/// Completions (`gpt-6.1-sol`, `gpt-6.1-terra`: "tool calling requires the
+/// Responses API"; `gpt-6-luna`: only with `reasoning_effort: none`); add it
+/// with a config overlay if your account allows it. Of the `gpt-5` family
+/// only `gpt-5.5`, still current, is listed; the deprecated `gpt-5*` models,
+/// `gpt-4.1*`, `gpt-4o*`, `o3` and shut-down ones are not.
 fn default_catalog() -> Vec<ModelInfo> {
-    use Capability::{Chat, Embeddings, JsonMode, Streaming, Text, ToolUse, Vision};
-    let as_of = AsOf::new(2024, 10, 1);
+    use Capability::{Chat, Embeddings, JsonMode, Reasoning, Streaming, Text, ToolUse, Vision};
+    let as_of = AsOf::new(2026, 11, 15);
+    let chat = [Text, Chat, Streaming, Vision, JsonMode, Reasoning];
+    let with_tools = [Text, Chat, Streaming, Vision, ToolUse, JsonMode, Reasoning];
     vec![
-        ModelInfo::new("openai", "gpt-4o")
-            .display_name("GPT-4o")
-            .capabilities([Text, Chat, Streaming, Vision, ToolUse, JsonMode])
-            .limits(128_000, 16_384)
-            .cost(2.5, 10.0)
-            .ranks(70, 60)
+        ModelInfo::new("openai", "gpt-6-astra")
+            .display_name("GPT-6 Astra")
+            .capabilities(with_tools)
+            .limits(1_050_000, 128_000)
+            .cost(10.0, 50.0)
+            .cache_cost(Some(1.0), None)
+            .ranks(100, 30)
             .as_of(as_of),
-        ModelInfo::new("openai", "gpt-4o-mini")
-            .display_name("GPT-4o mini")
-            .capabilities([Text, Chat, Streaming, Vision, ToolUse, JsonMode])
-            .limits(128_000, 16_384)
-            .cost(0.15, 0.60)
-            .ranks(45, 85)
+        ModelInfo::new("openai", "gpt-5.5")
+            .display_name("GPT-5.5")
+            .capabilities(with_tools)
+            .limits(1_050_000, 128_000)
+            // The rate for prompts under 272K tokens; longer prompts cost more.
+            .cost(5.0, 30.0)
+            .cache_cost(Some(0.50), None)
+            .meta("pricing_note", "rate for prompts under 272K tokens")
+            .ranks(85, 45)
+            .as_of(as_of),
+        ModelInfo::new("openai", "gpt-6.1-sol")
+            .display_name("GPT-6.1 Sol")
+            .capabilities(chat)
+            .limits(1_050_000, 128_000)
+            .cost(2.0, 10.0)
+            .cache_cost(Some(0.10), None)
+            .ranks(90, 55)
+            .as_of(as_of),
+        ModelInfo::new("openai", "gpt-6.1-terra")
+            .display_name("GPT-6.1 Terra")
+            .capabilities(chat)
+            .limits(1_050_000, 128_000)
+            .cost(1.0, 5.0)
+            .cache_cost(Some(0.05), None)
+            .ranks(75, 70)
+            .as_of(as_of),
+        ModelInfo::new("openai", "gpt-6-luna")
+            .display_name("GPT-6 Luna")
+            .capabilities(chat)
+            .limits(1_050_000, 128_000)
+            .cost(0.10, 0.50)
+            .cache_cost(Some(0.01), None)
+            .meta(
+                "tool_use_note",
+                "Chat Completions supports function calling only with reasoning_effort none",
+            )
+            .ranks(55, 90)
             .as_of(as_of),
         ModelInfo::new("openai", "text-embedding-3-small")
             .display_name("text-embedding-3-small")
             .capabilities([Embeddings])
-            .limits(8_191, 0)
+            .limits(8_192, 0)
             .cost(0.02, 0.0)
+            .as_of(as_of),
+        ModelInfo::new("openai", "text-embedding-3-large")
+            .display_name("text-embedding-3-large")
+            .capabilities([Embeddings])
+            .limits(8_192, 0)
+            .cost(0.13, 0.0)
             .as_of(as_of),
     ]
 }
@@ -545,7 +595,7 @@ fn build_body(
         messages.push(obj([("role", s("system")), ("content", s(sys))]));
     }
     for message in &request.messages {
-        encode_message(message, &mut messages);
+        encode_message(message, &mut messages)?;
     }
 
     let o = &request.options;
@@ -673,8 +723,9 @@ fn build_body(
 /// - an assistant message with tool calls carries them in `tool_calls`
 ///   (`arguments` as a JSON string) with `content: null` when it has no text;
 /// - anything else is `{role, content}` with a string, or an array of parts
-///   when it has images.
-fn encode_message(msg: &Message, out: &mut Vec<Value>) {
+///   when it has images or documents (a PDF is a `file` part carrying a
+///   `data:` URL; a text document is a text part).
+fn encode_message(msg: &Message, out: &mut Vec<Value>) -> Result<(), GenAiError> {
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut content: Vec<Value> = Vec::new();
     let mut text_only = true;
@@ -683,6 +734,7 @@ fn encode_message(msg: &Message, out: &mut Vec<Value>) {
         match part {
             MessagePart::Text(t) => content.push(obj([("type", s("text")), ("text", s(t))])),
             MessagePart::Image { data, mime_type } => {
+                check_image_mime(mime_type)?;
                 text_only = false;
                 let url = format!("data:{mime_type};base64,{}", base64::encode(data));
                 content.push(obj([
@@ -690,12 +742,45 @@ fn encode_message(msg: &Message, out: &mut Vec<Value>) {
                     ("image_url", obj([("url", s(&url))])),
                 ]));
             }
-            MessagePart::FileRef { uri, .. } => {
+            MessagePart::Document {
+                data,
+                mime_type,
+                name,
+            } => {
+                let essence = mime_essence(mime_type);
+                if essence == "application/pdf" {
+                    text_only = false;
+                    let url = format!("data:application/pdf;base64,{}", base64::encode(data));
+                    let filename = name.as_deref().unwrap_or("document.pdf");
+                    content.push(obj([
+                        ("type", s("file")),
+                        (
+                            "file",
+                            obj([("filename", s(filename)), ("file_data", s(&url))]),
+                        ),
+                    ]));
+                } else if essence.starts_with("text/") {
+                    text_only = false;
+                    let text = document_text(data, mime_type)?;
+                    content.push(obj([("type", s("text")), ("text", s(text))]));
+                } else {
+                    return Err(unsupported_document("openai", mime_type));
+                }
+            }
+            MessagePart::FileRef { uri, mime_type } => {
                 text_only = false;
-                content.push(obj([
-                    ("type", s("image_url")),
-                    ("image_url", obj([("url", s(uri))])),
-                ]));
+                if is_image_mime(mime_type) || mime_type.is_empty() {
+                    content.push(obj([
+                        ("type", s("image_url")),
+                        ("image_url", obj([("url", s(uri))])),
+                    ]));
+                } else {
+                    // Chat Completions fetches only image URLs. Sending any
+                    // other reference as text would hand the model a bare
+                    // URL instead of the file; refuse it before sending, as
+                    // for an unreadable inline document.
+                    return Err(unsupported_document("openai", mime_type));
+                }
             }
             MessagePart::ToolCall {
                 id,
@@ -729,7 +814,7 @@ fn encode_message(msg: &Message, out: &mut Vec<Value>) {
             // An empty message: keep the turn so roles still alternate.
             out.push(obj([("role", s(msg.role.as_str())), ("content", s(""))]));
         }
-        return;
+        return Ok(());
     }
     // A tool-role message that carried results is fully encoded above; any
     // other content it has is sent as a user turn.
@@ -753,6 +838,7 @@ fn encode_message(msg: &Message, out: &mut Vec<Value>) {
         fields.push(("tool_calls".to_string(), Value::Array(tool_calls)));
     }
     out.push(Value::Object(fields));
+    Ok(())
 }
 
 fn parse_usage(u: &Value) -> Usage {

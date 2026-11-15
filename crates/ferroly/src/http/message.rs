@@ -5,13 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
 
+use super::body::BodyStream;
 use super::form::{form_urlencode, Multipart};
 use super::inflate::Decoder;
 use super::io::{ChunkedReader, HeadLimits, BODY_PIECE_BYTES};
 use super::transport::Conn;
-use super::{HeaderMap, HttpError, Method, StatusCode, Uri};
+use super::{HeaderMap, HttpError, Method, Protocol, StatusCode, Uri};
 
 /// What the server knows about the connection a request arrived on.
 #[derive(Debug, Clone)]
@@ -28,7 +30,11 @@ pub(crate) struct ConnInfo {
 }
 
 /// An HTTP request (client- or server-side).
-#[derive(Debug, Clone)]
+///
+/// Cloning a request copies everything except a streamed body
+/// ([`take_body_stream`](Self::take_body_stream)), which cannot be shared:
+/// the clone has none.
+#[derive(Debug)]
 pub struct Request {
     /// The request method.
     pub method: Method,
@@ -40,6 +46,24 @@ pub struct Request {
     pub body: Vec<u8>,
     /// Connection metadata, set by the server for the requests it parses.
     conn: Option<ConnInfo>,
+    /// The protocol the request arrived over.
+    protocol: Protocol,
+    /// A streamed body (server, for handlers that ask for one).
+    body_stream: Option<BodyStream>,
+}
+
+impl Clone for Request {
+    fn clone(&self) -> Self {
+        Self {
+            method: self.method.clone(),
+            uri: self.uri.clone(),
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+            conn: self.conn.clone(),
+            protocol: self.protocol,
+            body_stream: None,
+        }
+    }
 }
 
 impl Request {
@@ -51,6 +75,8 @@ impl Request {
             headers: HeaderMap::new(),
             body: Vec::new(),
             conn: None,
+            protocol: Protocol::Http11,
+            body_stream: None,
         }
     }
 
@@ -121,6 +147,40 @@ impl Request {
 
     pub(crate) fn set_conn_info(&mut self, info: ConnInfo) {
         self.conn = Some(info);
+    }
+
+    /// The protocol the request arrived over: `Http10`/`Http11`, or `Http2`
+    /// for a request served over HTTP/2. A request built by hand reports
+    /// `Http11`.
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+
+    pub(crate) fn set_protocol(&mut self, protocol: Protocol) {
+        self.protocol = protocol;
+    }
+
+    /// Takes the streamed request body, when the handler asked for one with
+    /// [`HttpHandler::wants_body_stream`](super::HttpHandler::wants_body_stream)
+    /// (`None` otherwise, or once taken). [`body`](Self::body) is empty for
+    /// such a request.
+    ///
+    /// The stream yields the body as it arrives — the handler can read it
+    /// while it streams its response — and ends with the request's trailers
+    /// (HTTP/2 trailing HEADERS, or the HTTP/1.1 chunked trailer section), if
+    /// any. Dropping it early discards the rest of the body without affecting
+    /// the response; over HTTP/1.1 the connection is then closed after the
+    /// response, because the unread rest of the body is still on it.
+    pub fn take_body_stream(&mut self) -> Option<BodyStream> {
+        self.body_stream.take()
+    }
+
+    /// Attaches a streamed body (see
+    /// [`take_body_stream`](Self::take_body_stream)). The server does this
+    /// itself; the setter exists so streaming handlers can be unit-tested
+    /// with a hand-built request.
+    pub fn set_body_stream(&mut self, body: BodyStream) {
+        self.body_stream = Some(body);
     }
 }
 
@@ -229,9 +289,37 @@ pub(crate) struct Body {
     received: u64,
     /// Content decoder for a compressed body, with the bytes it has produced.
     decoder: Option<(Decoder, u64)>,
+    /// Trailers received at the end of the body.
+    trailers: Option<HeaderMap>,
+    /// The body is an HTTP/2 stream rather than bytes on `reader`.
+    #[cfg(feature = "http2")]
+    h2: Option<super::h2::RecvStream>,
+    /// For an HTTP/2 request body streamed in the background: released when
+    /// the response ends cleanly, dropped (stopping the upload) when the
+    /// body fails or is dropped before its end.
+    #[cfg(feature = "http2")]
+    upload: Option<super::h2::client::UploadWatch>,
+    /// The connection's slot under the client's per-host active-connection
+    /// limit, released as soon as the connection is pooled or closed.
+    slot: Option<OwnedSemaphorePermit>,
 }
 
 impl Body {
+    /// Holds `slot` until the connection is released (at once when it
+    /// already has been).
+    pub(crate) fn holding(mut self, slot: Option<OwnedSemaphorePermit>) -> Self {
+        if matches!(self.framing, Framing::Done | Framing::Length(0)) {
+            // Nothing to read (HEAD, 204, 304, an empty body) on a connection
+            // that is not pooled either: close it now, so its slot is free
+            // even while the caller holds the response.
+            self.finish();
+        }
+        if self.reader.is_some() {
+            self.slot = slot;
+        }
+        self
+    }
+
     pub(crate) fn new(reader: BufReader<Conn>, framing: Framing, limits: BodyLimits) -> Self {
         Self {
             reader: Some(reader),
@@ -241,6 +329,35 @@ impl Body {
             chunked: ChunkedReader::new(limits.max_bytes),
             received: 0,
             decoder: None,
+            trailers: None,
+            #[cfg(feature = "http2")]
+            h2: None,
+            #[cfg(feature = "http2")]
+            upload: None,
+            slot: None,
+        }
+    }
+
+    /// A body read from an HTTP/2 stream; `upload` watches the request body
+    /// being streamed in the background, if any.
+    #[cfg(feature = "http2")]
+    pub(crate) fn h2(
+        stream: super::h2::RecvStream,
+        limits: BodyLimits,
+        upload: Option<super::h2::client::UploadWatch>,
+    ) -> Self {
+        Self {
+            reader: None,
+            framing: Framing::Eof,
+            reclaim: None,
+            limits,
+            chunked: ChunkedReader::new(limits.max_bytes),
+            received: 0,
+            decoder: None,
+            trailers: None,
+            h2: Some(stream),
+            upload,
+            slot: None,
         }
     }
 
@@ -278,11 +395,14 @@ impl Body {
     /// called on self-delimited completion, never after a truncation/EOF-close.
     fn finish(&mut self) {
         self.framing = Framing::Done;
-        // Without a pool to return to, dropping the reader closes the
-        // connection.
-        if let (Some(reclaim), Some(reader)) = (self.reclaim.take(), self.reader.take()) {
+        // Without a pool to return to (`Connection: close`, HTTP/1.0,
+        // ambiguous framing), dropping the reader closes the connection.
+        // Either way the connection is released, and with it its slot.
+        let reader = self.reader.take();
+        if let (Some(reclaim), Some(reader)) = (self.reclaim.take(), reader) {
             reclaim.pool.put(reclaim.key, reader);
         }
+        self.slot = None;
     }
 
     /// Marks the body unusable and closes the connection.
@@ -290,6 +410,14 @@ impl Body {
         self.framing = Framing::Failed;
         self.reader = None;
         self.reclaim = None;
+        self.slot = None;
+        #[cfg(feature = "http2")]
+        {
+            // Dropping the stream resets it, and dropping the watch stops a
+            // request body still being streamed on it.
+            self.h2 = None;
+            self.upload = None;
+        }
     }
 
     /// The time allowed for the next read: the idle timeout, shortened to what
@@ -330,6 +458,35 @@ impl Body {
 
     async fn read_raw(&mut self) -> Result<Option<Vec<u8>>, HttpError> {
         let max = self.limits.max_bytes;
+        #[cfg(feature = "http2")]
+        if let Some(stream) = self.h2.as_mut() {
+            if matches!(self.framing, Framing::Failed) {
+                return Err(HttpError::Protocol(
+                    "response body is unusable after an earlier error".into(),
+                ));
+            }
+            return match stream.next().await? {
+                super::h2::Chunk::Data(piece) => {
+                    self.received += piece.len() as u64;
+                    if let Some(max) = max {
+                        if self.received > max {
+                            return Err(HttpError::BodyTooLarge(max));
+                        }
+                    }
+                    Ok(Some(piece))
+                }
+                super::h2::Chunk::End(trailers) => {
+                    if trailers.is_some() {
+                        self.trailers = trailers;
+                    }
+                    self.framing = Framing::Done;
+                    if let Some(mut upload) = self.upload.take() {
+                        upload.release();
+                    }
+                    Ok(None)
+                }
+            };
+        }
         match self.framing {
             Framing::Failed => Err(HttpError::Protocol(
                 "response body is unusable after an earlier error".into(),
@@ -369,6 +526,7 @@ impl Body {
                         Ok(Some(piece))
                     }
                     None => {
+                        self.trailers = self.chunked.take_trailers();
                         self.finish();
                         Ok(None)
                     }
@@ -384,6 +542,7 @@ impl Body {
                     self.framing = Framing::Done;
                     self.reader = None;
                     self.reclaim = None;
+                    self.slot = None;
                     return Ok(None);
                 }
                 self.received += piece.len() as u64;
@@ -485,6 +644,7 @@ pub struct Response {
     headers: HeaderMap,
     uri: Uri,
     body: Body,
+    protocol: Protocol,
 }
 
 impl std::fmt::Debug for Response {
@@ -504,7 +664,37 @@ impl Response {
             headers,
             uri,
             body,
+            protocol: Protocol::Http11,
         }
+    }
+
+    pub(crate) fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// The protocol the response was received over: `Http11` (or `Http10`
+    /// when the server answered as HTTP/1.0), or `Http2`.
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+
+    /// The trailer fields that ended the body: available once
+    /// [`chunk`](Self::chunk) has returned `None`, and `None` when the
+    /// response had none. HTTP/2 trailers (a trailing HEADERS frame — gRPC's
+    /// `grpc-status`) and HTTP/1.1 chunked trailers are both reported.
+    pub fn trailers(&self) -> Option<&HeaderMap> {
+        self.body.trailers.as_ref()
+    }
+
+    /// Reads the entire remaining body (bounded by the client's
+    /// response-body cap) and returns it with the trailers, if any.
+    pub async fn bytes_with_trailers(mut self) -> Result<(Vec<u8>, Option<HeaderMap>), HttpError> {
+        let mut out = Vec::new();
+        while let Some(chunk) = self.body.next_chunk().await? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok((out, self.body.trailers.take()))
     }
 
     /// The response status code.

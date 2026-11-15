@@ -354,9 +354,12 @@ pub struct RetryAttempt {
 }
 ```
 
-`RetryAfter(d)` waits exactly `d` instead of the policy's delay — the way to
-honour a server's `Retry-After`. It is not jittered, and it is subject to
-`max_retry_after` and `max_elapsed`. `parse_retry_after` reads the header:
+`RetryAfter(d)` waits the longer of `d` and the policy's (jittered) delay for
+the attempt — the way to honour a server's `Retry-After`. `d` itself is not
+jittered, and it is a minimum: `Retry-After: 0` or a date in the past keeps
+the planned backoff instead of firing the remaining retries at once. It is
+subject to `max_retry_after` and `max_elapsed`. `parse_retry_after` reads the
+header:
 
 ```rust
 use std::time::Duration;
@@ -614,6 +617,43 @@ Ignored outcomes are not in the window.
 | `state()` | current `CircuitState`. An `Open` breaker whose cooldown has elapsed still reports `Open` until the next admission request. |
 | `metrics() -> BreakerMetrics` | `state`, `successes`, `failures`, `rejected`, `trips`, `consecutive_failures`, `half_open_in_flight` |
 | `reset()` | force `Closed`, clearing counters and window (operator override) |
+| `export_metrics(&metrics::Registry, name)` | feature `metrics`: publish this breaker's `BreakerMetrics` to a [metrics registry](metrics.md) under `breaker="{name}"`, refreshed on every scrape (see below) |
+
+#### Exporting to `ferroly::metrics` (feature `metrics`)
+
+`CircuitBreaker::export_metrics(&registry, name)` and
+`CircuitBreakerRegistry::export_metrics(&registry)` register a
+[collector](metrics.md#collectors-and-process-metrics) that copies each breaker's
+`BreakerMetrics` into the registry at scrape time. It is opt-in; nothing is exported
+until you call one of them.
+
+```rust
+use ferroly::clients::{CircuitBreakerConfig, CircuitBreakerRegistry};
+use ferroly::metrics::global;
+
+let breakers = CircuitBreakerRegistry::new(CircuitBreakerConfig::default());
+breakers.export_metrics(global()); // every breaker, including ones created later
+```
+
+| Metric | Type | Value |
+|---|---|---|
+| `circuit_breaker_state{breaker}` | gauge | `0` closed, `1` open, `2` half-open |
+| `circuit_breaker_successes_total{breaker}` | counter | `successes` |
+| `circuit_breaker_failures_total{breaker}` | counter | `failures` |
+| `circuit_breaker_rejected_total{breaker}` | counter | `rejected` |
+| `circuit_breaker_trips_total{breaker}` | counter | `trips` |
+| `circuit_breaker_consecutive_failures{breaker}` | gauge | `consecutive_failures` (closed state; restarts at a trip) |
+| `circuit_breaker_half_open_in_flight{breaker}` | gauge | `half_open_in_flight` |
+
+The `breaker` label is the name given to `CircuitBreaker::export_metrics`, or the key in
+a `CircuitBreakerRegistry`. The collector holds only weak references, so it keeps neither
+a breaker nor a registry alive: the series of a dropped breaker, of a key removed from the
+registry, or of every key once the registry is dropped disappear at the next scrape. A
+single breaker's collector is removed with its series, so exporting many short-lived
+breakers leaves nothing behind. Each name is one set of series: give each live breaker
+its own name (two breakers under one name overwrite each other's values) and keep names
+bounded. Keys derived from request data (per host of arbitrary URLs, per user) grow the
+series count like any label; the registry's cardinality guard caps it. The counters mirror totals kept since the breaker was created.
 
 ### Legacy protocol: `can_execute` / `on_execution`
 
@@ -665,6 +705,7 @@ let breakers = CircuitBreakerRegistry::with_factory(|key| {
 | `remove(key)`, `clear()` | |
 | `keys()`, `len()`, `is_empty()` | |
 | `states() -> Vec<(String, CircuitState)>` | sorted by key — for a health endpoint |
+| `export_metrics(&metrics::Registry)` | feature `metrics`: export every breaker, labelled by key ([above](#exporting-to-ferrolymetrics-feature-metrics)) |
 
 Keys are never evicted automatically. If they are unbounded (derived from
 request data), remove them yourself.
@@ -823,7 +864,7 @@ async fn example() -> Result<String, PolicyError<ApiError>> {
 | `ErrorClass` | Retry | Breaker | Typical errors |
 |---|---|---|---|
 | `transient()` | yes | failure | timeouts, connection resets, `502`/`503`/`504` |
-| `retry_after(delay)` | yes, after exactly `delay` | failure | `429`/`503` with `Retry-After` |
+| `retry_after(delay)` | yes, after at least `delay` (and the backoff) | failure | `429`/`503` with `Retry-After` |
 | `fatal()` | no | failure | `500` on a non-idempotent call |
 | `caller_error()` | no | **ignored** | `400`, `401`, `403`, `404`, `422` |
 

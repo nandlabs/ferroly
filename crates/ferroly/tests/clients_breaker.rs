@@ -673,3 +673,112 @@ fn registry_is_safe_under_concurrent_first_use() {
     assert!(all.iter().all(|b| Arc::ptr_eq(b, &all[0])));
     assert_eq!(breakers.len(), 1);
 }
+
+// ---- metrics export ----------------------------------------------------------
+
+#[cfg(feature = "metrics")]
+mod metrics_export {
+    use super::*;
+    use ferroly::metrics::Registry;
+
+    fn line(name: &str, breaker: &str, value: &str) -> String {
+        format!("{name}{{breaker=\"{breaker}\"}} {value}")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_breaker_exports_its_counters_and_state() {
+        let reg = Registry::new();
+        let cb = CircuitBreaker::new(cfg());
+        cb.export_metrics(&reg, "db");
+        cb.try_acquire().unwrap().success();
+        cb.try_acquire().unwrap().failure();
+        assert!(reg
+            .encode()
+            .contains(&line("circuit_breaker_consecutive_failures", "db", "1")));
+        cb.try_acquire().unwrap().failure();
+        cb.try_acquire().unwrap().failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(cb.try_acquire().is_err());
+
+        let text = reg.encode();
+        for expected in [
+            line("circuit_breaker_state", "db", "1"),
+            line("circuit_breaker_successes_total", "db", "1"),
+            line("circuit_breaker_failures_total", "db", "3"),
+            line("circuit_breaker_rejected_total", "db", "1"),
+            line("circuit_breaker_trips_total", "db", "1"),
+            // The run is counted in the closed state and restarts on a trip.
+            line("circuit_breaker_consecutive_failures", "db", "0"),
+            line("circuit_breaker_half_open_in_flight", "db", "0"),
+        ] {
+            assert!(text.contains(&expected), "{expected} missing from\n{text}");
+        }
+        assert!(text.contains("# TYPE circuit_breaker_trips_total counter"));
+        assert!(text.contains("# TYPE circuit_breaker_state gauge"));
+
+        // Half-open with a trial in flight.
+        past_cooldown().await;
+        let trial = cb.try_acquire().unwrap();
+        let text = reg.encode();
+        assert!(text.contains(&line("circuit_breaker_state", "db", "2")));
+        assert!(text.contains(&line("circuit_breaker_half_open_in_flight", "db", "1")));
+        trial.success();
+
+        // The registry does not keep the breaker alive; its series go once
+        // it is dropped.
+        drop(cb);
+        assert!(!reg.encode().contains("breaker=\"db\""));
+        assert_eq!(reg.registration_errors(), 0);
+        // ... and neither does its collector.
+        assert_eq!(reg.collector_count(), 0);
+    }
+
+    /// Exporting many short-lived breakers leaves no collector behind.
+    #[test]
+    fn short_lived_breakers_do_not_leak_collectors() {
+        let reg = Registry::new();
+        let keep = CircuitBreaker::new(cfg());
+        keep.export_metrics(&reg, "keep");
+        for i in 0..100 {
+            let cb = CircuitBreaker::new(cfg());
+            cb.export_metrics(&reg, &format!("tmp-{i}"));
+        }
+        assert_eq!(reg.collector_count(), 101);
+        let text = reg.encode();
+        assert!(!text.contains("tmp-"));
+        assert!(text.contains("breaker=\"keep\""));
+        assert_eq!(reg.collector_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_registry_exports_every_breaker_and_forgets_removed_ones() {
+        let reg = Registry::new();
+        let breakers = CircuitBreakerRegistry::new(cfg());
+        breakers.export_metrics(&reg);
+        assert!(!reg.encode().contains("circuit_breaker_state{"));
+
+        // Breakers created after the export are included.
+        breakers.get("a").on_execution(true);
+        trip(&breakers.get("b"));
+        let text = reg.encode();
+        assert!(text.contains(&line("circuit_breaker_successes_total", "a", "1")));
+        assert!(text.contains(&line("circuit_breaker_state", "a", "0")));
+        assert!(text.contains(&line("circuit_breaker_state", "b", "1")));
+        assert!(text.contains(&line("circuit_breaker_trips_total", "b", "1")));
+
+        // A removed breaker's series disappear; the others stay.
+        let removed = breakers.remove("b").unwrap();
+        let text = reg.encode();
+        assert!(!text.contains("breaker=\"b\""), "{text}");
+        assert!(text.contains(&line("circuit_breaker_state", "a", "0")));
+        drop(removed);
+
+        // Dropping the registry drops every series, even while a caller
+        // still holds one of its breakers.
+        let held = breakers.get("a");
+        drop(breakers);
+        assert!(!reg.encode().contains("breaker=\"a\""));
+        drop(held);
+        assert_eq!(reg.registration_errors(), 0);
+    }
+}

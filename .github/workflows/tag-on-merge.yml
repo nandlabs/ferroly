@@ -4,13 +4,18 @@ name: Tag on merge
 # the crate version (if it doesn't already exist). Paired with the version-guard
 # on PRs — which ensures every merge to `main` carries a fresh, untagged version
 # — this makes each merge that bumps the version produce its release tag.
+#
+# A tag pushed with the GITHUB_TOKEN does not trigger other workflows, so after
+# creating a tag this workflow calls `publish.yml` itself (which then waits for
+# approval in the protected `crates-io` environment). For crates.io trusted
+# publishing this file, not `publish.yml`, is the workflow crates.io sees for
+# these runs, so both are registered as trusted publishers (CONTRIBUTING.md).
 on:
   push:
     branches: [main]
 
-# Needed to push the tag with the default GITHUB_TOKEN.
 permissions:
-  contents: write
+  contents: read
 
 # Never run two taggers at once.
 concurrency:
@@ -20,18 +25,36 @@ concurrency:
 jobs:
   tag:
     name: Create version tag
+    if: github.repository == 'nandlabs/ferroly'
     runs-on: ubuntu-latest
+    # Needed to push the tag with the default GITHUB_TOKEN.
+    permissions:
+      contents: write
+    outputs:
+      created: ${{ steps.tag.outputs.created }}
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           fetch-tags: true
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
 
       - name: Tag the crate version if untagged
+        id: tag
+        env:
+          # The commit main pointed at before this push (all zeros if none).
+          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
 
-          VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          version_at() {
+            git show "$1:Cargo.toml" 2>/dev/null \
+              | grep -m1 '^version = ' | sed -E 's/version = "([^"]+)"/\1/' || true
+          }
+          VERSION="$(version_at HEAD)"
           if [ -z "$VERSION" ]; then
             echo "::error::Could not read the crate version from Cargo.toml"
             exit 1
@@ -41,17 +64,67 @@ jobs:
           git fetch --tags --force --quiet
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "Tag $TAG already exists — nothing to do."
+            echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Tag the commit that introduced this version, not whatever happens to
-          # be at HEAD — a later non-release merge must not move the release
-          # point if an earlier run was skipped or failed.
-          COMMIT="$(git log --format=%H --reverse -S"version = \"$VERSION\"" -- Cargo.toml | head -1)"
-          COMMIT="${COMMIT:-$(git rev-parse HEAD)}"
+          # The same check publish.yml runs, before the version is burned by a
+          # tag that could never be published.
+          bash .github/scripts/check-release-version.sh "$VERSION"
+
+          # Which commit is the release:
+          #  - This push changed the version: tag the commit it pushed (HEAD).
+          #    That is the squash commit, the merge commit, or the last commit
+          #    of a rebase-merged or fast-forwarded branch; never a branch
+          #    commit in the middle that bumped the version before the rest of
+          #    the release landed.
+          #  - Otherwise the tag is missing although an earlier push set this
+          #    version (its run failed or was skipped): tag the oldest commit
+          #    on main's first-parent chain since the previous tag whose
+          #    release content is exactly HEAD's, so the later non-release
+          #    pushes don't move the release point but nothing that ships is
+          #    left out. Every change to the crates needs a new version
+          #    (version-guard), so that content is the release's.
+          RELEASE_PATHS=(crates Cargo.toml Cargo.lock CHANGELOG.md rust-toolchain.toml)
+          COMMIT=""
+          if [ -n "${BEFORE:-}" ] && ! [[ "$BEFORE" =~ ^0+$ ]] \
+            && git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+            && [ "$(version_at "$BEFORE")" != "$VERSION" ]; then
+            COMMIT="$(git rev-parse HEAD)"
+            echo "This push changed the version to $VERSION; tagging its head."
+          else
+            PREV="$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null || true)"
+            for c in $(git rev-list --first-parent --reverse "${PREV:+$PREV..}HEAD"); do
+              if git diff --quiet "$c" HEAD -- "${RELEASE_PATHS[@]}"; then
+                COMMIT="$c"
+                break
+              fi
+            done
+            COMMIT="${COMMIT:-$(git rev-parse HEAD)}"
+            echo "Recovering an untagged $VERSION (since ${PREV:-the first commit}); tagging the first commit with its release content."
+          fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "$TAG" "$COMMIT"
           git push origin "$TAG"
           echo "Created and pushed $TAG at $COMMIT."
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish the new tag
+    needs: tag
+    if: needs.tag.outputs.created == 'true'
+    # A called workflow gets at most these. `actions: read` lets it read the
+    # `crates-io` environment's protection rules; `id-token: write` lets its
+    # `crates-io` job use crates.io trusted publishing when that is enabled.
+    # No secrets are passed: the token lives in the `crates-io` environment,
+    # which only the approved job can read.
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}

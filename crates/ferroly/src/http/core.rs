@@ -1,4 +1,5 @@
-//! Core HTTP value types: [`Method`], [`StatusCode`], [`HeaderMap`], [`Uri`].
+//! Core HTTP value types: [`Method`], [`StatusCode`], [`HeaderMap`], [`Uri`],
+//! [`Protocol`].
 
 use super::HttpError;
 
@@ -104,6 +105,41 @@ impl Method {
             self,
             Method::Get | Method::Head | Method::Options | Method::Trace
         )
+    }
+}
+
+/// The HTTP version a message was exchanged with.
+///
+/// On the server, [`Request::protocol`](super::Request::protocol) reports how
+/// a request arrived; on the client,
+/// [`Response::protocol`](super::Response::protocol) reports how a response
+/// was received. `Http2` is only ever produced with the `http2` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Protocol {
+    /// HTTP/1.0.
+    Http10,
+    /// HTTP/1.1.
+    Http11,
+    /// HTTP/2 (over TLS with ALPN `h2`, or cleartext `h2c`).
+    Http2,
+}
+
+impl Protocol {
+    /// The protocol's name as written on an HTTP/1 start line
+    /// (`HTTP/1.0`, `HTTP/1.1`, `HTTP/2`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::Http10 => "HTTP/1.0",
+            Protocol::Http11 => "HTTP/1.1",
+            Protocol::Http2 => "HTTP/2",
+        }
+    }
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -283,6 +319,13 @@ impl HeaderMap {
     /// Creates an empty header map.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty map, usable in a `static`.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Sets a header, replacing any existing values with the same name.
@@ -769,7 +812,7 @@ fn valid_host(host: &str) -> bool {
 }
 
 /// Splits `authority` into a bracket-free host and a port.
-fn parse_authority(authority: &str, default_port: u16) -> Option<(String, u16)> {
+pub(crate) fn parse_authority(authority: &str, default_port: u16) -> Option<(String, u16)> {
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         // IPv6 literal: `[addr]` or `[addr]:port`.
         let (addr, after) = rest.split_once(']')?;

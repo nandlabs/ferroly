@@ -14,7 +14,7 @@ use ferroly::http::{
     TlsConfig,
 };
 use ferroly::turbo::{
-    Ctx, IntoResponse, MultipartLimits, Problem, Route, RouteError, Router, StaticFiles,
+    Ctx, ETag, IntoResponse, MultipartLimits, Problem, Route, RouteError, Router, StaticFiles,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,6 +27,20 @@ async fn spawn(router: Router) -> SocketAddr {
             .serve_listener(listener, ServerConfig::default(), std::future::pending())
             .await;
     });
+    addr
+}
+
+/// Serves `router` without validating it (`into_handler`), the way to run a
+/// router whose problems are deliberate.
+async fn spawn_lenient(router: Router) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(ferroly::http::serve_with_config(
+        listener,
+        router.into_handler(),
+        std::future::pending(),
+        ServerConfig::default(),
+    ));
     addr
 }
 
@@ -308,7 +322,7 @@ async fn conflicts_and_bad_patterns_are_reported_not_panicked() {
     assert!(conflict().validate().is_err());
     assert!(conflict().try_into_handler().is_err());
     // The lenient path keeps the first registration.
-    let addr = spawn(conflict()).await;
+    let addr = spawn_lenient(conflict()).await;
     assert_eq!(get(addr, "/users/1").await.body, "first");
 
     // The same path with different methods is not a conflict; nor is a
@@ -348,7 +362,7 @@ async fn conflicts_and_bad_patterns_are_reported_not_panicked() {
         router.validate(),
         Err(RouteError::InvalidPattern { .. })
     ));
-    let addr = spawn(router).await;
+    let addr = spawn_lenient(router).await;
     for target in [
         "/secret",
         "/bad/secret",
@@ -898,6 +912,53 @@ async fn schema_validation_answers_422_with_details() {
     );
 }
 
+#[tokio::test]
+async fn compiled_schema_validation_answers_like_the_one_shot_form() {
+    use ferroly::codec::schema::Schema;
+    let schema = std::sync::Arc::new(
+        Schema::compile(
+            &json::from_str(
+                r#"{"type":"object","required":["sku"],
+                    "properties":{"sku":{"type":"string","pattern":"^[A-Z]{3}-[0-9]+$"}}}"#,
+            )
+            .unwrap(),
+        )
+        .expect("valid schema"),
+    );
+    let router = Router::new().post("/items", move |ctx| {
+        let schema = schema.clone();
+        async move {
+            #[derive(ferroly::codec::Decode)]
+            struct Item {
+                sku: String,
+            }
+            let item: Item = ctx.read_valid_with(&schema)?;
+            Ok::<_, Problem>(HttpResponse::text(StatusCode::CREATED, item.sku))
+        }
+    });
+    let addr = spawn(router).await;
+    let json_ct = [("content-type", "application/json")];
+
+    let good = raw(addr, "POST", "/items", &json_ct, br#"{"sku":"ABC-42"}"#).await;
+    assert_eq!((good.status, good.body.as_str()), (201, "ABC-42"));
+
+    let bad = raw(addr, "POST", "/items", &json_ct, br#"{"sku":"abc-42"}"#).await;
+    assert_eq!(bad.status, 422);
+    let report = json::from_str(&bad.body).unwrap();
+    let errors = report.get("errors").and_then(|e| e.as_array()).unwrap();
+    assert_eq!(errors.len(), 1, "{}", bad.body);
+    assert_eq!(
+        errors[0].get("path").and_then(|p| p.as_str()),
+        Some("/sku"),
+        "{}",
+        bad.body
+    );
+    assert_eq!(
+        raw(addr, "POST", "/items", &json_ct, b"{").await.status,
+        400
+    );
+}
+
 // ---- static files ---------------------------------------------------------------------------
 
 /// A fresh directory tree for one test: `<tmp>/<name>/public/...` plus a
@@ -1240,4 +1301,198 @@ async fn serve_tls_and_reloadable_tls() {
         .build()
         .unwrap();
     assert!(client.send(plain).await.is_err());
+}
+
+/// Every `serve*` method validates the router, so two conflicting routes stop
+/// start-up instead of the first one silently winning.
+#[tokio::test]
+async fn serve_rejects_a_router_with_conflicting_routes() {
+    fn conflicting() -> Router {
+        Router::new()
+            .get("/users/:id", |_| async { ok("a") })
+            .get("/users/:name", |_| async { ok("b") })
+    }
+    fn route_error(err: ferroly::http::HttpError) -> RouteError {
+        let ferroly::http::HttpError::Io(io) = err else {
+            panic!("expected an io error, got {err:?}");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+        io.get_ref()
+            .and_then(|e| e.downcast_ref::<RouteError>())
+            .cloned()
+            .expect("the RouteError is the inner error")
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let served = tokio::time::timeout(
+        Duration::from_secs(5),
+        conflicting().serve_listener(listener, ServerConfig::default(), std::future::pending()),
+    )
+    .await
+    .expect("serve_listener returns at once");
+    assert!(matches!(
+        route_error(served.unwrap_err()),
+        RouteError::Conflict { .. }
+    ));
+
+    let tls = TlsConfig::from_pem(SERVER_CERT, SERVER_KEY).unwrap();
+    let served = tokio::time::timeout(
+        Duration::from_secs(5),
+        conflicting().serve_tls(
+            "127.0.0.1:0",
+            tls,
+            ServerConfig::default(),
+            std::future::pending(),
+        ),
+    )
+    .await
+    .expect("serve_tls returns at once");
+    assert!(matches!(
+        route_error(served.unwrap_err()),
+        RouteError::Conflict { .. }
+    ));
+
+    let bad_pattern = Router::new().get("/a/:", |_| async { ok("") });
+    let served = tokio::time::timeout(
+        Duration::from_secs(5),
+        bad_pattern.serve_with_shutdown("127.0.0.1:0", std::future::pending()),
+    )
+    .await
+    .expect("serve_with_shutdown returns at once");
+    assert!(matches!(
+        route_error(served.unwrap_err()),
+        RouteError::InvalidPattern { .. }
+    ));
+
+    // Validation comes before binding: an address already in use does not
+    // mask the routing mistake (plain and TLS).
+    let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy = taken.local_addr().unwrap();
+    let served = tokio::time::timeout(
+        Duration::from_secs(5),
+        conflicting().serve_with_shutdown(busy, std::future::pending()),
+    )
+    .await
+    .expect("serve_with_shutdown returns at once");
+    assert!(matches!(
+        route_error(served.unwrap_err()),
+        RouteError::Conflict { .. }
+    ));
+    let tls = TlsConfig::from_pem(SERVER_CERT, SERVER_KEY).unwrap();
+    let served = tokio::time::timeout(
+        Duration::from_secs(5),
+        conflicting().serve_tls(busy, tls, ServerConfig::default(), std::future::pending()),
+    )
+    .await
+    .expect("serve_tls returns at once");
+    assert!(matches!(
+        route_error(served.unwrap_err()),
+        RouteError::Conflict { .. }
+    ));
+    drop(taken);
+}
+
+/// Conditional GET for dynamic responses: an ETag over the body, `304` for a
+/// matching `If-None-Match`, a new tag when the body changes.
+#[tokio::test]
+async fn etag_middleware_answers_conditional_gets() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let version = Arc::new(AtomicUsize::new(1));
+    let v = version.clone();
+    let router = Router::new()
+        .etag(ETag::strong())
+        .get("/doc", move |_| {
+            let v = v.load(Ordering::SeqCst);
+            async move { ok(format!("version {v}")).header("Cache-Control", "no-cache") }
+        })
+        .post("/doc", |_| async { ok("posted") })
+        .get("/missing", |_| async {
+            HttpResponse::text(StatusCode::NOT_FOUND, "nope")
+        })
+        // An explicit HEAD handler that only declares the length, the way
+        // `StaticFiles` answers HEAD.
+        .get("/sized", |_| async { ok("version 1") })
+        .head("/sized", |_| async {
+            HttpResponse::new(StatusCode::OK).header("Content-Length", "9")
+        })
+        .get("/streamed", |_| async {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(b"chunk".to_vec()).await.unwrap();
+            HttpResponse::stream(StatusCode::OK, rx)
+        })
+        // A handler-set entity-tag holding a comma.
+        .get("/comma", |_| async { ok("c").header("ETag", "\"a,b\"") });
+    let addr = spawn(router).await;
+
+    let first = get(addr, "/doc").await;
+    assert_eq!((first.status, first.body.as_str()), (200, "version 1"));
+    let tag = first.header("etag").expect("an ETag on a 200 GET");
+    assert!(tag.starts_with('"') && tag.ends_with('"'), "{tag}");
+    assert_eq!(tag, ETag::strong().tag_for(b"version 1"));
+
+    // A matching If-None-Match (also inside a list, also as W/) → 304, no body.
+    for candidates in [tag.clone(), format!("\"x\", W/{tag}"), "*".to_string()] {
+        let again = raw(addr, "GET", "/doc", &[("If-None-Match", &candidates)], b"").await;
+        assert_eq!(again.status, 304, "{candidates}");
+        assert_eq!(again.body, "");
+        assert_eq!(again.header("etag").as_deref(), Some(tag.as_str()));
+        assert_eq!(again.header("cache-control").as_deref(), Some("no-cache"));
+        assert_eq!(again.header("content-type"), None);
+    }
+    // HEAD carries the same tag and is answered 304 the same way.
+    let head = raw(addr, "HEAD", "/doc", &[("If-None-Match", &tag)], b"").await;
+    assert_eq!(head.status, 304);
+    let head = raw(addr, "HEAD", "/doc", &[], b"").await;
+    assert_eq!((head.status, head.header("etag")), (200, Some(tag.clone())));
+
+    // An explicit HEAD with an empty body gets no (wrong) computed tag.
+    let sized_tag = get(addr, "/sized").await.header("etag").unwrap();
+    let head = raw(
+        addr,
+        "HEAD",
+        "/sized",
+        &[("If-None-Match", &sized_tag)],
+        b"",
+    )
+    .await;
+    assert_eq!((head.status, head.header("etag")), (200, None));
+    assert_eq!(head.header("content-length").as_deref(), Some("9"));
+
+    // A streamed body passes through untagged.
+    let streamed = raw(addr, "GET", "/streamed", &[("If-None-Match", "*")], b"").await;
+    assert_eq!((streamed.status, streamed.header("etag")), (200, None));
+
+    // An entity-tag with a comma inside matches when listed.
+    let comma = raw(
+        addr,
+        "GET",
+        "/comma",
+        &[("If-None-Match", "\"x\", \"a,b\"")],
+        b"",
+    )
+    .await;
+    assert_eq!(comma.status, 304);
+    let comma = raw(
+        addr,
+        "GET",
+        "/comma",
+        &[("If-None-Match", "\"a\", \"b\"")],
+        b"",
+    )
+    .await;
+    assert_eq!(comma.status, 200);
+
+    // The body changes → a new tag, and the old one no longer matches.
+    version.store(2, Ordering::SeqCst);
+    let changed = raw(addr, "GET", "/doc", &[("If-None-Match", &tag)], b"").await;
+    assert_eq!((changed.status, changed.body.as_str()), (200, "version 2"));
+    assert_ne!(changed.header("etag").as_deref(), Some(tag.as_str()));
+
+    // Unsafe methods and non-200 answers are left alone.
+    let posted = raw(addr, "POST", "/doc", &[("If-None-Match", "*")], b"x").await;
+    assert_eq!((posted.status, posted.header("etag")), (200, None));
+    let missing = raw(addr, "GET", "/missing", &[("If-None-Match", "*")], b"").await;
+    assert_eq!((missing.status, missing.header("etag")), (404, None));
 }

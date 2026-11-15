@@ -8,13 +8,15 @@ Derive macros for [Ferroly](https://crates.io/crates/ferroly):
   `source()` chaining, and `From` conversions for `?`.
 - `#[ferroly::rt::test]` and `#[ferroly::rt::main]` — async entry points that
   need no direct `tokio` dependency.
+- `#[derive(ferroly::proto::Message)]`, `Oneof` and `Enumeration` — a
+  Protocol Buffers wire encoding for a struct, a oneof and an enum.
 
 **Do not depend on this crate directly.** The macros generate paths into
 `ferroly`, and `ferroly` re-exports them where they belong:
 
 ```toml
 [dependencies]
-ferroly = { version = "0.5", features = ["codec"] }   # Encode, Decode
+ferroly = { version = "0.6", features = ["codec"] }   # Encode, Decode
 ```
 
 | Macro | Use it as | Needs feature |
@@ -22,6 +24,7 @@ ferroly = { version = "0.5", features = ["codec"] }   # Encode, Decode
 | `Encode`, `Decode` | `ferroly::codec::{Encode, Decode}` | `codec` |
 | `FerrolyError` | `ferroly::FerrolyError` | any (crate root) |
 | `rt_test`, `rt_main` | `#[ferroly::rt::test]`, `#[ferroly::rt::main]` | `rt` |
+| `ProtoMessage`, `ProtoOneof`, `ProtoEnumeration` | `ferroly::proto::{Message, Oneof, Enumeration}` | `protobuf` |
 
 The crate is build-time only: it depends on `proc-macro2`, `quote` and `syn`,
 and adds nothing to your runtime dependency tree.
@@ -222,6 +225,62 @@ fn main() {
 
 Generic error types are supported; the `Display` and `Error` bounds are inferred
 from how each field is used.
+
+## Protobuf: `Message`, `Oneof`, `Enumeration`
+
+With the `protobuf` feature, `ferroly::proto` re-exports three more derives
+that give a type a Protocol Buffers wire encoding. Every field names its field
+number; the Rust type picks the shape (`T` implicit presence, `Option<T>`
+explicit presence, `Vec<T>` repeated — packed for numbers — and `HashMap` /
+`BTreeMap` for `map<K, V>`), and an attribute picks the encoding where the
+type does not imply it.
+
+```rust
+use ferroly::proto::{EnumValue, Message, UnknownFields};
+
+#[derive(ferroly::proto::Enumeration, Clone, Copy, PartialEq, Debug)]
+enum Corpus {
+    #[proto(name = "CORPUS_UNSPECIFIED")]
+    Unspecified = 0,
+    #[proto(name = "CORPUS_WEB")]
+    Web = 1,
+}
+
+#[derive(ferroly::proto::Oneof, PartialEq, Debug)]
+enum Page {
+    #[proto(tag = 4)]
+    Token(String),
+    #[proto(tag = 5)]
+    Number(u32),
+}
+
+#[derive(ferroly::proto::Message, Default, PartialEq, Debug)]
+struct SearchRequest {
+    #[proto(tag = 1)]
+    query: String,
+    #[proto(tag = 2, sint32)]
+    offset: i32,
+    #[proto(tag = 3)]
+    corpus: EnumValue<Corpus>,   // open enum: unknown numbers survive
+    #[proto(oneof)]
+    page: Option<Page>,
+    #[proto(unknown)]
+    unknown: UnknownFields,      // fields from newer writers, re-emitted
+}
+
+fn main() {
+    let req = SearchRequest { query: "rust".into(), offset: -1, ..Default::default() };
+    let bytes = req.encode_to_vec();
+    assert_eq!(bytes, [0x0a, 0x04, b'r', b'u', b's', b't', 0x10, 0x01]);
+    assert_eq!(SearchRequest::decode(&bytes).unwrap(), req);
+}
+```
+
+Duplicate field numbers, field number 0, the reserved range 19000–19999,
+`packed` on a string or message field, a `oneof` field that is not an
+`Option`, and unknown or repeated attribute keys are compile errors. The
+[protobuf guide](https://github.com/nandlabs/ferroly/blob/main/docs/proto.md)
+lists every attribute.
 
 ## `#[ferroly::rt::test]` and `#[ferroly::rt::main]`
 

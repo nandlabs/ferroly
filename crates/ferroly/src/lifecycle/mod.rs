@@ -51,7 +51,9 @@ mod health;
 mod manager;
 mod state;
 
-pub use component::{BoxFuture, Component, ComponentOptions, RestartPolicy, SimpleComponent};
+pub use component::{
+    BoxFuture, Component, ComponentOptions, LivenessWatch, RestartPolicy, SimpleComponent,
+};
 pub use error::{LifecycleError, LifecycleErrors};
 pub use health::{
     CheckOptions, HealthRegistry, HealthReport, HealthStatus, ProbeKind, DEFAULT_CHECK_TIMEOUT,

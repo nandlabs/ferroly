@@ -22,8 +22,12 @@
 //!   and a [panic hook](install_panic_hook).
 //! - A process-global logger + free functions for package-level logging.
 //!
-//! There is no bridge from the `log` or `tracing` facade crates: wiring one
-//! would add those crates as dependencies, which this toolkit does not take.
+//! Records that other crates emit through the `log` facade crate
+//! (`log::info!` and friends) can be routed into a [`Logger`] by the opt-in
+//! `log-bridge` feature: see `bridge` (the module is compiled only with that
+//! feature). It is the toolkit's one optional dependency outside the
+//! `tokio`/`rustls` budget, and `log` itself has no dependencies. There is no
+//! bridge from `tracing`.
 //!
 //! ```
 //! use ferroly::log::{Level, Logger};
@@ -48,6 +52,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ferroly::codec::Value;
 
+#[cfg(feature = "log-bridge")]
+pub mod bridge;
 mod format;
 mod redact;
 mod rotate;
@@ -166,6 +172,14 @@ static MAX_LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 /// (unless a [target override](set_level_for) says otherwise).
 pub fn set_max_level(level: Level) {
     MAX_LEVEL.store(level as u8, Ordering::Relaxed);
+    levels_changed();
+}
+
+/// Called after any change to the level filters or the global logger, so an
+/// installed `log` bridge can update the facade's own max-level gate.
+fn levels_changed() {
+    #[cfg(feature = "log-bridge")]
+    bridge::sync_max_level();
 }
 
 /// The current global minimum level (default [`Level::Info`]).
@@ -216,29 +230,53 @@ pub fn set_level_for(target: &str, level: Level) {
     if target.is_empty() {
         return;
     }
-    let mut list = wlock(&TARGET_LEVELS);
-    match list.iter_mut().find(|(t, _)| t == target) {
-        Some(entry) => entry.1 = level,
-        None => list.push((target.to_string(), level)),
+    {
+        let mut list = wlock(&TARGET_LEVELS);
+        match list.iter_mut().find(|(t, _)| t == target) {
+            Some(entry) => entry.1 = level,
+            None => list.push((target.to_string(), level)),
+        }
+        list.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
+        TARGET_COUNT.store(list.len(), Ordering::Relaxed);
     }
-    list.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
-    TARGET_COUNT.store(list.len(), Ordering::Relaxed);
+    levels_changed();
 }
 
 /// Removes the override set for exactly `target`; `true` when there was one.
 pub fn clear_level_for(target: &str) -> bool {
-    let mut list = wlock(&TARGET_LEVELS);
-    let before = list.len();
-    list.retain(|(t, _)| t != target);
-    TARGET_COUNT.store(list.len(), Ordering::Relaxed);
-    list.len() != before
+    let removed = {
+        let mut list = wlock(&TARGET_LEVELS);
+        let before = list.len();
+        list.retain(|(t, _)| t != target);
+        TARGET_COUNT.store(list.len(), Ordering::Relaxed);
+        list.len() != before
+    };
+    levels_changed();
+    removed
 }
 
 /// Removes every per-target override.
 pub fn clear_target_levels() {
-    let mut list = wlock(&TARGET_LEVELS);
-    list.clear();
-    TARGET_COUNT.store(0, Ordering::Relaxed);
+    {
+        let mut list = wlock(&TARGET_LEVELS);
+        list.clear();
+        TARGET_COUNT.store(0, Ordering::Relaxed);
+    }
+    levels_changed();
+}
+
+/// The lowest level any target could currently pass the global and
+/// per-target filters at.
+#[cfg(feature = "log-bridge")]
+fn lowest_filter_level() -> Level {
+    let global = max_level();
+    if TARGET_COUNT.load(Ordering::Relaxed) == 0 {
+        return global;
+    }
+    rlock(&TARGET_LEVELS)
+        .iter()
+        .map(|(_, level)| *level)
+        .fold(global, std::cmp::min)
 }
 
 /// The minimum level in force for `target`: the longest matching
@@ -579,24 +617,57 @@ impl Logger {
     /// Whether a record at `level` would currently be emitted by this logger
     /// (its floor, the global or target level, and at least one sink admit it).
     pub fn enabled(&self, level: Level) -> bool {
+        self.passes(self.target.as_deref(), level)
+    }
+
+    /// [`enabled`](Self::enabled) for a record carrying `target` in place of
+    /// this logger's own.
+    fn passes(&self, target: Option<&str>, level: Level) -> bool {
         if level < self.min {
             return false;
         }
-        let passes = match self.target.as_deref() {
+        let passes = match target {
             Some(target) => enabled_for(target, level),
             None => enabled(level),
         };
         passes && self.sinks.iter().any(|s| level >= s.min)
     }
 
+    /// The lowest level this logger could emit a record at for *some* target
+    /// (its floor, the most permissive level filter, and its most permissive
+    /// sink), or `None` when it has no sink.
+    #[cfg(feature = "log-bridge")]
+    fn lowest_enabled(&self) -> Option<Level> {
+        let sink = self.sinks.iter().map(|s| s.min).min()?;
+        Some(self.min.max(lowest_filter_level()).max(sink))
+    }
+
     /// Emits a record at `level` with `msg` and extra typed `fields`.
     #[track_caller]
     pub fn log(&self, level: Level, msg: &str, fields: &[(&str, Value)]) {
-        self.emit(level, msg, fields, Location::caller());
+        let caller = Location::caller();
+        self.emit(
+            self.target.as_deref(),
+            level,
+            msg,
+            fields,
+            Some((caller.file(), caller.line())),
+        );
     }
 
-    fn emit(&self, level: Level, msg: &str, fields: &[(&str, Value)], caller: &Location<'_>) {
-        if !self.enabled(level) {
+    /// Emits one record. `target` is printed and selects the per-target level
+    /// (normally this logger's own target; the `log` bridge passes the facade
+    /// record's), and `caller` is the `file:line` printed when caller capture
+    /// is on.
+    fn emit(
+        &self,
+        target: Option<&str>,
+        level: Level,
+        msg: &str,
+        fields: &[(&str, Value)],
+        caller: Option<(&str, u32)>,
+    ) {
+        if !self.passes(target, level) {
             return;
         }
         // A sink writer that logs would deadlock on its own lock: drop the
@@ -604,7 +675,6 @@ impl Logger {
         if sink::writing() {
             return;
         }
-        let target = self.target.as_deref();
         let mut suppressed = 0;
         if let Some(sampler) = &self.sampler {
             let mut hasher = DefaultHasher::new();
@@ -617,9 +687,9 @@ impl Logger {
 
         let ts = format::rfc3339(SystemTime::now(), self.precision, self.offset_secs);
         let provided = context_fields();
-        let caller = self
-            .caller
-            .then(|| format!("{}:{}", caller.file(), caller.line()));
+        let caller = caller
+            .filter(|_| self.caller)
+            .map(|(file, line)| format!("{file}:{line}"));
         let suppressed_value = Value::UInt(suppressed);
         let sources = (suppressed > 0)
             .then_some(("suppressed", &suppressed_value))
@@ -694,6 +764,7 @@ static GLOBAL: RwLock<Option<Arc<Logger>>> = RwLock::new(None);
 /// etc. functions. May be called again to reconfigure.
 pub fn set_global(logger: Logger) {
     *wlock(&GLOBAL) = Some(Arc::new(logger));
+    levels_changed();
 }
 
 /// The process-global logger as an `Arc` — cloning it per free-function call is

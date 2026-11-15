@@ -30,6 +30,19 @@
 //! scalars are always strings — the lenient [`Decode`] impls parse numbers and
 //! bools out of them. Use JSON where full fidelity matters.
 //!
+//! ```
+//! use ferroly::codec::{xml, Decode, Encode};
+//!
+//! #[derive(Encode, Decode, PartialEq, Debug)]
+//! struct Item { id: u32, tags: Vec<String> }
+//!
+//! let item = Item { id: 3, tags: vec!["a".into(), "b".into()] };
+//! let text = xml::encode(&item);
+//! assert_eq!(text, "<root><id>3</id><tags>a</tags><tags>b</tags></root>");
+//! let back: Item = xml::decode(&text).unwrap();
+//! assert_eq!(back, item);
+//! ```
+//!
 //! Literal line breaks are normalized to LF as XML requires. Beyond that the
 //! parser is pragmatic rather than conforming: it tolerates some input a
 //! validating parser rejects (`]]>` in text, undeclared namespace prefixes,
@@ -76,6 +89,32 @@ pub fn try_encode<T: Encode + ?Sized>(value: &T) -> Result<String, CodecError> {
 /// Encodes to XML bytes.
 pub fn encode_to_vec<T: Encode + ?Sized>(value: &T) -> Vec<u8> {
     encode(value).into_bytes()
+}
+
+/// Like [`encode`], but indented for people to read: every element that holds
+/// child elements puts each child on its own line, two spaces deeper. Text
+/// content is never touched, so the result decodes to the same data (the
+/// parser ignores whitespace between child elements).
+///
+/// ```
+/// use ferroly::codec::{xml, Decode, Encode};
+///
+/// #[derive(Encode, Decode, PartialEq, Debug)]
+/// struct Item { id: u32, tags: Vec<String> }
+///
+/// let item = Item { id: 3, tags: vec!["a".into(), "b".into()] };
+/// let text = xml::encode_pretty(&item);
+/// assert_eq!(
+///     text,
+///     "<root>\n  <id>3</id>\n  <tags>a</tags>\n  <tags>b</tags>\n</root>"
+/// );
+/// assert_eq!(xml::decode::<Item>(&text).unwrap(), item);
+/// ```
+pub fn encode_pretty<T: Encode + ?Sized>(value: &T) -> String {
+    let mut w = Writer::new();
+    w.indent = Some(2);
+    w.single("root", &value.encode());
+    w.out
 }
 
 /// Decodes any [`Decode`] type from an XML string.
@@ -131,6 +170,10 @@ struct Writer {
     out: String,
     /// The first character written that XML 1.0 cannot represent.
     illegal: Option<char>,
+    /// `Some(width)` for indented output.
+    indent: Option<usize>,
+    /// Nesting depth of the element being written.
+    depth: usize,
 }
 
 impl Writer {
@@ -138,6 +181,18 @@ impl Writer {
         Writer {
             out: String::with_capacity(64),
             illegal: None,
+            indent: None,
+            depth: 0,
+        }
+    }
+
+    /// In indented output, starts a new line at the current depth.
+    fn break_line(&mut self) {
+        if let Some(width) = self.indent {
+            self.out.push('\n');
+            for _ in 0..self.depth * width {
+                self.out.push(' ');
+            }
         }
     }
 
@@ -156,22 +211,31 @@ impl Writer {
 
     /// Writes `value` as exactly one element named `tag`.
     fn single(&mut self, tag: &str, value: &Value) {
+        if self.depth > 0 {
+            self.break_line();
+        }
         match value {
             Value::Null => self.empty(tag, ""),
             Value::Object(o) if o.is_empty() => self.empty(tag, " type=\"object\""),
             Value::Object(o) => {
                 self.open(tag, "");
+                self.depth += 1;
                 for (k, v) in o {
                     self.field(k, v);
                 }
+                self.depth -= 1;
+                self.break_line();
                 self.close(tag);
             }
             Value::Array(items) if items.is_empty() => self.empty(tag, " type=\"array\""),
             Value::Array(items) => {
                 self.open(tag, " type=\"array\"");
+                self.depth += 1;
                 for item in items {
                     self.single(ITEM_TAG, item);
                 }
+                self.depth -= 1;
+                self.break_line();
                 self.close(tag);
             }
             Value::Str(s) => {
@@ -826,6 +890,51 @@ mod tests {
         assert!(xml.contains("<tags>a</tags><tags>b</tags>"));
         let back: Config = decode(&xml).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn pretty_output_indents_elements_and_round_trips() {
+        let v = Value::Object(vec![
+            ("name".into(), Value::Str(" padded ".into())),
+            (
+                "nested".into(),
+                Value::Object(vec![("a".into(), Value::Int(1)), ("b".into(), Value::Null)]),
+            ),
+            (
+                "grid".into(),
+                Value::Array(vec![
+                    Value::Array(vec![Value::Int(1), Value::Int(2)]),
+                    Value::Array(vec![]),
+                ]),
+            ),
+            ("empty".into(), Value::Object(vec![])),
+            ("text".into(), Value::Str("a\nb <c>".into())),
+        ]);
+        let pretty = encode_pretty(&v);
+        let want = [
+            "<root>",
+            "  <name xml:space=\"preserve\"> padded </name>",
+            "  <nested>",
+            "    <a>1</a>",
+            "    <b/>",
+            "  </nested>",
+            "  <grid type=\"array\">",
+            "    <item type=\"array\">",
+            "      <item>1</item>",
+            "      <item>2</item>",
+            "    </item>",
+            "    <item type=\"array\"/>",
+            "  </grid>",
+            "  <empty type=\"object\"/>",
+            "  <text>a\nb &lt;c&gt;</text>",
+            "</root>",
+        ]
+        .join("\n");
+        assert_eq!(pretty, want);
+        // The same data as the compact form.
+        assert_eq!(from_str(&pretty).unwrap(), from_str(&encode(&v)).unwrap());
+        // A scalar root stays on one line.
+        assert_eq!(encode_pretty(&5), "<root>5</root>");
     }
 
     #[test]

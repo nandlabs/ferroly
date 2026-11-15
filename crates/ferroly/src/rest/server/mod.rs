@@ -186,6 +186,9 @@ pub struct Server {
     config: ServerConfig,
     tls: Option<ReloadableTlsConfig>,
     handler: Arc<dyn HttpHandler>,
+    /// The routing mistake found by [`ServerBuilder::build`]; every `start`
+    /// fails with it.
+    invalid: Option<RouteError>,
     local_addr: Mutex<Option<SocketAddr>>,
     running: tokio::sync::Mutex<Option<Running>>,
     status: Arc<Status>,
@@ -248,6 +251,12 @@ impl Component for Server {
                 }
                 // The previous serve loop ended on its own; start afresh.
                 *running = None;
+            }
+
+            // Checked before binding, so a routing mistake never holds the
+            // port and an address in use does not mask it.
+            if let Some(problem) = &self.invalid {
+                return Err(LifecycleError::failure(self.id.clone(), problem.clone()));
             }
 
             // The only await between taking the lock and committing: if the
@@ -586,24 +595,41 @@ impl ServerBuilder {
         })
     }
 
-    /// Finalizes into a runnable [`Server`].
+    /// Finalizes into a runnable [`Server`], validating the routes
+    /// ([`Router::validate`]) like the `turbo` `serve*` methods do.
     ///
-    /// Routing mistakes (a malformed pattern, two routes for the same path
-    /// and method) do not stop the build — see
-    /// [`Router::into_handler`] for what happens to such routes. Use
-    /// [`try_build`](Self::try_build) to have them reported.
+    /// The build itself never fails: a routing mistake (a malformed pattern,
+    /// two routes for the same path and method, an unusable middleware
+    /// configuration) makes every [`start`](Component::start) fail, before
+    /// binding, with a [`LifecycleError::ComponentFailure`] whose source is
+    /// the [`RouteError`]. Use [`try_build`](Self::try_build) to have it
+    /// reported here instead, or [`build_lenient`](Self::build_lenient) to
+    /// serve such a router anyway.
     pub fn build(self) -> Server {
+        let invalid = self.router.validate().err();
         let handler = self.router.into_handler();
-        Self::assemble(self.options, handler)
+        Self::assemble(self.options, handler, invalid)
     }
 
     /// Validates the routes ([`Router::validate`]), then builds the server.
     pub fn try_build(self) -> Result<Server, RouteError> {
         let handler = self.router.try_into_handler()?;
-        Ok(Self::assemble(self.options, handler))
+        Ok(Self::assemble(self.options, handler, None))
     }
 
-    fn assemble(options: ServerOptions, handler: Arc<dyn HttpHandler>) -> Server {
+    /// Builds the server without validating the routes: a route with a
+    /// malformed pattern is absent (`404`) and of two conflicting routes the
+    /// one registered first wins, as with [`Router::into_handler`].
+    pub fn build_lenient(self) -> Server {
+        let handler = self.router.into_handler();
+        Self::assemble(self.options, handler, None)
+    }
+
+    fn assemble(
+        options: ServerOptions,
+        handler: Arc<dyn HttpHandler>,
+        invalid: Option<RouteError>,
+    ) -> Server {
         Server {
             id: options.id,
             host: options.listen_host,
@@ -614,6 +640,7 @@ impl ServerBuilder {
                 ServerTls::Reloadable(tls) => tls,
             }),
             handler,
+            invalid,
             local_addr: Mutex::new(None),
             running: tokio::sync::Mutex::new(None),
             status: Arc::new(Status::default()),

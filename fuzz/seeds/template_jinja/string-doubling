@@ -1,0 +1,1 @@
+{% set ns = namespace(s='ab') %}{% for i in range(40) %}{% set ns.s = ns.s ~ ns.s %}{% endfor %}{{ ns.s | length }}

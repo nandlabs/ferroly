@@ -1,0 +1,16 @@
+# A downstream crate whose only dependency is `ferroly` with `rt`: no tokio,
+# direct or dev. CI builds and tests it to guard that `ferroly::rt::test`,
+# `ferroly::rt::main` and the declarative `async_test!` / `async_main!` work
+# without the user depending on tokio themselves.
+#
+# Detached from the main workspace (its own `[workspace]`), like `fuzz/`.
+[package]
+name = "ferroly-rt-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ferroly = { path = "../../crates/ferroly", default-features = false, features = ["rt"] }
+
+[workspace]

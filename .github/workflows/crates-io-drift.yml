@@ -1,0 +1,161 @@
+name: crates.io drift
+
+# Fails when a release exists only on GitHub (a failed, skipped or
+# never-approved publish), so it is noticed:
+#   - with a `tag` (after `Publish to crates.io`, or by hand): that tag's
+#     version of both crates must be on crates.io;
+#   - without one (the daily run, or by hand): every `v*` tag newer than the
+#     newest one that is fully on crates.io is reported, and the version on
+#     `main` must have its tag (a missing one means tag-on-merge failed).
+#
+# A tag (or untagged version) younger than the grace period (scheduled runs:
+# 24 hours) passes with a warning, so a publish waiting for approval is not
+# reported as drift at once. A failing scheduled run opens a tracking issue
+# (`crates-io-drift-alert.yml`). The fix is to publish the tag: run
+# `Publish to crates.io` with it (CONTRIBUTING.md, "Publishing to crates.io").
+on:
+  schedule:
+    - cron: "37 5 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Check only this tag (v<version>); empty checks every unpublished tag"
+        required: false
+        default: ""
+        type: string
+      grace-hours:
+        description: "Pass if a missing release is younger than this many hours"
+        required: false
+        default: "0"
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: "Check only this tag (v<version>); empty checks every unpublished tag"
+        required: false
+        default: ""
+        type: string
+      grace-hours:
+        description: "Pass if a missing release is younger than this many hours"
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Releases are on crates.io
+    if: github.repository == 'nandlabs/ferroly'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Check the release tags against crates.io
+        env:
+          GRACE_HOURS: ${{ github.event_name == 'schedule' && '24' || inputs.grace-hours }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          SEMVER_TAG='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          GRACE_HOURS="${GRACE_HOURS:-0}"
+          if ! [[ "$GRACE_HOURS" =~ ^[0-9]+$ ]]; then
+            echo "::error::grace-hours must be a whole number, got '$GRACE_HOURS'"
+            exit 1
+          fi
+          NOW="$(date +%s)"
+          # 0 when something dated <unix time> is still inside the grace period.
+          young() { [ $(( NOW - $1 )) -lt $(( GRACE_HOURS * 3600 )) ]; }
+
+          # crates.io asks API clients for an identifying User-Agent.
+          UA="ferroly-ci (+https://github.com/nandlabs/ferroly)"
+          API="${CRATES_API:-https://crates.io/api/v1}"
+
+          # Sets MISSING to the crates that do not have <version> on crates.io.
+          check_version() {
+            local crate body code
+            MISSING=""
+            for crate in ferroly-derive ferroly; do
+              body="$(mktemp)"
+              code="$(curl -sS --retry 3 --retry-all-errors -A "$UA" -o "$body" \
+                -w '%{http_code}' "$API/crates/$crate/$1" || true)"
+              case "$code" in
+                200)
+                  if grep -qE '"yanked"[[:space:]]*:[[:space:]]*true' "$body"; then
+                    echo "::warning::$crate $1 is on crates.io but yanked"
+                  else
+                    echo "$crate $1 is on crates.io."
+                  fi ;;
+                404) MISSING="$MISSING $crate" ;;
+                *)
+                  rm -f "$body"
+                  echo "::error::could not ask crates.io about $crate $1 (HTTP ${code:-none})"
+                  exit 1 ;;
+              esac
+              rm -f "$body"
+              sleep "${API_DELAY_SECONDS:-1}"  # crates.io allows one request a second
+            done
+          }
+
+          if [ -n "${TAG:-}" ]; then
+            if ! [[ "$TAG" =~ $SEMVER_TAG ]]; then
+              echo "::error::'$TAG' is not a v<semver> tag"
+              exit 1
+            fi
+            if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+              echo "::error::there is no tag $TAG"
+              exit 1
+            fi
+            TAGS="$TAG"
+          else
+            # Newest first, by version (pre-releases sort before their release).
+            TAGS="$(git -c versionsort.suffix=- tag -l --sort=-v:refname 'v*' \
+              | grep -E "$SEMVER_TAG" || true)"
+          fi
+
+          failed=0
+          if [ -z "$TAGS" ]; then
+            echo "No v* tags yet; nothing to check."
+          fi
+          for t in $TAGS; do
+            check_version "${t#v}"
+            if [ -z "$MISSING" ]; then
+              echo "OK: $t is on crates.io."
+              # Older tags are not checked: everything up to here was released.
+              break
+            fi
+            if young "$(git for-each-ref --format='%(creatordate:unix)' "refs/tags/$t")"; then
+              echo "::warning::$t is not on crates.io yet (missing:$MISSING), but it is younger than $GRACE_HOURS hours"
+            else
+              echo "::error::$t is not on crates.io (missing:$MISSING). Publish it: run the 'Publish to crates.io' workflow from main with tag $t."
+              failed=1
+            fi
+          done
+
+          # The version on main must be tagged; if not, tag-on-merge failed and
+          # nothing above can see the release.
+          if [ -z "${TAG:-}" ]; then
+            VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/' || true)"
+            if [ -z "$VERSION" ]; then
+              echo "::error::Could not read the crate version from Cargo.toml"
+              exit 1
+            fi
+            if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+              echo "OK: $VERSION, the version on this branch, is tagged."
+            else
+              # Dated by the first commit on this branch that set the version.
+              SINCE="$(git log --first-parent --reverse --format=%ct -S"version = \"$VERSION\"" -- Cargo.toml | head -1 || true)"
+              if young "${SINCE:-$(git log -1 --format=%ct)}"; then
+                echo "::warning::$VERSION has no tag v$VERSION yet, but the version is younger than $GRACE_HOURS hours"
+              else
+                echo "::error::$VERSION, the version on this branch, has no tag v$VERSION: tag-on-merge failed or never ran. Re-run its run for the merge that set the version, or tag that commit by hand (CONTRIBUTING.md)."
+                failed=1
+              fi
+            fi
+          fi
+          exit "$failed"

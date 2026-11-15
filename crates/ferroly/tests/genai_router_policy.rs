@@ -58,10 +58,7 @@ fn request() -> CompletionRequest {
 }
 
 fn api(status: u16) -> GenAiError {
-    GenAiError::Api {
-        status,
-        message: format!("status {status}"),
-    }
+    GenAiError::api(status, format!("status {status}"))
 }
 
 fn breaker(timeout_ms: u64) -> CircuitBreakerConfig {
@@ -1072,4 +1069,288 @@ async fn stream_failing_after_only_metadata_is_failed_over() {
         .unwrap();
     assert_eq!(empty.text(), "");
     assert_eq!(b.call_count(), 1, "no fallover for an empty answer");
+}
+
+/// A reloaded configuration takes effect in full: the strategy, its rules and
+/// the fallback depth, not only the registry. An invalid one changes nothing.
+#[test]
+fn reload_config_applies_strategy_rules_and_depth() {
+    let p = mock(
+        "p",
+        vec![
+            chat("small", 0.1, 0.2).ranks(40, 90),
+            chat("mid", 1.0, 2.0).ranks(60, 60),
+            chat("big", 5.0, 15.0).ranks(90, 20),
+        ],
+    );
+    let set = ProviderSet::new(vec![p.clone() as Arc<dyn GenAiProvider>]);
+    let router = RouterBuilder::from_config(set, &RoutingConfig::default())
+        .unwrap()
+        .build();
+    let codegen = Task::new().kind(TaskKind::CodeGen).priority(Priority::Cost);
+    let (route, decision) = router.resolve(&codegen).unwrap();
+    assert_eq!(decision.strategy, "capability");
+    assert_eq!(route.primary.model, "small");
+    assert_eq!(route.fallbacks.len(), 2);
+
+    let reloaded = RoutingConfig::from_yaml(
+        "genai:\n  routing:\n    fallback_depth: 0\n    rules:\n      -\n        kind: codegen\n        provider: p\n        model: big\n    disabled_models:\n      -\n        provider: p\n        model: mid\n",
+    )
+    .unwrap();
+    router.reload_config(&reloaded).unwrap();
+    assert_eq!(router.strategy_name(), "composite");
+    assert_eq!(router.fallback_depth(), 0);
+    let (route, decision) = router.resolve(&codegen).unwrap();
+    assert_eq!(decision.strategy, "composite");
+    assert_eq!(route.primary.model, "big", "the reloaded rule is in force");
+    assert!(route.fallbacks.is_empty(), "the reloaded depth is in force");
+    // The registry overlay was applied too.
+    let (_, decision) = router.resolve(&Task::new()).unwrap();
+    assert!(decision.considered.iter().all(|c| c.model != "mid"));
+
+    // An invalid configuration is refused and the previous one stays.
+    let mut bad = reloaded.clone();
+    bad.default_strategy = Some("fastest".into());
+    assert!(matches!(
+        router.reload_config(&bad),
+        Err(RouterError::Config(_))
+    ));
+    assert_eq!(router.strategy_name(), "composite");
+    assert_eq!(router.fallback_depth(), 0);
+
+    // A registry-only reload keeps the configured strategy and depth.
+    let registry = build_registry(
+        &ProviderSet::new(vec![p.clone() as Arc<dyn GenAiProvider>]),
+        &RoutingConfig::default(),
+    )
+    .unwrap();
+    router.reload(registry);
+    assert_eq!(router.strategy_name(), "composite");
+    assert_eq!(router.fallback_depth(), 0);
+}
+
+/// A tenant policy narrows the eligible models, sets the priority, and
+/// refuses a pin outside its allow-list; configured and code-registered
+/// policies both apply, and a config reload replaces only the configured
+/// ones.
+#[test]
+fn tenant_policies_restrict_models_and_priority() {
+    use ferroly::genai::router::TenantPolicy;
+    let cloud = mock(
+        "cloud",
+        vec![
+            chat("big", 5.0, 15.0).ranks(95, 20),
+            chat("small", 0.5, 1.0).ranks(50, 80),
+        ],
+    );
+    let local = mock(
+        "local",
+        vec![chat("llama", 0.0, 0.0).ranks(30, 50), embedding("embed")],
+    );
+    let set = ProviderSet::new(vec![
+        cloud.clone() as Arc<dyn GenAiProvider>,
+        local.clone() as Arc<dyn GenAiProvider>,
+    ]);
+    let config = RoutingConfig::from_yaml(
+        "genai:\n  routing:\n    tenants:\n      -\n        name: acme\n        allowed_providers:\n          - local\n      -\n        name: thrifty\n        priority: cost\n",
+    )
+    .unwrap();
+    let router = RouterBuilder::from_config(set, &config)
+        .unwrap()
+        .tenant_policy("beta", TenantPolicy::new().allow_model("cloud", "small"))
+        .build();
+    let pick = |task: &Task| {
+        let (route, decision) = router.resolve(task).unwrap();
+        (
+            format!("{}/{}", route.primary.provider, route.primary.model),
+            decision,
+        )
+    };
+
+    // No tenant (or an unknown one): the router's defaults.
+    assert_eq!(pick(&Task::new()).0, "cloud/big");
+    assert_eq!(pick(&Task::new().tenant("nobody")).0, "cloud/big");
+
+    // acme may only use the local provider.
+    let (chosen, decision) = pick(&Task::new().tenant("acme"));
+    assert_eq!(chosen, "local/llama");
+    assert!(decision.fallbacks.is_empty());
+    assert!(decision
+        .excluded
+        .iter()
+        .any(|e| e.model == "big" && e.reason.contains("tenant 'acme'")));
+    let pinned = router.resolve(&Task::new().tenant("acme").pin("cloud", "big"));
+    assert!(
+        matches!(&pinned, Err(RouterError::NoRoute { reason }) if reason.contains("acme")),
+        "{pinned:?}"
+    );
+    assert!(router
+        .resolve(&Task::new().tenant("acme").pin("local", "llama"))
+        .is_ok());
+
+    // thrifty's policy overrides the task's priority.
+    assert_eq!(
+        pick(&Task::new().tenant("thrifty").priority(Priority::Quality)).0,
+        "local/llama"
+    );
+    // beta (registered in code) may use exactly one model.
+    assert_eq!(pick(&Task::new().tenant("beta")).0, "cloud/small");
+
+    // Reloading a configuration without tenants drops the configured
+    // policies but keeps the one registered in code.
+    router.reload_config(&RoutingConfig::default()).unwrap();
+    assert_eq!(pick(&Task::new().tenant("acme")).0, "cloud/big");
+    assert_eq!(pick(&Task::new().tenant("beta")).0, "cloud/small");
+}
+
+fn cloud_and_local() -> ProviderSet {
+    let cloud = mock(
+        "cloud",
+        vec![
+            chat("big", 5.0, 15.0).ranks(95, 20),
+            chat("small", 0.5, 1.0).ranks(50, 80),
+            embedding("cloud-embed"),
+        ],
+    );
+    let local = mock(
+        "local",
+        vec![chat("llama", 0.0, 0.0).ranks(30, 50), embedding("embed")],
+    );
+    ProviderSet::new(vec![
+        cloud as Arc<dyn GenAiProvider>,
+        local as Arc<dyn GenAiProvider>,
+    ])
+}
+
+/// Tenant policies fail closed: an unknown tenant can be refused, an empty
+/// allow-list allows nothing, and a configured tenant laid over a
+/// code-registered one keeps the parts it does not set.
+#[test]
+fn tenant_policies_fail_closed() {
+    use ferroly::genai::router::TenantPolicy;
+    let config = RoutingConfig::from_yaml(
+        "genai:\n  routing:\n    tenants:\n      -\n        name: acme\n        priority: cost\n      -\n        name: frozen\n        allowed_providers: []\n",
+    )
+    .unwrap();
+    let build = |require: bool| {
+        RouterBuilder::from_config(cloud_and_local(), &config)
+            .unwrap()
+            .tenant_policy(
+                "acme",
+                TenantPolicy::new()
+                    .allow_model("cloud", "big")
+                    .allow_model("cloud", "small"),
+            )
+            .require_tenant_policy(require)
+            .build()
+    };
+    let router = build(true);
+    let pick = |task: &Task| {
+        router
+            .resolve(task)
+            .map(|(route, _)| format!("{}/{}", route.primary.provider, route.primary.model))
+    };
+
+    // (a) An unknown tenant (a typo, a case difference) is refused.
+    for name in ["acme ", "ACME", "nobody"] {
+        let err = pick(&Task::new().tenant(name)).unwrap_err();
+        assert!(
+            matches!(&err, RouterError::NoRoute { reason } if reason.contains("no routing policy")),
+            "{name:?}: {err:?}"
+        );
+    }
+    // A task without a tenant is unaffected.
+    assert_eq!(pick(&Task::new()).unwrap(), "cloud/big");
+    // Off (the default), an unknown tenant gets the router's defaults.
+    let lenient = build(false);
+    assert!(lenient.resolve(&Task::new().tenant("nobody")).is_ok());
+
+    // (b) `allowed_providers: []` is an empty allow-list: nothing is eligible.
+    assert!(matches!(
+        pick(&Task::new().tenant("frozen")),
+        Err(RouterError::NoRoute { .. })
+    ));
+    assert!(pick(&Task::new().tenant("frozen").pin("local", "llama")).is_err());
+
+    // (c) The configured `acme` sets only a priority: the code's allow-list
+    // is kept (the cheapest allowed model, not local/llama), and the
+    // configured priority applies.
+    assert_eq!(pick(&Task::new().tenant("acme")).unwrap(), "cloud/small");
+    assert!(pick(&Task::new().tenant("acme").pin("local", "llama")).is_err());
+    // The same holds after a reload.
+    router.reload_config(&config).unwrap();
+    assert_eq!(pick(&Task::new().tenant("acme")).unwrap(), "cloud/small");
+}
+
+/// The embedding router applies tenant policies to its candidates and
+/// fallbacks.
+#[tokio::test]
+async fn embedding_router_applies_tenant_policies() {
+    use ferroly::genai::router::{EmbeddingRouter, TenantPolicy};
+    use ferroly::genai::{EmbedRequest, Embedder};
+    let cloud = mock("cloud", vec![embedding("cloud-embed").cost(0.001, 0.0)]);
+    let local = mock("local", vec![embedding("embed")]);
+    let set = ProviderSet::new(vec![
+        cloud.clone() as Arc<dyn GenAiProvider>,
+        local.clone() as Arc<dyn GenAiProvider>,
+    ]);
+    let registry = build_registry(&set, &RoutingConfig::default()).unwrap();
+    let embedders = || {
+        vec![
+            ("cloud".to_string(), cloud.clone() as Arc<dyn Embedder>),
+            ("local".to_string(), local.clone() as Arc<dyn Embedder>),
+        ]
+    };
+    let task = |tenant: &str| Task::new().priority(Priority::Cost).tenant(tenant);
+
+    // Only the cloud embedder is ranked, and the tenant may not use it.
+    let only_cloud = EmbeddingRouter::new(
+        vec![("cloud".to_string(), cloud.clone() as Arc<dyn Embedder>)],
+        build_registry(
+            &ProviderSet::new(vec![cloud.clone() as Arc<dyn GenAiProvider>]),
+            &RoutingConfig::default(),
+        )
+        .unwrap(),
+        Box::new(CapabilityStrategy),
+    )
+    .tenant_policy("acme", TenantPolicy::new().allow_provider("local"));
+    let err = only_cloud.resolve(&task("acme")).unwrap_err();
+    assert!(
+        matches!(&err, RouterError::NoRoute { reason } if reason.contains("acme")),
+        "{err:?}"
+    );
+    assert!(matches!(
+        only_cloud
+            .embed(&task("acme"), EmbedRequest::single("", "hi"))
+            .await,
+        Err(RouterError::NoRoute { .. })
+    ));
+
+    // With both, the cheaper cloud model is ranked first but excluded, and
+    // it is not kept as a fallback either.
+    let router = EmbeddingRouter::new(embedders(), registry.clone(), Box::new(CapabilityStrategy))
+        .tenant_policy("acme", TenantPolicy::new().allow_provider("local"));
+    let open = router
+        .resolve(&Task::new().priority(Priority::Cost))
+        .unwrap();
+    assert_eq!(open.primary.provider, "cloud");
+    let route = router.resolve(&task("acme")).unwrap();
+    assert_eq!(route.primary.provider, "local");
+    assert!(route.fallbacks.iter().all(|c| c.provider == "local"));
+
+    // Policies from configuration, and a required policy.
+    let config = RoutingConfig::from_yaml(
+        "genai:\n  routing:\n    tenants:\n      -\n        name: frozen\n        allowed_models: []\n",
+    )
+    .unwrap();
+    let router = EmbeddingRouter::new(embedders(), registry, Box::new(CapabilityStrategy))
+        .tenant_policies_from(&config)
+        .unwrap()
+        .require_tenant_policy(true);
+    assert!(router.resolve(&task("frozen")).is_err());
+    let err = router.resolve(&task("nobody")).unwrap_err();
+    assert!(
+        matches!(&err, RouterError::NoRoute { reason } if reason.contains("no routing policy"))
+    );
+    assert!(router.resolve(&Task::new()).is_ok());
 }

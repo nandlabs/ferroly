@@ -182,9 +182,59 @@ fn wide_integers() {
     // Strict mode takes the string form exactly; lenient mode trims.
     assert!(json::decode::<i128>("\" 5 \"").is_err());
     assert_eq!(i128::decode(&Value::Str(" 5 ".into())).unwrap(), 5);
+    // A whole float below 2^53 is exact; at or beyond it the float may be a
+    // rounded literal, so it is rejected rather than decoded wrongly.
+    assert_eq!(json::decode::<i128>("1e15").unwrap(), 1_000_000_000_000_000);
+    assert_eq!(json::decode::<u128>("-0.0").unwrap(), 0);
+    assert!(json::decode::<i128>("1e20").is_err());
+    assert!(json::decode::<u128>("9007199254740992.0").is_err());
+}
+
+#[test]
+fn integer_literals_beyond_64_bits_decode_exactly_or_fail() {
+    // The audit: `-9223372036854775809` decoded to `-9223372036854775808`.
+    let cases: [(&str, i128); 4] = [
+        ("-9223372036854775809", -9_223_372_036_854_775_809),
+        ("18446744073709551617", 18_446_744_073_709_551_617),
+        ("170141183460469231731687303715884105727", i128::MAX),
+        ("-170141183460469231731687303715884105728", i128::MIN),
+    ];
+    for (text, want) in cases {
+        // The streaming JSON path reads the digits: exact.
+        assert_eq!(json::decode::<i128>(text).unwrap(), want, "{text}");
+        assert_eq!(
+            json::decode::<Vec<i128>>(&format!("[{text}]")).unwrap(),
+            [want]
+        );
+        // Through a `Value` the literal is a rounded float: an error, never
+        // a wrong number.
+        let tree = json::from_str(text).unwrap();
+        assert!(matches!(tree, Value::Float(_)), "{text}");
+        assert!(i128::decode(&tree).is_err(), "{text}");
+        assert!(from_value_strict::<i128>(&tree).is_err(), "{text}");
+    }
     assert_eq!(
-        json::decode::<i128>("1e20").unwrap(),
-        100_000_000_000_000_000_000
+        json::decode::<u128>("340282366920938463463374607431768211455").unwrap(),
+        u128::MAX
+    );
+    assert_eq!(json::decode::<u128>("-0").unwrap(), 0);
+    assert!(json::decode::<u128>("-18446744073709551617").is_err());
+    assert!(json::decode::<u128>("340282366920938463463374607431768211456").is_err());
+    assert!(json::decode::<i128>("170141183460469231731687303715884105728").is_err());
+    let wide = json::from_str("18446744073709551617").unwrap();
+    assert!(u128::decode(&wide).is_err());
+    // YAML has no streaming path: its wide literals fail the same way.
+    assert!(ferroly::codec::yaml::decode::<i128>("-9223372036854775809").is_err());
+    // Inside a derived struct the field reads exactly too.
+    #[derive(Decode, Debug, PartialEq)]
+    struct Ledger {
+        balance: i128,
+    }
+    assert_eq!(
+        json::decode::<Ledger>(r#"{"balance": -9223372036854775809}"#).unwrap(),
+        Ledger {
+            balance: -9_223_372_036_854_775_809
+        }
     );
 }
 

@@ -170,8 +170,10 @@ fn external_enum_rejects_malformed_input() {
     assert!(decode_both::<Shape>(r#"{"Rect":[3,4]}"#).is_err());
     assert!(decode_both::<Shape>(r#"{"Line":[[0,0]]}"#).is_err());
     assert!(decode_both::<Shape>("7").is_err());
+    // The variant's content errors are located under the variant key.
     let missing = decode_both::<Shape>(r#"{"Rect":{"w":3}}"#).unwrap_err();
-    assert!(matches!(missing, CodecError::MissingField(ref f) if f == "h"));
+    assert!(matches!(missing.root_cause(), CodecError::MissingField(ref f) if f == "h"));
+    assert_eq!(missing.to_string(), "Rect: missing field: h");
 }
 
 /// No unit variants: `decode_from` streams the content out of the map entry.
@@ -272,7 +274,10 @@ fn unit_only_enum_is_still_a_plain_string() {
     assert_eq!(Level::High.encode(), Value::Str("High".into()));
     assert!(matches!(
         decode_both::<Level>(r#"{"Low":null}"#).unwrap_err(),
-        CodecError::Expected("string")
+        CodecError::TypeMismatch {
+            expected: "string",
+            found: "object"
+        }
     ));
     assert!(matches!(
         decode_both::<Level>(r#""Mid""#).unwrap_err(),
@@ -351,7 +356,13 @@ fn internal_tag_rejects_malformed_input() {
     let missing = decode_both::<Event>(r#"{"id":1}"#).unwrap_err();
     assert!(matches!(missing, CodecError::MissingField(ref f) if f == "type"));
     let not_string = decode_both::<Event>(r#"{"type":1}"#).unwrap_err();
-    assert!(matches!(not_string, CodecError::Expected(_)));
+    assert!(matches!(
+        not_string,
+        CodecError::TypeMismatch {
+            expected: "string tag",
+            found: "number"
+        }
+    ));
     let unknown = decode_both::<Event>(r#"{"type":"nope"}"#).unwrap_err();
     assert!(matches!(unknown, CodecError::UnknownVariant(ref v) if v == "nope"));
     let field = decode_both::<Event>(r#"{"type":"user_created","id":1}"#).unwrap_err();

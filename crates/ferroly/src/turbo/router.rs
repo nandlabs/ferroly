@@ -858,6 +858,16 @@ impl Router {
 
     /// Binds `addr` and serves until the process ends, with the default
     /// [`ServerConfig`].
+    ///
+    /// Every `serve*` method [`validate`](Self::validate)s the router first,
+    /// before binding anything: a
+    /// malformed pattern, two conflicting routes or an unusable middleware
+    /// configuration fails start-up with an [`HttpError::Io`] of kind
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput) whose inner error is
+    /// the [`RouteError`] (reach it with `get_ref()` and `downcast_ref`). To
+    /// serve a router with such problems anyway, finalize it with
+    /// [`into_handler`](Self::into_handler) and pass that to
+    /// [`ferroly::http::serve_with_config`].
     pub async fn serve(self, addr: impl ToSocketAddrs) -> Result<(), HttpError> {
         self.serve_with_config(addr, ServerConfig::default(), std::future::pending())
             .await
@@ -907,8 +917,11 @@ impl Router {
     where
         S: Future<Output = ()> + Send,
     {
+        // Validate before binding: a routing mistake never holds the port, and
+        // an address in use does not mask it.
+        let handler = self.serve_handler()?;
         let listener = TcpListener::bind(addr).await?;
-        self.serve_listener(listener, config, shutdown).await
+        ferroly::http::serve_with_config(listener, handler, shutdown, config).await
     }
 
     /// Serves on an already bound listener (for an ephemeral port, socket
@@ -922,7 +935,8 @@ impl Router {
     where
         S: Future<Output = ()> + Send,
     {
-        ferroly::http::serve_with_config(listener, self.into_handler(), shutdown, config).await
+        let handler = self.serve_handler()?;
+        ferroly::http::serve_with_config(listener, handler, shutdown, config).await
     }
 
     /// Binds `addr` and serves HTTPS with the certificate in `tls` until
@@ -957,9 +971,9 @@ impl Router {
     where
         S: Future<Output = ()> + Send,
     {
+        let handler = self.serve_handler()?;
         let listener = TcpListener::bind(addr).await?;
-        self.serve_tls_listener(listener, tls, config, shutdown)
-            .await
+        ferroly::http::serve_tls_reloadable(listener, handler, shutdown, config, tls).await
     }
 
     /// Serves HTTPS on an already bound listener. Pass
@@ -975,8 +989,16 @@ impl Router {
     where
         S: Future<Output = ()> + Send,
     {
-        ferroly::http::serve_tls_reloadable(listener, self.into_handler(), shutdown, config, tls)
-            .await
+        let handler = self.serve_handler()?;
+        ferroly::http::serve_tls_reloadable(listener, handler, shutdown, config, tls).await
+    }
+
+    /// [`try_into_handler`](Self::try_into_handler) for the `serve*` methods:
+    /// a routing mistake stops start-up as an [`HttpError::Io`] of kind
+    /// `InvalidInput` wrapping the [`RouteError`].
+    fn serve_handler(self) -> Result<Arc<dyn HttpHandler>, HttpError> {
+        self.try_into_handler()
+            .map_err(|e| HttpError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))
     }
 }
 

@@ -1,9 +1,12 @@
 //! Configuration sources: files, environment variables and raw arguments.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use ferroly::codec::{json, toml, xml, yaml, Value};
+use ferroly::codec::{json, toml, xml, yaml, Limits, Value};
 
+use super::secret::{read_bounded, read_secret_file};
+use super::unknown::EnvKey;
 use super::{navigate, ConfigError, EnvOptions, Source};
 
 /// The file extensions [`load_file`] understands, in probing order.
@@ -18,11 +21,21 @@ pub(super) const EXTENSIONS: [&str; 8] = [
     "env",
 ];
 
-/// Largest secret file read for the `*_FILE` convention.
-const MAX_SECRET_BYTES: u64 = 1024 * 1024;
-
 /// What replaces file content that an error message would otherwise repeat.
 const REDACTED: &str = "<redacted>";
+
+/// The most segments a key read from arguments, `cli` flags, the environment,
+/// a secrets directory or a `.properties` file may have: the nesting depth the
+/// codec allows a config file ([`Limits::DEFAULT_MAX_DEPTH`]). A deeper key is
+/// ignored, like a key with an empty segment — building, merging and dropping
+/// a tree that deep would overflow the stack.
+pub(super) const MAX_KEY_DEPTH: usize = Limits::DEFAULT_MAX_DEPTH;
+
+/// Whether `segs` can be a config key: 1 to [`MAX_KEY_DEPTH`] segments, none
+/// of them empty.
+pub(super) fn usable_key(segs: &[String]) -> bool {
+    !segs.is_empty() && segs.len() <= MAX_KEY_DEPTH && !segs.iter().any(String::is_empty)
+}
 
 #[derive(Clone, Copy)]
 enum FileFormat {
@@ -177,7 +190,7 @@ pub(super) fn scrub(message: &str, content: &str) -> String {
 /// Parses `.properties` lines (`key.path = value`, `#`/`!` comments), nesting on
 /// `.` — so `db.host = localhost` becomes `{ db: { host: "localhost" } }`.
 pub(super) fn parse_properties(input: &str) -> Value {
-    let mut entries: Vec<(String, Value)> = Vec::new();
+    let mut tree = Tree::default();
     for line in input.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
@@ -189,12 +202,12 @@ pub(super) fn parse_properties(input: &str) -> Value {
                 .split('.')
                 .map(|s| s.trim().to_string())
                 .collect();
-            if !segs.iter().any(|s| s.is_empty()) {
-                insert_nested(&mut entries, &segs, Value::Str(val.trim().to_string()));
+            if usable_key(&segs) {
+                tree.insert(&segs, Value::Str(val.trim().to_string()));
             }
         }
     }
-    Value::Object(entries)
+    tree.into_value()
 }
 
 /// One setting produced by a source, with where it came from.
@@ -207,11 +220,16 @@ pub(super) struct Setting {
 /// Reads the environment variables starting with `prefix` into settings.
 ///
 /// `base` is the configuration merged so far; it is only consulted for
-/// [`EnvOptions::case_insensitive`] key matching.
+/// [`EnvOptions::case_insensitive`] key matching. `classify` decides, before
+/// any secret file is read, whether a key is configuration at all
+/// ([`EnvKey::Ignore`] skips the variable) and whether it is known (the file
+/// of an [`EnvKey::Unknown`] `*_FILE` variable is not read; its value is
+/// `null`).
 pub(super) fn read_env(
     prefix: &str,
     opts: &EnvOptions,
     base: &Value,
+    classify: &dyn Fn(&[String]) -> EnvKey,
 ) -> Result<Vec<Setting>, ConfigError> {
     // Variables whose name or value is not valid UTF-8 cannot be config
     // values; skip them instead of panicking the way `env::vars()` would.
@@ -237,11 +255,6 @@ pub(super) fn read_env(
             None
         };
         let key = secret_key.unwrap_or(rest);
-        // An empty segment (`APP_A____B`, a leading or trailing `__`) has no
-        // sensible key; ignore the variable rather than invent a "" key.
-        if key.is_empty() || key.split("__").any(str::is_empty) {
-            continue;
-        }
         let mut segs: Vec<String> = key
             .split("__")
             .map(|s| {
@@ -252,13 +265,28 @@ pub(super) fn read_env(
                 }
             })
             .collect();
+        // An empty segment (`APP_A____B`, a leading or trailing `__`) has no
+        // sensible key, and a key deeper than `MAX_KEY_DEPTH` cannot be
+        // merged safely; ignore the variable rather than invent a "" key.
+        if !usable_key(&segs) {
+            continue;
+        }
         if opts.match_keys {
             remap(base, &mut segs);
         }
+        let class = classify(&segs);
+        if class == EnvKey::Ignore {
+            continue;
+        }
 
         let (text, source) = if secret_key.is_some() {
+            let text = if class == EnvKey::Unknown {
+                String::new()
+            } else {
+                read_secret(&name, Path::new(&raw))?
+            };
             (
-                read_secret(&name, Path::new(&raw))?,
+                text,
                 Source::SecretFile {
                     var: name.clone(),
                     path: raw.clone(),
@@ -296,15 +324,8 @@ pub(super) fn read_env(
 
 /// Reads the file a `*_FILE` variable points at, without its trailing newline.
 fn read_secret(var: &str, path: &Path) -> Result<String, ConfigError> {
-    let fail = |e: &dyn std::fmt::Display| {
-        ConfigError::Io(format!("secret file for {var}: {}: {e}", path.display()))
-    };
-    let meta = std::fs::metadata(path).map_err(|e| fail(&e))?;
-    if meta.len() > MAX_SECRET_BYTES {
-        return Err(fail(&"file is larger than 1 MiB"));
-    }
-    let bytes = std::fs::read(path).map_err(|e| fail(&e))?;
-    let text = String::from_utf8(bytes).map_err(|_| fail(&"content is not valid UTF-8"))?;
+    let text = read_bounded(path)
+        .map_err(|e| ConfigError::Io(format!("secret file for {var}: {}: {e}", path.display())))?;
     Ok(text.trim_end_matches(['\n', '\r']).to_string())
 }
 
@@ -386,36 +407,230 @@ where
             }
         };
         let segs: Vec<String> = key.split('.').map(str::to_string).collect();
-        if !segs.iter().any(|s| s.is_empty()) {
+        if usable_key(&segs) {
             out.push((segs, Value::Str(val)));
         }
     }
     out
 }
 
-/// Sets `segs` (a non-empty key path) to `value` inside `entries`, creating
-/// intermediate objects and replacing any non-object in the way.
-pub(super) fn insert_nested(entries: &mut Vec<(String, Value)>, segs: &[String], value: Value) {
-    let head = &segs[0];
-    if segs.len() == 1 {
-        match entries.iter_mut().find(|(k, _)| k == head) {
-            Some((_, v)) => *v = value,
-            None => entries.push((head.clone(), value)),
+/// Reads a mounted secrets directory: one regular file per key, as Kubernetes
+/// and Docker secret volumes lay them out. `Ok(None)` when the directory is
+/// missing and `optional`.
+///
+/// - Entries whose name starts with `.` are skipped (Kubernetes keeps its
+///   `..data` and timestamped directories there), and so is anything that is
+///   not a regular file after following symlinks (the visible keys of a
+///   Kubernetes volume are symlinks into `..data`).
+/// - When `dir/..data` exists (a Kubernetes volume), it is resolved **once**
+///   and every key is listed and read from that one revision directory, so a
+///   load never mixes keys of two revisions during an atomic update. If the
+///   revision is swapped and removed while it is being read, the load starts
+///   over on the new one (a few times at most).
+/// - The file name is the key: `.` and `__` both nest (`db.password` and
+///   `db__password` set `db.password`), the case is kept, and a name with an
+///   empty segment or more than [`MAX_KEY_DEPTH`] segments is skipped. A key that is also the prefix of another key
+///   (`db` next to `db.password`) is an error: one of them would be lost.
+/// - The value is the content with **one** trailing newline (`\n` or `\r\n`)
+///   removed; it must be UTF-8 and at most 1 MiB.
+pub(super) fn read_secret_dir(
+    dir: &Path,
+    optional: bool,
+) -> Result<Option<Vec<Setting>>, ConfigError> {
+    // A revision directory can vanish between resolving `..data` and reading
+    // it; the next attempt sees the new revision.
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 1;
+    loop {
+        let revision = resolve_revision(dir);
+        match read_secret_revision(dir, revision.as_deref(), optional) {
+            Err(DirError::Vanished(_))
+                if attempt < ATTEMPTS && resolve_revision(dir) != revision =>
+            {
+                attempt += 1;
+            }
+            Err(DirError::Vanished(e) | DirError::Fatal(e)) => return Err(e),
+            Ok(settings) => return Ok(settings),
         }
-        return;
     }
-    let idx = match entries.iter().position(|(k, _)| k == head) {
-        Some(i) => i,
-        None => {
-            entries.push((head.clone(), Value::Object(Vec::new())));
-            entries.len() - 1
+}
+
+/// The directory `dir/..data` points at — the current revision of a
+/// Kubernetes secret or ConfigMap volume — or `None` when there is none.
+fn resolve_revision(dir: &Path) -> Option<PathBuf> {
+    let data = dir.join("..data");
+    match std::fs::read_link(&data) {
+        // Kubernetes writes a relative link (`..2026_11_15_…`); `join` keeps
+        // an absolute one as it is.
+        Ok(target) => Some(dir.join(target)),
+        Err(_) if data.is_dir() => Some(data),
+        Err(_) => None,
+    }
+}
+
+/// Why reading one revision of a secret directory failed.
+enum DirError {
+    /// A file or the revision directory disappeared while it was read.
+    Vanished(ConfigError),
+    /// Anything else.
+    Fatal(ConfigError),
+}
+
+/// Reads the keys of `dir` from `revision` (its resolved `..data`) when there
+/// is one, else from `dir` itself.
+fn read_secret_revision(
+    dir: &Path,
+    revision: Option<&Path>,
+    optional: bool,
+) -> Result<Option<Vec<Setting>>, DirError> {
+    let fail = |what: &dyn std::fmt::Display, e: &dyn std::fmt::Display| {
+        ConfigError::Io(format!("secret directory {}: {what}: {e}", dir.display()))
+    };
+    let classify = |kind: Option<std::io::ErrorKind>, e: ConfigError| {
+        if revision.is_some() && kind == Some(std::io::ErrorKind::NotFound) {
+            DirError::Vanished(e)
+        } else {
+            DirError::Fatal(e)
         }
     };
-    if !matches!(entries[idx].1, Value::Object(_)) {
-        entries[idx].1 = Value::Object(Vec::new());
+    let root = revision.unwrap_or(dir);
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if revision.is_none() && optional && e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None)
+        }
+        Err(e) => return Err(classify(Some(e.kind()), fail(&"cannot be listed", &e))),
+    };
+    let mut files: Vec<(String, Vec<String>)> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| classify(Some(e.kind()), fail(&"cannot be listed", &e)))?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        // `metadata` follows symlinks; a dangling one is skipped like any
+        // other non-file.
+        if !std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file()) {
+            continue;
+        }
+        let segs: Vec<String> = name
+            .split('.')
+            .flat_map(|part| part.split("__"))
+            .map(str::to_string)
+            .collect();
+        if !usable_key(&segs) {
+            continue;
+        }
+        files.push((name, segs));
     }
-    if let Value::Object(child) = &mut entries[idx].1 {
-        insert_nested(child, &segs[1..], value);
+    // Deterministic order, so a key spelled two ways resolves the same way
+    // every time (the later name wins).
+    files.sort();
+
+    // A file whose key is the prefix of another file's key (`db` next to
+    // `db.password`) cannot be merged: one value would silently replace the
+    // other.
+    let keys: HashSet<&[String]> = files.iter().map(|(_, segs)| segs.as_slice()).collect();
+    for (name, segs) in &files {
+        if let Some(n) = (1..segs.len()).find(|&n| keys.contains(&segs[..n])) {
+            let prefix = &segs[..n];
+            let owner = files
+                .iter()
+                .find(|(_, other)| other.as_slice() == prefix)
+                .map_or("", |(other, _)| other.as_str());
+            return Err(DirError::Fatal(fail(
+                &format!("files `{owner}` and `{name}`"),
+                &format!(
+                    "key `{}` cannot be both a value and a section",
+                    prefix.join(".")
+                ),
+            )));
+        }
+    }
+
+    let mut out = Vec::with_capacity(files.len());
+    for (name, segs) in files {
+        let shown = dir.join(&name).display().to_string();
+        let text = read_secret_file(&root.join(&name))
+            .map_err(|e| classify(e.kind(), fail(&shown, &e)))?;
+        out.push(Setting {
+            segs,
+            value: Value::Str(text),
+            source: Source::SecretDir(shown),
+        });
+    }
+    Ok(Some(out))
+}
+
+/// An object built from many key paths. Every level indexes its keys, so
+/// adding `n` distinct keys takes linear time, and a path is walked with a
+/// loop rather than recursion.
+#[derive(Default)]
+pub(super) struct Tree {
+    entries: Vec<(String, Node)>,
+    index: HashMap<String, usize>,
+}
+
+/// A value in a [`Tree`]: set by a key path, or a section other paths go
+/// through.
+enum Node {
+    Leaf(Value),
+    Branch(Tree),
+}
+
+impl Tree {
+    /// Sets `segs` to `value`, creating the sections on the way and replacing
+    /// any value in the way; a later value for the same key replaces the
+    /// earlier one, in place. A path that is empty or deeper than
+    /// [`MAX_KEY_DEPTH`] is ignored.
+    pub(super) fn insert(&mut self, segs: &[String], value: Value) {
+        if segs.len() > MAX_KEY_DEPTH {
+            return;
+        }
+        let Some((last, path)) = segs.split_last() else {
+            return;
+        };
+        let mut cur = self;
+        for seg in path {
+            let node = cur.slot(seg);
+            if !matches!(node, Node::Branch(_)) {
+                *node = Node::Branch(Tree::default());
+            }
+            cur = match node {
+                Node::Branch(next) => next,
+                Node::Leaf(_) => unreachable!("replaced by a branch above"),
+            };
+        }
+        *cur.slot(last) = Node::Leaf(value);
+    }
+
+    /// The node for `key` at this level, added (as `null`) when missing.
+    fn slot(&mut self, key: &str) -> &mut Node {
+        let at = match self.index.get(key) {
+            Some(&at) => at,
+            None => {
+                self.index.insert(key.to_string(), self.entries.len());
+                self.entries
+                    .push((key.to_string(), Node::Leaf(Value::Null)));
+                self.entries.len() - 1
+            }
+        };
+        &mut self.entries[at].1
+    }
+
+    /// The tree as a [`Value::Object`], keys in first-insertion order.
+    pub(super) fn into_value(self) -> Value {
+        Value::Object(
+            self.entries
+                .into_iter()
+                .map(|(key, node)| match node {
+                    Node::Leaf(value) => (key, value),
+                    Node::Branch(tree) => (key, tree.into_value()),
+                })
+                .collect(),
+        )
     }
 }
 

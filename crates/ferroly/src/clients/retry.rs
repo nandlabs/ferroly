@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::rng;
+use ferroly::http::parse_retry_after_at;
 
 /// Configures a bounded retry loop with optional exponential backoff.
 ///
@@ -132,9 +133,11 @@ pub enum RetryDecision {
     Stop,
     /// Retry after the policy's (jittered) backoff delay.
     Retry,
-    /// Retry after exactly this delay instead of the policy's — for a
-    /// server-provided `Retry-After` (see [`parse_retry_after`]). The delay is
-    /// not jittered. If it exceeds the configured
+    /// Retry after at least this delay — for a server-provided
+    /// `Retry-After` (see [`parse_retry_after`]). The wait is the longer of
+    /// this delay and the policy's (jittered) backoff for the attempt, so a
+    /// `Retry-After: 0` or a date in the past cannot make the remaining
+    /// retries fire at once. If the delay exceeds the configured
     /// [`max_retry_after`](Retry::max_retry_after) the retry loop stops
     /// instead of waiting less than the server asked for.
     RetryAfter(Duration),
@@ -443,7 +446,9 @@ impl Retry {
                     if self.max_retry_after.is_some_and(|cap| requested > cap) {
                         return Err(error);
                     }
-                    requested
+                    // A server's delay is a minimum: `Retry-After: 0` (or a
+                    // past date) must not turn the backoff into a burst.
+                    requested.max(planned)
                 }
             };
             if let Some(max_elapsed) = self.max_elapsed {
@@ -546,72 +551,6 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
     parse_retry_after_at(value, now)
 }
 
-fn parse_retry_after_at(value: &str, now_unix: u64) -> Option<Duration> {
-    let value = value.trim();
-    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
-        return value.parse().ok().map(Duration::from_secs);
-    }
-    let at = parse_imf_fixdate(value)?;
-    Some(Duration::from_secs(at.saturating_sub(now_unix)))
-}
-
-/// Parses `"Sun, 06 Nov 1994 08:49:37 GMT"` into Unix seconds.
-fn parse_imf_fixdate(value: &str) -> Option<u64> {
-    let mut fields = value.split(' ');
-    let weekday = fields.next()?;
-    if weekday.len() != 4 || !weekday.ends_with(',') {
-        return None;
-    }
-    let day = two_digits(fields.next()?)?;
-    let month = match fields.next()? {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let year = fields.next()?;
-    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let year: u64 = year.parse().ok()?;
-    let mut clock = fields.next()?.split(':');
-    let hour = two_digits(clock.next()?)?;
-    let minute = two_digits(clock.next()?)?;
-    let second = two_digits(clock.next()?)?;
-    if clock.next().is_some() || fields.next() != Some("GMT") || fields.next().is_some() {
-        return None;
-    }
-    if year < 1970 || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
-        return None;
-    }
-    // Days since 1970-01-01 (the civil-from-days algorithm, inverted).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y / 400;
-    let year_of_era = y % 400;
-    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
-    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = (era * 146_097 + day_of_era).checked_sub(719_468)?;
-    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
-}
-
-fn two_digits(text: &str) -> Option<u64> {
-    if text.len() == 2 && text.bytes().all(|b| b.is_ascii_digit()) {
-        text.parse().ok()
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,7 +641,10 @@ mod tests {
         }
         // The RFC 9110 example date is 784111777 seconds after the epoch.
         let date = "Sun, 06 Nov 1994 08:49:37 GMT";
-        assert_eq!(parse_imf_fixdate(date), Some(784_111_777));
+        assert_eq!(
+            parse_retry_after_at(date, 0).map(|d| d.as_secs()),
+            Some(784_111_777)
+        );
         assert_eq!(
             parse_retry_after_at(date, 784_111_777 - 90),
             Some(Duration::from_secs(90))
@@ -712,13 +654,16 @@ mod tests {
             parse_retry_after_at(date, 784_111_777 + 5),
             Some(Duration::ZERO)
         );
-        assert_eq!(parse_imf_fixdate("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
         assert_eq!(
-            parse_imf_fixdate("Tue, 29 Feb 2000 12:00:00 GMT"),
+            parse_retry_after_at("Thu, 01 Jan 1970 00:00:00 GMT", 0).map(|d| d.as_secs()),
+            Some(0)
+        );
+        assert_eq!(
+            parse_retry_after_at("Tue, 29 Feb 2000 12:00:00 GMT", 0).map(|d| d.as_secs()),
             Some(951_825_600)
         );
         assert_eq!(
-            parse_imf_fixdate("Wed, 21 Oct 2015 07:28:00 GMT"),
+            parse_retry_after_at("Wed, 21 Oct 2015 07:28:00 GMT", 0).map(|d| d.as_secs()),
             Some(1_445_412_480)
         );
         for bad in [
@@ -732,7 +677,11 @@ mod tests {
             "Sun, 06 Nov 1969 08:49:37 GMT",
             "Sun, 06 Nov 1994 08:49 GMT",
         ] {
-            assert_eq!(parse_imf_fixdate(bad), None, "{bad:?}");
+            assert_eq!(
+                parse_retry_after_at(bad, 0).map(|d| d.as_secs()),
+                None,
+                "{bad:?}"
+            );
         }
     }
 }

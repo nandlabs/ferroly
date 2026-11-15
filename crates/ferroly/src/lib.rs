@@ -5,7 +5,7 @@
 //! you enable:
 //!
 //! ```toml
-//! ferroly = { version = "0.5", features = ["genai", "codec"] }
+//! ferroly = { version = "0.6", features = ["genai", "codec"] }
 //! ```
 //!
 //! ```
@@ -16,7 +16,7 @@
 //! ## Modules
 //!
 //! Every module sits behind the cargo feature of the same name. The defaults
-//! are `codec` and `errutils`; `full` enables everything.
+//! are `codec`, `errutils` and `tls-ring`; `full` enables everything.
 //!
 //! | Module | What it provides |
 //! |---|---|
@@ -26,17 +26,24 @@
 //! | `codec` | `Value` model, `Encode`/`Decode` traits and derives, JSON/XML/YAML/TOML, a JSON-Schema subset |
 //! | `config` | Layered configuration from files, environment and command-line flags |
 //! | `errutils` | `MultiError` aggregation, error context wrapping and error classification |
-//! | `fsutils` | Content-type detection and read-only memory-mapped files |
+//! | `fsutils` | Content-type detection, read-only memory-mapped files, human-readable byte sizes |
 //! | `genai` | Provider-agnostic LLM interface, prompt templates and a model router |
+//! | `grpc` | gRPC over HTTP/2: unary and streaming calls, status, metadata, deadlines, a `.proto` service generator, the health service |
 //! | `hash` | Streaming SHA-256 / SHA-1 / HMAC-SHA256 |
 //! | `http` | HTTP/1.1 client and server (chunked, SSE, range downloads, TLS) |
+//! | `http2` | HTTP/2 for the `http` server and client: ALPN `h2`, h2c prior knowledge, multiplexing, trailers, bidirectional streaming (no module of its own) |
 //! | `lifecycle` | Dependency-ordered component start/stop and health probes |
 //! | `log` | Structured logger |
+//! | `log::bridge` | Routes records from the `log` facade crate into the structured logger (feature `log-bridge`) |
 //! | `messaging` | Provider-agnostic messaging: typed attributes, filters, a delivery context, and an in-process bus |
 //! | `metrics` | Counters, gauges, histograms and Prometheus exposition |
 //! | `obs` | Span/event tracing with exporters |
+//! | `proto` | Protocol Buffers wire codec, `Message` derive, `.proto` parser and code generator (feature `protobuf`) |
 //! | `rest` | REST client and server framework |
 //! | `rt` | Async runtime surface (re-exported `tokio` primitives) |
+//! | `sig` | Verify-only Ed25519 signatures (RFC 8032; Ed25519ph and Ed25519ctx; streaming) |
+//! | `store` | Content-addressed cache; S3 (SigV4), Hugging Face and OCI fetch adapters (`store-s3`, `store-hf`, `store-oci`) |
+//! | `template` | Sandboxed, bounded Jinja2-subset template engine (LLM chat templates) |
 //! | `turbo` | HTTP router with middleware |
 //! | `vectorstore` | Vector-store trait with an in-memory backend |
 //! | `vfs` | Virtual filesystem trait with local and in-memory backends and object-store hooks |
@@ -47,16 +54,30 @@
 //! own. The derive macros (`Encode`, `Decode`, [`FerrolyError`]) come from the
 //! companion `ferroly-derive` crate and are re-exported here.
 //!
+//! | Feature | What it does |
+//! |---|---|
+//! | `tls-ring` | `ring` as the `rustls` crypto backend (default; no module of its own). Used when the application has not installed a process-default `CryptoProvider`; with it off ferroly links no backend, and TLS setup and RS256 / ES256 verification return a typed error until one is installed (e.g. `aws-lc-rs`) |
+//!
 //! [`Error`] wraps every enabled module's error type, so a function that
 //! touches several modules can return `Result<_, ferroly::Error>` and use `?`
 //! throughout.
 //!
 //! The only external runtime dependencies are `tokio` and, for TLS, the
 //! `rustls` stack (`tokio-rustls`, `rustls`, `webpki-roots`); everything else
-//! is implemented in-house.
+//! is implemented in-house. The single optional exception is the opt-in
+//! `log-bridge` feature, which adds the `log` facade crate (itself free of
+//! dependencies).
 
 // Let derive-generated `::ferroly::codec::…` paths resolve inside this crate.
 extern crate self as ferroly;
+
+// The one base64 implementation (public as `hash::base64`), always compiled.
+mod base64;
+
+// The plain `key=value` text format shared by `log` and `obs`'s
+// `PlainExporter`.
+#[cfg(any(feature = "log", feature = "obs"))]
+mod textfmt;
 
 /// Derives a typed error enum/struct: `Display` from `#[error("…")]` format
 /// strings (with field interpolation), `std::error::Error::source()` chaining,
@@ -83,6 +104,8 @@ pub mod errutils;
 pub mod fsutils;
 #[cfg(feature = "genai")]
 pub mod genai;
+#[cfg(feature = "grpc")]
+pub mod grpc;
 #[cfg(feature = "hash")]
 pub mod hash;
 #[cfg(feature = "http")]
@@ -97,10 +120,18 @@ pub mod messaging;
 pub mod metrics;
 #[cfg(feature = "obs")]
 pub mod obs;
+#[cfg(feature = "protobuf")]
+pub mod proto;
 #[cfg(feature = "rest")]
 pub mod rest;
 #[cfg(feature = "rt")]
 pub mod rt;
+#[cfg(feature = "sig")]
+pub mod sig;
+#[cfg(feature = "store")]
+pub mod store;
+#[cfg(feature = "template")]
+pub mod template;
 #[cfg(feature = "turbo")]
 pub mod turbo;
 #[cfg(feature = "vectorstore")]
@@ -199,6 +230,16 @@ pub enum Error {
     #[error(transparent)]
     Vfs(#[from] vfs::VfsError),
 
+    /// A signature-verification error.
+    #[cfg(feature = "sig")]
+    #[error(transparent)]
+    Sig(#[from] sig::SigError),
+
+    /// An artifact-cache or fetch-adapter error.
+    #[cfg(feature = "store")]
+    #[error(transparent)]
+    Store(#[from] store::StoreError),
+
     /// A command-line parsing error (including help/version requests).
     #[cfg(feature = "cli")]
     #[error(transparent)]
@@ -208,6 +249,21 @@ pub enum Error {
     #[cfg(feature = "genai")]
     #[error(transparent)]
     Router(#[from] genai::RouterError),
+
+    /// A protobuf decoding error.
+    #[cfg(feature = "protobuf")]
+    #[error(transparent)]
+    Proto(#[from] proto::ProtoError),
+
+    /// A template parse or render error.
+    #[cfg(feature = "template")]
+    #[error(transparent)]
+    Template(#[from] template::TemplateError),
+
+    /// A failed gRPC call.
+    #[cfg(feature = "grpc")]
+    #[error(transparent)]
+    Grpc(#[from] grpc::Status),
 
     /// A spawned task failed to complete (it panicked or was cancelled).
     #[cfg(feature = "rt")]
@@ -249,7 +305,7 @@ impl errutils::Classify for Error {
             #[cfg(feature = "config")]
             Error::Config(e) => e.kind(),
             #[cfg(feature = "fsutils")]
-            Error::Fs(e) => classify::io_source(e).unwrap_or(K::Unknown),
+            Error::Fs(e) => errutils::io_source_kind(e).unwrap_or(K::Unknown),
             #[cfg(feature = "lifecycle")]
             Error::Lifecycle(e) => match e {
                 lifecycle::LifecycleError::ComponentNotFound { .. } => K::NotFound,
@@ -259,7 +315,7 @@ impl errutils::Classify for Error {
                 _ => K::Unknown,
             },
             #[cfg(feature = "genai")]
-            Error::GenAi(e) => classify::genai(e),
+            Error::GenAi(e) => e.kind(),
             #[cfg(feature = "genai")]
             Error::Router(e) => {
                 match e {
@@ -272,20 +328,20 @@ impl errutils::Classify for Error {
                     genai::RouterError::GenAi { .. }
                     | genai::RouterError::AllRoutesFailed { .. } => std::error::Error::source(e)
                         .and_then(|s| s.downcast_ref::<genai::GenAiError>())
-                        .map_or(K::Unknown, classify::genai),
+                        .map_or(K::Unknown, Classify::kind),
                     _ => K::Unknown,
                 }
             }
             #[cfg(feature = "rest")]
             Error::Rest(e) => errutils::Classify::kind(e),
             #[cfg(feature = "ws")]
-            Error::Ws(_) => K::Unavailable,
+            Error::Ws(e) => e.kind(),
             #[cfg(feature = "http")]
-            Error::Http(e) => classify::http(e),
+            Error::Http(e) => e.kind(),
             #[cfg(feature = "clients")]
             Error::Breaker(_) => K::Unavailable,
             #[cfg(feature = "auth")]
-            Error::Auth(_) => K::Unauthenticated,
+            Error::Auth(e) => e.kind(),
             #[cfg(feature = "auth")]
             Error::Scope(_) => K::PermissionDenied,
             #[cfg(feature = "clients")]
@@ -298,43 +354,77 @@ impl errutils::Classify for Error {
             #[cfg(feature = "turbo")]
             Error::Param(_) => K::InvalidInput,
             #[cfg(feature = "messaging")]
-            Error::Messaging(e) => {
-                use messaging::MessagingError as M;
-                match e {
-                    M::BufferFull(_) | M::SendTimeout(_) | M::Closed(_) => K::Unavailable,
-                    M::NoListeners(_) => K::NotFound,
-                    M::RequestTimeout(_) => K::Timeout,
-                    M::InvalidAddress(_) | M::InvalidOptions(_) => K::InvalidInput,
-                    M::Unsupported(_) => K::Unsupported,
-                    M::Backend {
-                        transient: true, ..
-                    }
-                    | M::Refused {
-                        transient: true, ..
-                    } => K::Unavailable,
-                    _ => K::Unknown,
-                }
-            }
+            Error::Messaging(e) => e.kind(),
             #[cfg(feature = "vectorstore")]
             Error::VectorStore(vectorstore::VectorStoreError::DimMismatch { .. }) => {
                 K::InvalidInput
             }
             #[cfg(feature = "vfs")]
-            Error::Vfs(e) => match e {
-                vfs::VfsError::NotFound { .. } => K::NotFound,
-                vfs::VfsError::Permission { .. } => K::PermissionDenied,
-                vfs::VfsError::NotDir { .. } | vfs::VfsError::IsDir { .. } => K::InvalidInput,
-                vfs::VfsError::Unsupported { .. } => K::Unsupported,
-                vfs::VfsError::AlreadyExists { .. } | vfs::VfsError::PreconditionFailed { .. } => {
-                    K::Conflict
+            Error::Vfs(e) => e.kind(),
+            #[cfg(feature = "sig")]
+            Error::Sig(e) => match e {
+                // A tampered signature is either of these, depending on
+                // which bits changed; both are a failed authentication.
+                sig::SigError::VerificationFailed | sig::SigError::MalformedSignature => {
+                    K::Unauthenticated
                 }
-                vfs::VfsError::Unavailable { .. } => K::Unavailable,
-                vfs::VfsError::Timeout { .. } => K::Timeout,
-                vfs::VfsError::Unauthenticated { .. } => K::Unauthenticated,
-                other => classify::io_source(other).unwrap_or(K::Unknown),
+                _ => K::InvalidInput,
             },
+            #[cfg(feature = "store")]
+            Error::Store(e) => {
+                use store::StoreError as S;
+                match e {
+                    S::Http(h) => h.kind(),
+                    S::Io(io) => Classify::kind(io),
+                    S::InvalidDigest(_) | S::Config(_) => K::InvalidInput,
+                    S::DigestMismatch { .. } | S::SizeMismatch(_) => K::Internal,
+                    // A short or stalled transfer is parked for resumption.
+                    S::Interrupted(_) => K::Unavailable,
+                    // A response the adapter cannot use (or refuses, such as
+                    // an https -> http redirect) does not change on retry.
+                    S::Protocol(_) => K::InvalidInput,
+                    S::Auth(_) => K::Unauthenticated,
+                    S::Remote { status, .. } => match *status {
+                        401 => K::Unauthenticated,
+                        403 => K::PermissionDenied,
+                        404 => K::NotFound,
+                        408 => K::Timeout,
+                        409 | 412 => K::Conflict,
+                        429 => K::RateLimited,
+                        400..=499 => K::InvalidInput,
+                        500..=599 => K::Unavailable,
+                        _ => K::Unknown,
+                    },
+                    _ => K::Unknown,
+                }
+            }
             #[cfg(feature = "cli")]
             Error::Cli(e) => e.kind(),
+            #[cfg(feature = "protobuf")]
+            Error::Proto(_) => K::InvalidInput,
+            #[cfg(feature = "template")]
+            Error::Template(e) => match e.kind() {
+                template::TemplateErrorKind::Unsupported(_) => K::Unsupported,
+                template::TemplateErrorKind::Function { .. } => K::Unknown,
+                _ => K::InvalidInput,
+            },
+            #[cfg(feature = "grpc")]
+            Error::Grpc(status) => {
+                use grpc::Code as C;
+                match status.code() {
+                    C::InvalidArgument | C::OutOfRange => K::InvalidInput,
+                    C::Unauthenticated => K::Unauthenticated,
+                    C::PermissionDenied => K::PermissionDenied,
+                    C::NotFound => K::NotFound,
+                    C::AlreadyExists | C::Aborted | C::FailedPrecondition => K::Conflict,
+                    C::Unimplemented => K::Unsupported,
+                    C::ResourceExhausted => K::RateLimited,
+                    C::DeadlineExceeded => K::Timeout,
+                    C::Unavailable => K::Unavailable,
+                    C::Internal | C::DataLoss => K::Internal,
+                    _ => K::Unknown,
+                }
+            }
             #[cfg(feature = "rt")]
             Error::Join(e) => {
                 if e.is_panic() {
@@ -345,71 +435,6 @@ impl errutils::Classify for Error {
             }
             Error::Multi(e) => e.kind(),
             Error::Context(e) => e.kind(),
-            _ => K::Unknown,
-        }
-    }
-}
-
-/// Per-module classification helpers shared by several [`Error`] variants.
-#[cfg(feature = "errutils")]
-mod classify {
-    // `{ .. }` patterns on purpose; see `Classify for Error`.
-    #![allow(unknown_lints, clippy::unneeded_struct_pattern)]
-
-    #[allow(unused_imports)]
-    use super::errutils::{Classify, ErrorKind as K};
-
-    /// The kind of the `std::io::Error` directly behind `e`, when that is what
-    /// its `source()` is.
-    #[cfg(any(feature = "fsutils", feature = "http", feature = "vfs"))]
-    pub(super) fn io_source(e: &(dyn std::error::Error + 'static)) -> Option<K> {
-        e.source()
-            .and_then(|s| s.downcast_ref::<std::io::Error>())
-            .map(Classify::kind)
-    }
-
-    #[cfg(feature = "http")]
-    pub(super) fn http(e: &super::http::HttpError) -> K {
-        use super::http::HttpError;
-        #[allow(unreachable_patterns)]
-        match e {
-            HttpError::InvalidUrl { .. } => K::InvalidInput,
-            HttpError::Timeout { .. } => K::Timeout,
-            other => io_source(other).unwrap_or(K::Unknown),
-        }
-    }
-
-    #[cfg(feature = "genai")]
-    pub(super) fn genai(e: &super::genai::GenAiError) -> K {
-        use super::genai::GenAiError;
-        #[allow(unreachable_patterns)]
-        match e {
-            GenAiError::Template { .. } | GenAiError::Config { .. } => K::InvalidInput,
-            GenAiError::TemplateNotFound { .. } => K::NotFound,
-            GenAiError::Unsupported { .. } => K::Unsupported,
-            GenAiError::Transport { .. } => K::Unavailable,
-            GenAiError::Api { status, .. } => match *status {
-                401 => K::Unauthenticated,
-                403 => K::PermissionDenied,
-                404 => K::NotFound,
-                408 => K::Timeout,
-                409 => K::Conflict,
-                429 => K::RateLimited,
-                400..=499 => K::InvalidInput,
-                500..=599 => K::Unavailable,
-                _ => K::Unknown,
-            },
-            GenAiError::ResponseParse { .. } => K::Internal,
-            GenAiError::Timeout { .. } => K::Timeout,
-            GenAiError::RateLimited { .. } => K::RateLimited,
-            GenAiError::Auth { status, .. } => match *status {
-                403 => K::PermissionDenied,
-                _ => K::Unauthenticated,
-            },
-            GenAiError::ContentFilter { .. } | GenAiError::ContextLengthExceeded { .. } => {
-                K::InvalidInput
-            }
-            GenAiError::Overloaded { .. } => K::Unavailable,
             _ => K::Unknown,
         }
     }

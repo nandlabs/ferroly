@@ -961,13 +961,29 @@ fn process_collector_reports_start_time_and_uptime() {
     assert_eq!(doc.types["process_start_time_seconds"], "gauge");
     assert_eq!(doc.named("process_uptime_seconds").len(), 1);
 
-    if cfg!(target_os = "linux") {
+    let value = |name: &str| {
+        doc.value(name, &[])
+            .unwrap_or_else(|| panic!("{name} is missing"))
+    };
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         assert_eq!(doc.types["process_cpu_seconds_total"], "counter");
-        assert!(doc.value("process_resident_memory_bytes", &[]).unwrap() > 0.0);
-        assert!(doc.value("process_threads", &[]).unwrap() >= 1.0);
-        assert!(doc.value("process_open_fds", &[]).unwrap() >= 1.0);
+        assert!(value("process_cpu_seconds_total") >= 0.0);
+        assert!(value("process_resident_memory_bytes") > 0.0);
+        assert!(value("process_virtual_memory_bytes") > 0.0);
+        assert!(value("process_open_fds") >= 1.0);
+        // The real start time, not "when metrics were first used": this
+        // test process started before the registry existed.
+        assert!(start < now, "start={start} now={now}");
     } else {
         assert!(doc.named("process_resident_memory_bytes").is_empty());
+    }
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert!(value("process_threads") >= 1.0);
+        assert!(value("process_max_fds") >= value("process_open_fds"));
+    } else {
+        // Windows reports no thread count or descriptor limit.
+        assert!(doc.named("process_threads").is_empty());
+        assert!(doc.named("process_max_fds").is_empty());
     }
     // The OpenMetrics rendering of the same registry is valid too.
     parse(&reg.encode_openmetrics(), true);

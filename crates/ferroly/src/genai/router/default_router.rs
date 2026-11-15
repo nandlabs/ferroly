@@ -22,7 +22,11 @@ use super::route::{
 };
 use super::strategy::RoutingStrategy;
 use super::strategy_capability::CapabilityStrategy;
+use super::tenant::{merge_tenants, policy_for, TenantPolicy};
 use super::{Ranking, RouterError, Task};
+
+/// The fallback depth of a router whose builder or configuration sets none.
+const DEFAULT_FALLBACK_DEPTH: usize = 2;
 
 /// Selects a model for a task, executes with fallback, and returns the response.
 pub trait ModelRouter: Send + Sync {
@@ -95,15 +99,29 @@ struct Shared {
     sticky: Arc<Mutex<Sticky>>,
 }
 
+/// The part of the router a reload replaces, swapped as one unit so a routed
+/// call never sees the registry of one configuration with the rules of
+/// another.
+#[derive(Clone)]
+struct State {
+    registry: Arc<dyn ModelRegistry>,
+    strategy: Arc<dyn RoutingStrategy>,
+    fallback_depth: usize,
+    tenants: HashMap<String, TenantPolicy>,
+}
+
 /// The default router: strategy selection + option clamping + error-classified,
 /// deadline-aware fallback composed with `clients` retry / circuit breaking.
 pub struct DefaultRouter {
     providers: ProviderSet,
-    registry: RwLock<Arc<dyn ModelRegistry>>,
-    strategy: Box<dyn RoutingStrategy>,
+    state: RwLock<Arc<State>>,
+    /// Tenant policies registered in code; a configuration reload keeps them
+    /// (a configured tenant of the same name is laid over them).
+    code_tenants: HashMap<String, TenantPolicy>,
+    /// Whether a task naming a tenant without a policy is refused.
+    require_tenant_policy: bool,
     retry: Option<Retry>,
     breakers: Option<Arc<CircuitBreakerRegistry>>,
-    fallback_depth: usize,
     fallback_on_timeout: bool,
     shared: Shared,
 }
@@ -193,13 +211,61 @@ enum Attempted<T> {
 
 impl DefaultRouter {
     /// Replaces the registry atomically (hot-reload). In-flight routes keep the
-    /// snapshot they started with.
+    /// snapshot they started with. The strategy, rules, fallback depth and
+    /// tenant policies are unchanged; use
+    /// [`reload_config`](Self::reload_config) to apply a whole configuration.
     pub fn reload(&self, registry: Arc<dyn ModelRegistry>) {
-        *self.registry.write().expect("registry lock") = registry;
+        let mut state = self.state.write().expect("router state lock");
+        let mut next = State::clone(&state);
+        next.registry = registry;
+        *state = Arc::new(next);
+    }
+
+    /// Applies a reloaded configuration in full, atomically: the registry
+    /// overlay, the strategy named by `default_strategy` with its `rules` and
+    /// `default_model`, `fallback_depth` and the `tenants` policies — exactly
+    /// as [`RouterBuilder::from_config`] applies them to a new builder. A key
+    /// the configuration leaves out takes its default (`fallback_depth` 2;
+    /// the strategy `capability`, or `composite` when there are rules), so a
+    /// strategy or depth set in code is replaced. Tenant policies registered
+    /// with [`RouterBuilder::tenant_policy`] are kept; a configured tenant of
+    /// the same name is laid over the code's policy (each part the
+    /// configuration sets replaces the code's, the others are kept).
+    ///
+    /// Nothing changes when the configuration is invalid: the error is
+    /// returned and the router keeps routing under the previous one.
+    /// In-flight routes finish under the state they started with.
+    pub fn reload_config(&self, config: &RoutingConfig) -> Result<(), RouterError> {
+        let registry = build_registry(&self.providers, config)?;
+        let strategy: Arc<dyn RoutingStrategy> = Arc::from(config.strategy()?);
+        let tenants = merge_tenants(&self.code_tenants, config.tenant_policies()?);
+        let next = State {
+            registry,
+            strategy,
+            fallback_depth: config.fallback_depth.unwrap_or(DEFAULT_FALLBACK_DEPTH),
+            tenants,
+        };
+        *self.state.write().expect("router state lock") = Arc::new(next);
+        Ok(())
+    }
+
+    fn state(&self) -> Arc<State> {
+        self.state.read().expect("router state lock").clone()
     }
 
     fn snapshot(&self) -> Arc<dyn ModelRegistry> {
-        self.registry.read().expect("registry lock").clone()
+        self.state().registry.clone()
+    }
+
+    /// The name of the strategy routing currently uses (tenant policies
+    /// aside).
+    pub fn strategy_name(&self) -> String {
+        self.state().strategy.name().to_string()
+    }
+
+    /// How many ranked tail entries currently become fallbacks.
+    pub fn fallback_depth(&self) -> usize {
+        self.state().fallback_depth
     }
 
     /// The state of every circuit breaker created so far, as
@@ -554,8 +620,11 @@ impl DefaultRouter {
                                     }
                                 }
                                 Some(Err(e)) => return Err(e),
+                                // An empty 2xx stream is a malformed answer:
+                                // nothing reached the caller, so the next
+                                // model may serve it.
                                 None if opening.is_empty() => {
-                                    return Err(GenAiError::Transport(
+                                    return Err(GenAiError::ResponseParse(
                                         "the provider closed the stream without sending anything"
                                             .into(),
                                     ))
@@ -680,9 +749,41 @@ impl DefaultRouter {
     }
 
     fn resolve_inner(&self, task: &Task) -> Result<(Route, RouteDecision), RouterError> {
-        let reg = self.snapshot();
+        let state = self.state();
+        let reg = state.registry.clone();
+        let policy = policy_for(
+            &state.tenants,
+            task.tenant.as_deref(),
+            self.require_tenant_policy,
+        )?;
+        let strategy: Arc<dyn RoutingStrategy> = policy
+            .and_then(TenantPolicy::strategy_arc)
+            .unwrap_or_else(|| state.strategy.clone());
+        let tenant_task;
+        let task = match policy.and_then(TenantPolicy::priority_override) {
+            Some(priority) if priority != task.priority => {
+                tenant_task = Task {
+                    priority,
+                    ..task.clone()
+                };
+                &tenant_task
+            }
+            _ => task,
+        };
 
         if let Some(pin) = &task.pin {
+            if let Some(policy) = policy {
+                if !policy.permits(&pin.provider, &pin.model) {
+                    return Err(RouterError::NoRoute {
+                        reason: format!(
+                            "tenant '{}' may not use the pinned model {}/{}",
+                            task.tenant.as_deref().unwrap_or_default(),
+                            pin.provider,
+                            pin.model
+                        ),
+                    });
+                }
+            }
             let est_cost = reg
                 .get(&pin.provider, &pin.model)
                 .map(|m| m.est_cost(task.est_input_tokens, task.output_estimate()))
@@ -714,7 +815,7 @@ impl DefaultRouter {
         let Ranking {
             candidates,
             mut excluded,
-        } = self.strategy.rank(task, reg.as_ref());
+        } = strategy.rank(task, reg.as_ref());
 
         // A completion can only be served by a chat/text model. Whatever the
         // strategy ranked, a model the registry knows to be embedding-only is
@@ -734,11 +835,25 @@ impl DefaultRouter {
                 _ => true,
             })
             .collect();
+        // A tenant policy narrows whatever the strategy ranked.
+        if let (Some(policy), Some(tenant)) = (policy, &task.tenant) {
+            candidates.retain(|c| {
+                let allowed = policy.permits(&c.provider, &c.model);
+                if !allowed {
+                    excluded.push(Exclusion {
+                        provider: c.provider.clone(),
+                        model: c.model.clone(),
+                        reason: format!("not allowed for tenant '{tenant}'"),
+                    });
+                }
+                allowed
+            });
+        }
         if candidates.is_empty() {
             return Err(RouterError::NoRoute {
                 reason: format!(
                     "no model satisfied the task (strategy: {})",
-                    self.strategy.name()
+                    strategy.name()
                 ),
             });
         }
@@ -763,10 +878,10 @@ impl DefaultRouter {
         let considered = candidates.clone();
         let mut iter = candidates.into_iter();
         let primary = iter.next().expect("non-empty");
-        let fallbacks: Vec<Candidate> = iter.take(self.fallback_depth).collect();
+        let fallbacks: Vec<Candidate> = iter.take(state.fallback_depth).collect();
 
         let decision = RouteDecision {
-            strategy: self.strategy.name().to_string(),
+            strategy: strategy.name().to_string(),
             chosen: primary.clone(),
             fallbacks: fallbacks.clone(),
             considered,
@@ -818,6 +933,9 @@ pub struct RouterBuilder {
     observer: Option<Arc<dyn GenAiObserver>>,
     budget: Option<Budget>,
     sticky_capacity: usize,
+    tenants: HashMap<String, TenantPolicy>,
+    config_tenants: Vec<(String, TenantPolicy)>,
+    require_tenant_policy: bool,
 }
 
 impl RouterBuilder {
@@ -829,18 +947,23 @@ impl RouterBuilder {
             strategy: None,
             retry: None,
             breakers: None,
-            fallback_depth: 2,
+            fallback_depth: DEFAULT_FALLBACK_DEPTH,
             fallback_on_timeout: false,
             observer: None,
             budget: None,
             sticky_capacity: 10_000,
+            tenants: HashMap::new(),
+            config_tenants: Vec::new(),
+            require_tenant_policy: false,
         }
     }
 
     /// Starts a builder from a routing configuration, applying **all** of it:
     /// the registry overlay (cost / rank overrides, disabled models and
     /// capabilities, custom models), the strategy named by `default_strategy`
-    /// with its `rules` and `default_model`, and `fallback_depth`.
+    /// with its `rules` and `default_model`, `fallback_depth` and the
+    /// `tenants` policies. [`DefaultRouter::reload_config`] applies a later
+    /// version of the same configuration.
     pub fn from_config(
         providers: ProviderSet,
         config: &RoutingConfig,
@@ -851,7 +974,30 @@ impl RouterBuilder {
         if let Some(depth) = config.fallback_depth {
             builder = builder.fallback_depth(depth);
         }
+        builder.config_tenants = config.tenant_policies()?;
         Ok(builder)
+    }
+
+    /// Registers the routing policy for `tenant` (see [`TenantPolicy`]). A
+    /// configured tenant of the same name (from
+    /// [`from_config`](Self::from_config) or a later
+    /// [`reload_config`](DefaultRouter::reload_config)) is laid over it:
+    /// each part the configuration sets (allow-list, strategy, priority)
+    /// replaces this policy's, and the parts it leaves out are kept.
+    pub fn tenant_policy(mut self, tenant: impl Into<String>, policy: TenantPolicy) -> Self {
+        self.tenants.insert(tenant.into(), policy);
+        self
+    }
+
+    /// Whether a task naming a tenant that has no policy is refused with
+    /// [`RouterError::NoRoute`] instead of being routed under the router's
+    /// defaults (default `false`). Turn it on when tenant names come from
+    /// requests, so a typo, a case difference or a tenant added before its
+    /// policy fails closed. A task without a tenant is routed as usual. The
+    /// setting survives [`reload_config`](DefaultRouter::reload_config).
+    pub fn require_tenant_policy(mut self, require: bool) -> Self {
+        self.require_tenant_policy = require;
+        self
     }
 
     /// Sets the routing strategy (default: [`CapabilityStrategy`]).
@@ -926,15 +1072,22 @@ impl RouterBuilder {
 
     /// Builds the router.
     pub fn build(self) -> DefaultRouter {
+        let tenants = merge_tenants(&self.tenants, self.config_tenants);
+        let strategy: Box<dyn RoutingStrategy> = self
+            .strategy
+            .unwrap_or_else(|| Box::new(CapabilityStrategy));
         DefaultRouter {
             providers: self.providers,
-            registry: RwLock::new(self.registry),
-            strategy: self
-                .strategy
-                .unwrap_or_else(|| Box::new(CapabilityStrategy)),
+            state: RwLock::new(Arc::new(State {
+                registry: self.registry,
+                strategy: Arc::from(strategy),
+                fallback_depth: self.fallback_depth,
+                tenants,
+            })),
+            code_tenants: self.tenants,
+            require_tenant_policy: self.require_tenant_policy,
             retry: self.retry,
             breakers: self.breakers,
-            fallback_depth: self.fallback_depth,
             fallback_on_timeout: self.fallback_on_timeout,
             shared: Shared {
                 observer: self.observer,

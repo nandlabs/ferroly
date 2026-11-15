@@ -132,8 +132,9 @@ pub use tokio::{join, pin, select, task_local, try_join};
 /// [`interval`](time::interval), and the [`Duration`](time::Duration) /
 /// [`Instant`](time::Instant) types.
 ///
-/// The paused test clock (`pause` / `advance` / `resume`) is not re-exported:
-/// it needs tokio's `test-util` feature, which normal builds do not enable.
+/// The paused test clock (`pause` / `advance` / `resume`) is re-exported only
+/// with the `rt-test-util` feature: it needs tokio's `test-util` feature, which
+/// normal builds should not enable, so turn it on under `[dev-dependencies]`.
 pub mod time {
     #[doc(no_inline)]
     pub use tokio::time::{

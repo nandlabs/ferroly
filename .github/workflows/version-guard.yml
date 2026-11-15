@@ -5,8 +5,11 @@ name: Version guard
 #      must agree.
 #   2. That version must not already be published as a `v<version>` git tag —
 #      otherwise the version needs bumping before merge.
-#   3. CHANGELOG.md must have a `## [<version>]` entry for that version.
-# PRs that change nothing under `crates/` are exempt (nothing is released).
+#   3. `.github/scripts/check-release-version.sh`, which tag-on-merge and
+#      publish.yml run too: both crates carry that version, ferroly requires
+#      ferroly-derive at it, and CHANGELOG.md has a `## [<version>]` entry.
+# PRs that change nothing under `crates/` or the root `Cargo.toml` are exempt
+# (nothing is released).
 on:
   pull_request:
     branches: [main]
@@ -23,17 +26,26 @@ jobs:
         with:
           fetch-depth: 0     # need full history + tags
           fetch-tags: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
 
       - name: Check versions and tag
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
 
-          # Only changes to the published crates are releases. A PR that touches
-          # nothing under `crates/` (CI, docs, the lockfile, Dependabot bumps)
-          # ships no new crate contents, so it needs no version bump.
-          BASE="origin/${{ github.base_ref }}"
-          if ! git diff --name-only "$BASE...HEAD" | grep -q '^crates/'; then
-            echo "No changes under crates/ — version guard skipped."
+          # Only changes to the published crates are releases. That is anything
+          # under `crates/`, and the root `Cargo.toml`, whose
+          # `[workspace.package]` and `[workspace.dependencies]` are inlined
+          # into both published manifests. A PR that touches neither (CI, docs,
+          # the lockfile, Dependabot bumps) ships no new crate contents, so it
+          # needs no version bump.
+          BASE="origin/$BASE_REF"
+          if ! git diff --name-only "$BASE...HEAD" | grep -qE '^(crates/|Cargo\.toml$)'; then
+            echo "No changes under crates/ or to the root Cargo.toml — version guard skipped."
             exit 0
           fi
 
@@ -68,12 +80,9 @@ jobs:
             exit 1
           fi
 
-          # 3) The CHANGELOG must document this version. Match "## [X.Y.Z]" with or
-          #    without a trailing date; "## [Unreleased]" does not count.
-          ESCAPED="$(printf '%s' "$CARGO_VERSION" | sed 's/\./\\./g')"
-          if ! grep -qE "^## \[${ESCAPED}\]([[:space:]]|$)" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md has no '## [$CARGO_VERSION]' entry — add release notes for this version before merging."
-            exit 1
-          fi
+          # 3) The release check that tag-on-merge and publish.yml run as well:
+          #    both crates and the derive requirement carry this version, and
+          #    CHANGELOG.md documents it ("## [Unreleased]" does not count).
+          bash .github/scripts/check-release-version.sh "$CARGO_VERSION"
 
           echo "OK: version $CARGO_VERSION is consistent, not yet tagged, and documented in CHANGELOG.md."

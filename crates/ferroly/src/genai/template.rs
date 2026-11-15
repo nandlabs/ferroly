@@ -1,5 +1,9 @@
 //! A small in-house template engine for prompts.
 //!
+//! This is a Handlebars-style syntax of its own. To run templates written in
+//! Jinja2, such as a model's `chat_template`, use `ferroly::template`
+//! (feature `template`).
+//!
 //! | Syntax | Meaning |
 //! |---|---|
 //! | `{{ name }}`, `{{ user.name }}` | substitute a variable (dot-path lookup) |

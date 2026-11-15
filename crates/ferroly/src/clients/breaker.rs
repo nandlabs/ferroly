@@ -217,6 +217,19 @@ struct Inner {
 }
 
 impl Inner {
+    fn metrics(&self) -> BreakerMetrics {
+        let s = self.lock();
+        BreakerMetrics {
+            state: s.circuit,
+            successes: s.total_successes,
+            failures: s.total_failures,
+            rejected: s.rejected,
+            trips: s.trips,
+            consecutive_failures: s.failures,
+            half_open_in_flight: s.probes.len() as u32,
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         // The state is plain counters, valid after any panic; do not let one
         // panicking caller disable the breaker for everyone.
@@ -546,16 +559,51 @@ impl CircuitBreaker {
 
     /// A snapshot of the breaker's counters.
     pub fn metrics(&self) -> BreakerMetrics {
-        let s = self.inner.lock();
-        BreakerMetrics {
-            state: s.circuit,
-            successes: s.total_successes,
-            failures: s.total_failures,
-            rejected: s.rejected,
-            trips: s.trips,
-            consecutive_failures: s.failures,
-            half_open_in_flight: s.probes.len() as u32,
-        }
+        self.inner.metrics()
+    }
+
+    /// Exports this breaker's [`metrics`](Self::metrics) to `registry` under
+    /// the label `breaker="{name}"`, refreshed on every scrape (feature
+    /// `metrics`; see the `clients` guide for the metric names).
+    ///
+    /// The registry holds only a weak reference: it does not keep the
+    /// breaker alive, and once the breaker is dropped its series are removed
+    /// at the next scrape, together with the collector itself, so exporting
+    /// many short-lived breakers leaves nothing behind. Call it once per
+    /// breaker and registry.
+    ///
+    /// `name` becomes the `breaker` label, so each exported name is one set
+    /// of series: give each live breaker its own name, and keep the names
+    /// bounded (do not derive them from arbitrary URLs or user input). Two
+    /// breakers exported under one name overwrite each other's values.
+    ///
+    /// ```
+    /// use ferroly::clients::{CircuitBreaker, CircuitBreakerConfig};
+    /// use ferroly::metrics::Registry;
+    ///
+    /// let registry = Registry::new();
+    /// let breaker = CircuitBreaker::new(CircuitBreakerConfig::default());
+    /// breaker.export_metrics(&registry, "payments");
+    /// breaker.on_execution(false);
+    /// let text = registry.encode();
+    /// assert!(text.contains("circuit_breaker_failures_total{breaker=\"payments\"} 1"));
+    /// assert!(text.contains("circuit_breaker_state{breaker=\"payments\"} 0"));
+    /// ```
+    #[cfg(feature = "metrics")]
+    pub fn export_metrics(&self, registry: &ferroly::metrics::Registry, name: &str) {
+        let inner = Arc::downgrade(&self.inner);
+        let name = name.to_string();
+        registry.register_collector_while(move |reg| match inner.upgrade() {
+            Some(inner) => {
+                export::record(reg, &name, &inner.metrics());
+                true
+            }
+            None => {
+                // Last run: remove the series, then the collector.
+                export::forget(reg, &name);
+                false
+            }
+        });
     }
 
     /// Asks to run one call. On admission returns a [`Permit`] to resolve
@@ -793,7 +841,8 @@ type Factory = Box<dyn Fn(&str) -> CircuitBreaker + Send + Sync>;
 /// [`clear`](Self::clear) yourself.
 pub struct CircuitBreakerRegistry {
     factory: Factory,
-    breakers: Mutex<HashMap<String, Arc<CircuitBreaker>>>,
+    /// Shared so that a metrics collector can hold it weakly.
+    breakers: Arc<Mutex<HashMap<String, Arc<CircuitBreaker>>>>,
 }
 
 impl fmt::Debug for CircuitBreakerRegistry {
@@ -831,7 +880,7 @@ impl CircuitBreakerRegistry {
     {
         CircuitBreakerRegistry {
             factory: Box::new(factory),
-            breakers: Mutex::new(HashMap::new()),
+            breakers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -883,6 +932,57 @@ impl CircuitBreakerRegistry {
         self.lock().is_empty()
     }
 
+    /// Exports the [`metrics`](CircuitBreaker::metrics) of every breaker in
+    /// this registry to `registry`, labelled `breaker="{key}"` and refreshed
+    /// on every scrape — including breakers created later (feature
+    /// `metrics`; see the `clients` guide for the metric names).
+    ///
+    /// The metrics registry holds only a weak reference: it keeps neither
+    /// this registry nor its breakers alive. The series of a breaker that is
+    /// [`remove`](Self::remove)d (or of every breaker, once this registry is
+    /// dropped) disappear at the next scrape. Call it once per registry pair.
+    ///
+    /// ```
+    /// use ferroly::clients::{CircuitBreakerConfig, CircuitBreakerRegistry};
+    /// use ferroly::metrics::Registry;
+    ///
+    /// let metrics = Registry::new();
+    /// let breakers = CircuitBreakerRegistry::new(CircuitBreakerConfig::default());
+    /// breakers.export_metrics(&metrics);
+    /// breakers.get("api.example.com").on_execution(true);
+    /// assert!(metrics
+    ///     .encode()
+    ///     .contains("circuit_breaker_successes_total{breaker=\"api.example.com\"} 1"));
+    /// ```
+    #[cfg(feature = "metrics")]
+    pub fn export_metrics(&self, registry: &ferroly::metrics::Registry) {
+        let map = Arc::downgrade(&self.breakers);
+        let exported = Mutex::new(std::collections::HashSet::<String>::new());
+        registry.register_collector(move |reg| {
+            // Copy the handles out first: no registry lock is held while the
+            // breakers are read.
+            let breakers: Vec<(String, Arc<CircuitBreaker>)> = match map.upgrade() {
+                Some(map) => map
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .map(|(key, breaker)| (key.clone(), breaker.clone()))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let mut exported = exported.lock().unwrap_or_else(|e| e.into_inner());
+            let mut current = std::collections::HashSet::with_capacity(breakers.len());
+            for (key, breaker) in breakers {
+                export::record(reg, &key, &breaker.metrics());
+                current.insert(key);
+            }
+            for key in exported.difference(&current) {
+                export::forget(reg, key);
+            }
+            *exported = current;
+        });
+    }
+
     /// The state of every breaker, sorted by key — for a health endpoint or
     /// periodic metrics.
     pub fn states(&self) -> Vec<(String, CircuitState)> {
@@ -893,6 +993,85 @@ impl CircuitBreakerRegistry {
             .collect();
         states.sort_by(|a, b| a.0.cmp(&b.0));
         states
+    }
+}
+
+/// Mirrors [`BreakerMetrics`] into a [`ferroly::metrics::Registry`].
+#[cfg(feature = "metrics")]
+mod export {
+    use ferroly::metrics::Registry;
+
+    use super::{BreakerMetrics, CircuitState};
+
+    const STATE: &str = "circuit_breaker_state";
+    const SUCCESSES: &str = "circuit_breaker_successes_total";
+    const FAILURES: &str = "circuit_breaker_failures_total";
+    const REJECTED: &str = "circuit_breaker_rejected_total";
+    const TRIPS: &str = "circuit_breaker_trips_total";
+    const CONSECUTIVE: &str = "circuit_breaker_consecutive_failures";
+    const IN_FLIGHT: &str = "circuit_breaker_half_open_in_flight";
+
+    /// `0` closed, `1` open, `2` half-open.
+    pub(super) fn state_code(state: CircuitState) -> i64 {
+        match state {
+            CircuitState::Closed => 0,
+            CircuitState::Open => 1,
+            CircuitState::HalfOpen => 2,
+        }
+    }
+
+    pub(super) fn record(reg: &Registry, name: &str, m: &BreakerMetrics) {
+        let labels = [("breaker", name)];
+        reg.gauge(
+            STATE,
+            "Circuit breaker state: 0 closed, 1 open, 2 half-open",
+            &labels,
+        )
+        .set(state_code(m.state));
+        reg.counter(
+            SUCCESSES,
+            "Calls the breaker recorded as successful",
+            &labels,
+        )
+        .set_total(m.successes);
+        reg.counter(FAILURES, "Calls the breaker recorded as failed", &labels)
+            .set_total(m.failures);
+        reg.counter(
+            REJECTED,
+            "Calls rejected because the breaker was open or out of trial slots",
+            &labels,
+        )
+        .set_total(m.rejected);
+        reg.counter(TRIPS, "Times the breaker tripped to open", &labels)
+            .set_total(m.trips);
+        reg.gauge(
+            CONSECUTIVE,
+            "The current run of consecutive failures (closed state)",
+            &labels,
+        )
+        .set(i64::from(m.consecutive_failures));
+        reg.gauge(
+            IN_FLIGHT,
+            "Trial calls in flight (half-open state)",
+            &labels,
+        )
+        .set(i64::from(m.half_open_in_flight));
+    }
+
+    /// Removes every series of breaker `name`.
+    pub(super) fn forget(reg: &Registry, name: &str) {
+        let labels = [("breaker", name)];
+        for family in [
+            STATE,
+            SUCCESSES,
+            FAILURES,
+            REJECTED,
+            TRIPS,
+            CONSECUTIVE,
+            IN_FLIGHT,
+        ] {
+            reg.remove(family, &labels);
+        }
     }
 }
 

@@ -39,7 +39,7 @@ pub enum StoreError {
 [dependencies]
 ferroly = "0.4"                       # errutils + codec are the defaults
 # or, explicitly / minimally:
-ferroly = { version = "0.5", default-features = false, features = ["errutils"] }
+ferroly = { version = "0.6", default-features = false, features = ["errutils"] }
 ```
 
 ## Quick start
@@ -277,6 +277,15 @@ Implementations provided:
 | `ferroly::Error` | delegates to the wrapped module error — see below |
 | `ConfigError`, `CliError` | `InvalidInput` (see [config](config.md), [cli](cli.md)) |
 | `rest::ClientError` | by cause: a timeout is `Timeout`, an open breaker `Unavailable`, a `Status` error by its HTTP status, a bad request `InvalidInput` (see [rest](rest.md)) |
+| `http::HttpError` | `InvalidInput` for a bad URL, `Timeout` for a request or connect timeout, `Internal` for a panicked handler, the I/O kind for an I/O failure. An HTTP/2 failure maps by its `Http2Cause`: `Timeout` for a timer, the I/O kind for an I/O failure, `Internal` for a protocol violation; for a reset this side made itself (`LocalReset`), `Unavailable` when it refused the stream, `Internal` when a handler failed, `Unknown` when it just gave the stream up; `Unavailable` for anything else (a reset, refusal, GOAWAY, close or local limit) |
+| `vfs::VfsError` | by variant (`NotFound`, `PermissionDenied`, `Conflict`, `Unavailable`, …), the I/O kind for an I/O failure |
+| `genai::GenAiError` | by variant, and by HTTP status for provider responses |
+| `auth::JwtError` | `Unauthenticated` for a rejected token; `Unavailable` for a failed key-set fetch, `InvalidInput` for a too-short secret, `Internal` for an unusable key or JWK, `Unsupported` without a crypto provider; `Unknown` for a variant added later |
+| `ws::WsError` | `Timeout` for a timeout, the HTTP status's kind for a rejected upgrade, `Internal` for a protocol error (the application asked for something RFC 6455 forbids), `Unavailable` when the connection failed, closed or its queue is full; `Unknown` for a variant added later |
+| `messaging::MessagingError` | by variant; see the `Messaging` bullet below |
+
+Each module type answers the same whether you classify it directly or after `?` has
+turned it into a `ferroly::Error`, which simply delegates.
 
 A boxed `dyn Error` cannot be asked for its kind, which is why wrappers answer
 `Unknown` unless they find an error type they recognise.
@@ -304,6 +313,7 @@ per enabled module error, so a function touching several modules can return
 | `Messaging` | `messaging::MessagingError` | `messaging` |
 | `VectorStore` | `vectorstore::VectorStoreError` | `vectorstore` |
 | `Vfs` | `vfs::VfsError` | `vfs` |
+| `Sig` | `sig::SigError` | `sig` |
 | `Cli` | `cli::CliError` | `cli` |
 | `Join` | `rt::JoinError` | `rt` |
 | `Multi` | `errutils::MultiError` | `errutils` |
@@ -314,19 +324,29 @@ the category is unambiguous and `Unknown` otherwise:
 
 - `Codec` → `InvalidInput` (`Unsupported` for an unknown content type); `Config`
   and `Cli` → their own classification; `Param` → `InvalidInput`.
-- `Auth` → `Unauthenticated`; `Breaker` and `Ws` → `Unavailable`.
-- `Http` → `InvalidInput` for a bad URL, `Timeout` for a timeout, the I/O kind for
-  an I/O failure; `Rest` → `InvalidInput` for an invalid request, otherwise the
+- `Auth` → `Unauthenticated` for a rejected token (`Unavailable` when the key set
+  could not be fetched, `InvalidInput` for a too-short secret, `Unsupported` with no
+  crypto provider); `Breaker` → `Unavailable`; `Ws` → `Timeout` for a timeout, the
+  HTTP status's kind for a rejected upgrade, otherwise `Unavailable`.
+- `Http` → `InvalidInput` for a bad URL, `Timeout` for a request or connect timeout,
+  `Internal` for a panicked handler, the I/O kind for an I/O failure; `Rest` → `InvalidInput` for an invalid request, otherwise the
   kind of the HTTP error underneath.
 - `GenAi` → by variant, and by HTTP status for provider responses (`401` →
   `Unauthenticated`, `429` → `RateLimited`, `5xx` → `Unavailable`, other `4xx` →
   `InvalidInput`); `Router` → `Timeout` for an exceeded deadline, `InvalidInput`
   for configuration problems, otherwise the kind of the provider error underneath.
 - `Lifecycle` → `NotFound` / `Conflict` / `InvalidInput` / `Timeout` by variant;
-  `Vfs` → `NotFound` / `PermissionDenied` / `InvalidInput` / `Unsupported` by
-  variant, the I/O kind for an I/O failure; `Fs` → the I/O kind for an I/O failure.
-- `Messaging` → `Unavailable` for a full buffer; `VectorStore` → `InvalidInput`
-  for a dimension mismatch; `Join` → `Internal` for a panicked task.
+  `Vfs` → `NotFound` / `PermissionDenied` / `InvalidInput` / `Unsupported` /
+  `Conflict` / `Unavailable` / `Timeout` / `Unauthenticated` by variant, the I/O
+  kind for an I/O failure; `Fs` → the I/O kind for an I/O failure.
+- `Messaging` → `Unavailable` for a full buffer, a send timeout, a closed
+  provider or a transient backend failure or refusal; `NotFound` for no
+  listeners; `Timeout` for a request timeout; `InvalidInput` for a bad address or
+  options; `Unsupported` for an unsupported operation. `VectorStore` →
+  `InvalidInput` for a dimension mismatch; `Join` → `Internal` for a panicked task.
+- `Sig` → `Unauthenticated` for a signature that does not verify or is
+  malformed (a tampered signature can be either, depending on the bits that
+  changed), `InvalidInput` for a malformed key or context.
 - `Multi`, `Context` → as described above.
 
 ```rust
@@ -356,8 +376,9 @@ one error was collected.
   `chain()` if you need the concrete type back.
 - **No backtraces** — `ContextError` records messages, not a stack trace.
 - **Classification is coarse and opt-in** — only the types listed above implement
-  `Classify`; the individual module error enums do not yet, so classify through
-  `ferroly::Error` or implement the trait for your own types.
+  `Classify`. Module errors not in the table (`codec::CodecError`,
+  `lifecycle::LifecycleError`, `genai::RouterError`, `store::StoreError`, …) classify
+  through `ferroly::Error`; implement the trait for your own types.
 - **No deduplication** — pushing the same error twice stores it twice.
 
 ## See also

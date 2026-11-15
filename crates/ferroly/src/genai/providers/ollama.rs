@@ -6,8 +6,9 @@ use ferroly::codec::{json, Value};
 use ferroly::hash::base64;
 
 use super::common::{
-    f32_num, merge_custom, num_f32, obj, s, stream_failure, tool_result_text, u32_field, ErrorHint,
-    HttpCore, ProviderFailure,
+    check_image_mime, document_text, f32_num, merge_custom, mime_essence, num_f32, obj, s,
+    stream_failure, tool_result_text, u32_field, unsupported_document, ErrorHint, HttpCore,
+    ProviderFailure,
 };
 use super::sse::{Framing, StreamParser};
 use super::ProviderOptions;
@@ -256,7 +257,7 @@ fn build_body(request: &CompletionRequest, stream: bool) -> Result<Value, GenAiE
         messages.push(obj([("role", s("system")), ("content", s(sys))]));
     }
     for (position, message) in request.messages.iter().enumerate() {
-        encode_message(message, &request.messages[..position], &mut messages);
+        encode_message(message, &request.messages[..position], &mut messages)?;
     }
 
     let o = &request.options;
@@ -346,14 +347,32 @@ fn tool_name_for<'a>(call_id: &str, earlier: &'a [Message]) -> Option<&'a str> {
 /// - every tool result becomes `{role: "tool", content, tool_name}`;
 /// - an assistant message with tool calls carries
 ///   `tool_calls: [{function: {name, arguments: <object>}}]`;
-/// - images go in `images` as base64 strings.
-fn encode_message(msg: &Message, earlier: &[Message], out: &mut Vec<Value>) {
+/// - images go in `images` as base64 strings;
+/// - a text document joins the message text; Ollama has no other document
+///   input, so any other document (a PDF) is refused.
+fn encode_message(
+    msg: &Message,
+    earlier: &[Message],
+    out: &mut Vec<Value>,
+) -> Result<(), GenAiError> {
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut images: Vec<Value> = Vec::new();
+    let mut documents: Vec<&str> = Vec::new();
     let mut has_result = false;
     for part in &msg.parts {
         match part {
-            MessagePart::Image { data, .. } => images.push(s(&base64::encode(data))),
+            MessagePart::Image { data, mime_type } => {
+                check_image_mime(mime_type)?;
+                images.push(s(&base64::encode(data)));
+            }
+            MessagePart::Document {
+                data, mime_type, ..
+            } => {
+                if !mime_essence(mime_type).starts_with("text/") {
+                    return Err(unsupported_document(PROVIDER, mime_type));
+                }
+                documents.push(document_text(data, mime_type)?);
+            }
             MessagePart::ToolCall {
                 name, arguments, ..
             } => {
@@ -380,9 +399,15 @@ fn encode_message(msg: &Message, earlier: &[Message], out: &mut Vec<Value>) {
             _ => {}
         }
     }
-    let text = msg.text_content();
+    let mut text = msg.text_content();
+    for document in documents {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(document);
+    }
     if has_result && text.is_empty() && tool_calls.is_empty() && images.is_empty() {
-        return;
+        return Ok(());
     }
     let role = if has_result && msg.role == Role::Tool {
         "user"
@@ -400,6 +425,7 @@ fn encode_message(msg: &Message, earlier: &[Message], out: &mut Vec<Value>) {
         fields.push(("tool_calls".to_string(), Value::Array(tool_calls)));
     }
     out.push(Value::Object(fields));
+    Ok(())
 }
 
 /// Reads the tool calls of an Ollama message as `(id, name, arguments)`.
@@ -682,7 +708,7 @@ mod tests {
         let mut out = Vec::new();
         OllamaStream::default().on_data(None, "{\"error\":\"model crashed\"}", &mut out);
         assert!(
-            matches!(&out[0], Err(GenAiError::Api { status: 500, message }) if message == "model crashed")
+            matches!(&out[0], Err(GenAiError::Api { status: 500, message, .. }) if message == "model crashed")
         );
     }
 }

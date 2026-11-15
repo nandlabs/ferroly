@@ -1,0 +1,93 @@
+name: Interop
+
+# Conformance and interop against third-party implementations:
+#   - h2spec, the HTTP/2 conformance suite, against examples/h2spec_server.rs;
+#   - grpc-go (interop/grpc-go), both directions, against examples/grpc_interop.rs;
+#   - Go's net/http client (interop/go-http, standard library only) against
+#     examples/h2spec_server.rs: sustained traffic and concurrent uploads.
+#
+# All three are required: a conformance or interop regression fails CI.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  h2spec:
+    name: h2spec (HTTP/2 conformance)
+    runs-on: ubuntu-latest
+    env:
+      H2SPEC_VERSION: v2.6.0
+      # SHA-256 of h2spec_linux_amd64.tar.gz from the release above. The
+      # project publishes no checksums; this one was taken when the version
+      # was pinned. Update both together.
+      H2SPEC_SHA256: 157ee0de702e01ad40e752dbf074b366027e550c8e7504f9450da2809e279318
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install h2spec (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/h2spec"
+          mkdir -p "$dir"
+          curl -sSfL -o "$dir/h2spec.tar.gz" \
+            "https://github.com/summerwind/h2spec/releases/download/${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz"
+          echo "${H2SPEC_SHA256}  $dir/h2spec.tar.gz" | sha256sum -c -
+          tar -xzf "$dir/h2spec.tar.gz" -C "$dir" h2spec
+          echo "H2SPEC=$dir/h2spec" >> "$GITHUB_ENV"
+      - name: Run h2spec
+        run: ./interop/h2spec.sh -j "$RUNNER_TEMP/h2spec-report.xml"
+      - name: Upload the h2spec report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: h2spec-report
+          path: ${{ runner.temp }}/h2spec-report.xml
+          if-no-files-found: ignore
+
+  grpc-go:
+    name: grpc-go interop (both directions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: interop/grpc-go/go.mod
+          cache-dependency-path: interop/grpc-go/go.sum
+      # go.sum pins every module by hash; -mod=readonly fails instead of
+      # silently changing it.
+      - name: Run the interop checks
+        env:
+          GOFLAGS: -mod=readonly
+        run: ./interop/grpc-go.sh
+
+  go-http:
+    name: Go net/http interop (HTTP/2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: interop/go-http/go.mod
+          # Standard library only: there is no go.sum and nothing to cache.
+          cache: false
+      - name: Run the interop checks
+        run: ./interop/go-http.sh

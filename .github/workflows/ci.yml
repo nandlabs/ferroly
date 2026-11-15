@@ -18,8 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: rustfmt
@@ -36,20 +37,37 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build (default features)
         run: cargo build -p ferroly
       - name: Test (all features)
         run: cargo test -p ferroly --features full
+      # Wipe-on-drop stores are what an optimiser removes as dead, so check
+      # them in an optimised build too.
+      - name: Test secret wiping (release)
+        run: cargo test -p ferroly --release --no-default-features --features hash --test hash_wipe
+      # The Windows FFI (`extern "system"`, pointer-sized struct fields) is
+      # where 32-bit differs: x86 is the one Windows target whose calling
+      # convention is not the C one. Check the modules that hold it there.
+      - name: Check the Windows FFI on 32-bit (i686-pc-windows-msvc)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add i686-pc-windows-msvc
+          cargo check -p ferroly --target i686-pc-windows-msvc --no-default-features --features fsutils,hash,metrics --locked
 
   features:
     name: Feature isolation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
         with:
+          toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # Every feature must lint cleanly on its own — library, tests and examples.
@@ -87,12 +105,44 @@ jobs:
       - name: Test (derive crate)
         run: cargo test -p ferroly-derive
 
+  workflow-tests:
+    name: Release workflow tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Runs the shell in the release workflows (publish, tag-on-merge,
+      # crates.io drift) against throwaway git repositories and a mock
+      # crates.io / GitHub API on 127.0.0.1: no network, no credentials.
+      # Only needed when something under `.github/` changed.
+      - name: Test the release workflows
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) base="$(git merge-base "origin/$BASE_REF" HEAD 2>/dev/null || true)" ;;
+            *) base="$BEFORE" ;;
+          esac
+          if [ -n "$base" ] && ! [[ "$base" =~ ^0+$ ]] && git cat-file -e "$base^{commit}" 2>/dev/null \
+            && git diff --quiet "$base" HEAD -- .github; then
+            echo "Nothing under .github/ changed; skipping."
+            exit 0
+          fi
+          python3 -I .github/tests/test_publish_workflows.py .
+
   dependency-budget:
     name: Dependency budget
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
       # The project's defining rule: the only direct runtime dependencies are
       # tokio, the rustls TLS family, and ferroly's own derive crate. A new direct
       # dependency must be a deliberate decision, so it fails here first.
@@ -106,7 +156,9 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo doc --no-deps -p ferroly --features full
 
@@ -119,22 +171,82 @@ jobs:
       RUSTUP_TOOLCHAIN: "1.75.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@1.75.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: "1.75.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # `--locked` fails loudly if Cargo.lock drifts to a version that raises the
       # MSRV (e.g. a transitive dep jumping to edition 2024) instead of silently
       # re-resolving. Keep transitive deps pinned to 1.75-compatible versions.
       - run: cargo build -p ferroly --features full --locked
+      # The dev-dependencies (tokio only) build on 1.75 too, so the whole
+      # suite runs on the MSRV: a std API newer than 1.75 used only by a test
+      # or a doc example fails here.
+      - name: Test on the MSRV (all features)
+        run: cargo test -p ferroly --features full --locked
+
+  i686:
+    name: 32-bit (i686-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # `ring` (the default TLS crypto provider) compiles C for the target.
+      - name: Install a 32-bit C toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-multilib
+      # `unsafe` lives in four audited places, all behind these features:
+      # `fsutils` (the mmap and file-lock FFI), `hash` (the OS random source)
+      # and `metrics` (the process-statistics FFI). Check them alone, then
+      # `full`, which covers every usize/u64 conversion in the crate.
+      - name: Check the unsafe modules
+        run: cargo check -p ferroly --target i686-unknown-linux-gnu --no-default-features --features fsutils,hash,metrics --locked
+      - name: Check all features
+        run: cargo check -p ferroly --target i686-unknown-linux-gnu --features full --all-targets --locked
+
+  rt-consumer:
+    name: rt without a tokio dependency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ci/rt-consumer
+      # `ci/rt-consumer` depends on `ferroly` (feature `rt`) and nothing else.
+      # Its async tests use `#[ferroly::rt::test]`, `#[ferroly::rt::main]` and
+      # `async_test!`, which must work without the user adding tokio.
+      - name: Test the tokio-free consumer crate
+        run: |
+          set -euo pipefail
+          # Resolve against the workspace's pinned versions.
+          cp Cargo.lock ci/rt-consumer/Cargo.lock
+          deps="$(cargo tree --manifest-path ci/rt-consumer/Cargo.toml -e normal,dev,build --depth 1 --prefix none \
+            | tail -n +2 | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+          if [ "$deps" != "ferroly" ]; then
+            echo "::error::ci/rt-consumer must depend on ferroly only; found: $deps"
+            exit 1
+          fi
+          cargo test --manifest-path ci/rt-consumer/Cargo.toml
+          cargo run --manifest-path ci/rt-consumer/Cargo.toml
 
   coverage:
     name: Coverage (llvm-cov)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
         with:
+          toolchain: stable
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Measure coverage
         run: cargo llvm-cov -p ferroly --features full --summary-only

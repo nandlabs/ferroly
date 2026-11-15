@@ -1,0 +1,32 @@
+// The common proto2 subset.
+syntax = "proto2";
+
+package sample.legacy;
+
+enum Status {
+  option allow_alias = true;
+  STATUS_UNKNOWN = 0;
+  STATUS_STARTED = 1;
+  STATUS_RUNNING = 1;
+  STATUS_DONE = 2;
+}
+
+message Job {
+  required int64 id = 1;
+  optional string owner = 2;
+  repeated int32 attempts = 3;
+  repeated int32 packed_attempts = 4 [packed = true];
+  optional Status status = 5 [default = STATUS_STARTED];
+  optional Job parent = 6;
+  required Detail detail = 7;
+
+  message Detail {
+    optional bytes blob = 1;
+  }
+
+  extensions 100 to 199;
+}
+
+extend Job {
+  optional string note = 100;
+}

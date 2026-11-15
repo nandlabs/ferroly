@@ -1,4 +1,5 @@
 #![cfg(feature = "auth")]
+#![allow(deprecated)] // deliberately exercises the legacy JWT API alongside the new one
 //! HMAC JWTs (HS256 / HS384 / HS512): known answers, strict parsing (no token
 //! malleability), secret handling and the `Validation` policy.
 
@@ -493,13 +494,15 @@ fn signature_must_match_exactly() {
 #[test]
 fn empty_and_short_secrets_are_rejected() {
     let claims = claims_with(vec![]);
-    assert_eq!(MIN_SECRET_LEN, 16);
+    assert_eq!(MIN_SECRET_LEN, 32);
     assert_eq!(Algorithm::Hs256.recommended_secret_len(), Some(32));
     assert_eq!(Algorithm::Hs384.recommended_secret_len(), Some(48));
     assert_eq!(Algorithm::Hs512.recommended_secret_len(), Some(64));
 
-    // Empty: rejected everywhere it can be reported.
+    // Empty: rejected everywhere, including by the legacy encoder, which
+    // returns no token at all rather than a forgeable one.
     let empty_signed = encode_hs256(&claims, b"");
+    assert_eq!(empty_signed, "");
     assert_eq!(decode_hs256(&empty_signed, b""), Err(JwtError::WeakSecret));
     assert_eq!(
         decode_hs256_with(&empty_signed, b"", &at_now()),
@@ -510,11 +513,46 @@ fn empty_and_short_secrets_are_rejected() {
         Err(JwtError::WeakSecret)
     );
 
-    // The validating API enforces the hard minimum of 16 bytes.
+    // The validating API enforces the RFC 7518 §3.2 minimum per algorithm:
+    // the hash output size (32 / 48 / 64 bytes).
+    for (alg, min) in [
+        (Algorithm::Hs256, 32),
+        (Algorithm::Hs384, 48),
+        (Algorithm::Hs512, 64),
+    ] {
+        assert_eq!(alg.min_secret_len(), Some(min));
+        let short = vec![b'k'; min - 1];
+        let exact = vec![b'k'; min];
+        assert_eq!(
+            encode_hmac(alg, &claims, &short),
+            Err(JwtError::WeakSecret),
+            "{alg}"
+        );
+        let token = encode_hmac(alg, &claims, &exact).unwrap();
+        assert!(
+            decode_hmac_with(alg, &token, &exact, &at_now()).is_ok(),
+            "{alg}"
+        );
+        assert_eq!(
+            decode_hmac_with(alg, &token, &short, &at_now()),
+            Err(JwtError::WeakSecret),
+            "{alg}"
+        );
+        // The minimum of a longer hash is not satisfied by a shorter one's.
+        if min > 32 {
+            assert_eq!(
+                encode_hmac(alg, &claims, &[b'k'; 32]),
+                Err(JwtError::WeakSecret),
+                "{alg}"
+            );
+        }
+    }
+    assert_eq!(Algorithm::Rs256.min_secret_len(), None);
+    // 16 bytes, the old floor, is no longer enough for anything.
     let fifteen = b"123456789012345";
     let sixteen = b"1234567890123456";
     assert_eq!(
-        encode_hmac(Algorithm::Hs256, &claims, fifteen),
+        encode_hmac(Algorithm::Hs256, &claims, sixteen),
         Err(JwtError::WeakSecret)
     );
     let short_signed = encode_hs256(&claims, fifteen);
@@ -522,20 +560,7 @@ fn empty_and_short_secrets_are_rejected() {
         decode_hs256_with(&short_signed, fifteen, &at_now()),
         Err(JwtError::WeakSecret)
     );
-    let token = encode_hmac(Algorithm::Hs256, &claims, sixteen).unwrap();
-    assert!(decode_hs256_with(&token, sixteen, &at_now()).is_ok());
-    for alg in [Algorithm::Hs384, Algorithm::Hs512] {
-        assert_eq!(
-            encode_hmac(alg, &claims, fifteen),
-            Err(JwtError::WeakSecret)
-        );
-        let token = encode_hmac(alg, &claims, sixteen).unwrap();
-        assert!(decode_hmac_with(alg, &token, sixteen, &at_now()).is_ok());
-        assert_eq!(
-            decode_hmac_with(alg, &token, fifteen, &at_now()),
-            Err(JwtError::WeakSecret)
-        );
-    }
+    let _ = sixteen;
 
     // The original entry point only refuses the empty secret.
     assert!(decode_hs256(&short_signed, fifteen).is_ok());
@@ -1005,12 +1030,24 @@ fn algorithm_names_round_trip() {
         Algorithm::Hs384,
         Algorithm::Hs512,
         Algorithm::Rs256,
+        Algorithm::Rs384,
+        Algorithm::Rs512,
+        Algorithm::Ps256,
+        Algorithm::Ps384,
+        Algorithm::Ps512,
         Algorithm::Es256,
+        Algorithm::Es384,
+        Algorithm::Es512,
+        Algorithm::EdDsa,
     ] {
         assert_eq!(Algorithm::from_name(alg.as_str()), Some(alg));
         assert_eq!(alg.to_string(), alg.as_str());
+        assert_eq!(alg.is_hmac(), alg.as_str().starts_with("HS"));
     }
-    for unknown in ["none", "hs256", "HS256 ", "PS256", "EdDSA", ""] {
+    assert_eq!(Algorithm::EdDsa.as_str(), "EdDSA");
+    for unknown in [
+        "none", "hs256", "HS256 ", "ps256", "EDDSA", "Ed25519", "ES256K", "",
+    ] {
         assert_eq!(Algorithm::from_name(unknown), None);
     }
 }

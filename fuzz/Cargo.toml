@@ -17,8 +17,13 @@ libfuzzer-sys = "0.4"
 path = "../crates/ferroly"
 default-features = false
 # `genai` is needed only by the `template_render` target (the prompt-template
-# renderer lives in that module).
-features = ["codec", "genai"]
+# renderer lives in that module); `protobuf` only by `proto_decode`;
+# `http2` only by `h2_frames` and `h2_conn`.
+# `sig` is needed only by the `ed25519_verify` and `ed25519_structured` targets.
+# `grpc` only by `grpc_frames`.
+# `store-oci` only by `www_authenticate`.
+# `template` only by `template_jinja`.
+features = ["codec", "genai", "sig", "protobuf", "http2", "grpc", "store-oci", "template"]
 
 [[bin]]
 name = "json_parse"
@@ -51,6 +56,69 @@ bench = false
 [[bin]]
 name = "template_render"
 path = "fuzz_targets/template_render.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "regex_match"
+path = "fuzz_targets/regex_match.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ed25519_verify"
+path = "fuzz_targets/ed25519_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ed25519_structured"
+path = "fuzz_targets/ed25519_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_decode"
+path = "fuzz_targets/proto_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_frames"
+path = "fuzz_targets/h2_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_conn"
+path = "fuzz_targets/h2_conn.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grpc_frames"
+path = "fuzz_targets/grpc_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "www_authenticate"
+path = "fuzz_targets/www_authenticate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "template_jinja"
+path = "fuzz_targets/template_jinja.rs"
 test = false
 doc = false
 bench = false

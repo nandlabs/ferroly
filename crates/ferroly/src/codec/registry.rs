@@ -3,7 +3,9 @@
 //! The format set is a closed [`Format`] enum dispatched by `match`, so these
 //! are free functions — there is no state to carry.
 
-use ferroly::codec::{json, toml, xml, yaml, CodecError, Decode, Encode, Limits};
+use ferroly::codec::{
+    from_value_strict, json, toml, xml, yaml, CodecError, Decode, Encode, Limits, Value,
+};
 
 /// An encoding format supported by the content-type dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -12,7 +14,7 @@ pub enum Format {
     Json,
     /// Extensible Markup Language (pragmatic subset).
     Xml,
-    /// YAML Ain't Markup Language (block-style subset).
+    /// YAML Ain't Markup Language (the subset described in [`yaml`](super::yaml)).
     Yaml,
     /// Tom's Obvious Minimal Language (config subset).
     Toml,
@@ -49,6 +51,34 @@ impl Format {
             Some(Format::Toml)
         } else {
             None
+        }
+    }
+
+    /// Decodes `T` from a [`Value`] this format already parsed, with the
+    /// format's scalar rules: strict ([`from_value_strict`]) for JSON and
+    /// TOML, lenient ([`Decode::decode`]) for XML and YAML — the same rules
+    /// [`decode`] applies to the bytes. Use it to decode a body that was
+    /// parsed once into a `Value` (to validate it, say) without parsing it
+    /// again.
+    ///
+    /// ```
+    /// use ferroly::codec::{json, Format};
+    ///
+    /// let value = json::from_str(r#"{"port":"8080"}"#).unwrap();
+    /// // JSON is typed: a string is not a number.
+    /// assert!(Format::Json.decode_value::<std::collections::BTreeMap<String, u16>>(&value).is_err());
+    /// // YAML is lenient.
+    /// let map: std::collections::BTreeMap<String, u16> = Format::Yaml.decode_value(&value).unwrap();
+    /// assert_eq!(map["port"], 8080);
+    /// ```
+    ///
+    /// Integer literals wider than 64 bits are already a rounded float in a
+    /// `Value`, so an `i128` / `u128` field rejects them here; `json::decode`
+    /// reads such a literal exactly.
+    pub fn decode_value<T: Decode>(self, value: &Value) -> Result<T, CodecError> {
+        match self {
+            Format::Json | Format::Toml => from_value_strict(value),
+            Format::Xml | Format::Yaml => T::decode(value),
         }
     }
 }

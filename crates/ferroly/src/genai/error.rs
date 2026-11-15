@@ -109,20 +109,42 @@ pub enum GenAiError {
         capability: ferroly::genai::Capability,
     },
 
-    /// The provider's HTTP transport failed (connection refused or reset, TLS
-    /// failure, malformed response, oversized body).
+    /// The provider's HTTP transport failed **after the connection was
+    /// established** (connection reset mid-exchange, malformed or oversized
+    /// response). The request may have reached the provider and been
+    /// processed — and billed — so it is not retried.
     #[error("transport error: {0}")]
     Transport(String),
 
+    /// No connection to the provider could be established (connection
+    /// refused, name resolution failure, unreachable network, TLS handshake
+    /// or proxy `CONNECT` failure). **Nothing was sent**, so the call is safe
+    /// to repeat.
+    #[error("could not connect to the provider: {0}")]
+    Connect(String),
+
     /// The provider returned a non-success HTTP status that has no more
     /// specific variant.
+    ///
+    /// `#[non_exhaustive]`: build one with [`GenAiError::api`] (plus
+    /// [`with_error_type`](GenAiError::with_error_type) /
+    /// [`with_retry_after`](GenAiError::with_retry_after)) and match it with
+    /// `GenAiError::Api { status, .. }`.
     #[error("provider returned status {status}: {message}")]
+    #[non_exhaustive]
     Api {
         /// The HTTP status code.
         status: u16,
         /// The provider's error message (truncated), prefixed with the
         /// provider's error type when it sent one.
         message: String,
+        /// The provider's machine-readable error type or code, when its
+        /// error body carried one (`invalid_request_error`, `not_found_error`,
+        /// `server_error`, …).
+        error_type: Option<String>,
+        /// The delay the provider asked for (`Retry-After` /
+        /// `retry-after-ms`), if any.
+        retry_after: Option<Duration>,
     },
 
     /// The provider's response could not be parsed into the normalized shape.
@@ -196,6 +218,49 @@ pub enum GenAiError {
 }
 
 impl GenAiError {
+    /// An [`Api`](GenAiError::Api) error with no error type and no retry
+    /// delay.
+    pub fn api(status: u16, message: impl Into<String>) -> GenAiError {
+        GenAiError::Api {
+            status,
+            message: message.into(),
+            error_type: None,
+            retry_after: None,
+        }
+    }
+
+    /// Sets the provider's error type on an [`Api`](GenAiError::Api) error;
+    /// any other variant is returned unchanged.
+    pub fn with_error_type(mut self, kind: impl Into<String>) -> GenAiError {
+        if let GenAiError::Api { error_type, .. } = &mut self {
+            *error_type = Some(kind.into());
+        }
+        self
+    }
+
+    /// Sets the requested retry delay on an [`Api`](GenAiError::Api),
+    /// [`RateLimited`](GenAiError::RateLimited) or
+    /// [`Overloaded`](GenAiError::Overloaded) error; any other variant is
+    /// returned unchanged.
+    pub fn with_retry_after(mut self, delay: Duration) -> GenAiError {
+        match &mut self {
+            GenAiError::Api { retry_after, .. }
+            | GenAiError::RateLimited { retry_after, .. }
+            | GenAiError::Overloaded { retry_after, .. } => *retry_after = Some(delay),
+            _ => {}
+        }
+        self
+    }
+
+    /// The provider's machine-readable error type, when the error came from
+    /// an [`Api`](GenAiError::Api) response that carried one.
+    pub fn error_type(&self) -> Option<&str> {
+        match self {
+            GenAiError::Api { error_type, .. } => error_type.as_deref(),
+            _ => None,
+        }
+    }
+
     /// The HTTP status behind this error, when it came from an HTTP response.
     pub fn status(&self) -> Option<u16> {
         match self {
@@ -211,7 +276,8 @@ impl GenAiError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             GenAiError::RateLimited { retry_after, .. }
-            | GenAiError::Overloaded { retry_after, .. } => *retry_after,
+            | GenAiError::Overloaded { retry_after, .. }
+            | GenAiError::Api { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -229,6 +295,7 @@ impl GenAiError {
             GenAiError::TemplateNotFound(_) => "template_not_found",
             GenAiError::Unsupported { .. } => "unsupported",
             GenAiError::Transport(_) => "transport",
+            GenAiError::Connect(_) => "connect",
             GenAiError::Api { .. } => "api",
             GenAiError::ResponseParse(_) => "response_parse",
             GenAiError::Config(_) => "config",
@@ -261,16 +328,22 @@ impl GenAiError {
     ///
     /// | Error | Retry | Breaker |
     /// |---|---|---|
-    /// | `Transport`, `Timeout { Connect }`, `Api` `408`/`409`/`5xx` | yes | failure |
+    /// | `Connect`, `Timeout { Connect }` | yes | failure |
+    /// | `Api` `408`/`409`/`429`/`5xx` | yes, after `retry_after` when given | failure |
     /// | `RateLimited`, `Overloaded` | yes, after `retry_after` when given | failure |
-    /// | `Timeout { Response \| StreamIdle }`, `ResponseParse` | **no** | failure |
+    /// | `Transport`, `Timeout { Response \| StreamIdle }`, `ResponseParse` | **no** | failure |
     /// | other `Api` `4xx`, `Auth`, `ContentFilter`, `ContextLengthExceeded`, `Config`, `Template*`, `Unsupported` | no | ignored |
     ///
-    /// A response or stream-idle timeout is not retried because a completion is
-    /// not idempotent: the provider may have produced (and billed) the answer.
+    /// A transport failure after the connection was up, and a response or
+    /// stream-idle timeout, are not retried because a completion is not
+    /// idempotent: the provider may have produced (and billed) the answer.
+    /// Only failures where nothing was sent ([`Connect`](GenAiError::Connect),
+    /// a connect timeout) and explicit refusals by the provider (a `5xx`,
+    /// `429` or overload answer) are retried.
     pub fn error_class(&self) -> ErrorClass {
         match self {
-            GenAiError::Transport(_) => ErrorClass::transient(),
+            GenAiError::Connect(_) => ErrorClass::transient(),
+            GenAiError::Transport(_) => ErrorClass::fatal(),
             GenAiError::Timeout { phase } => match phase {
                 TimeoutPhase::Connect => ErrorClass::transient(),
                 _ => ErrorClass::fatal(),
@@ -280,8 +353,13 @@ impl GenAiError {
                 Some(delay) => ErrorClass::retry_after(*delay),
                 None => ErrorClass::transient(),
             },
-            GenAiError::Api { status, .. } => match *status {
-                408 | 409 | 429 | 500..=599 => ErrorClass::transient(),
+            GenAiError::Api {
+                status,
+                retry_after,
+                ..
+            } => match (*status, retry_after) {
+                (408 | 409 | 429 | 500..=599, Some(delay)) => ErrorClass::retry_after(*delay),
+                (408 | 409 | 429 | 500..=599, None) => ErrorClass::transient(),
                 _ => ErrorClass::caller_error(),
             },
             GenAiError::ResponseParse(_) => ErrorClass::fatal(),
@@ -302,17 +380,11 @@ mod tests {
 
     #[test]
     fn classifies_for_retry_and_breaker() {
-        let e = GenAiError::Api {
-            status: 400,
-            message: "bad".into(),
-        };
+        let e = GenAiError::api(400, "bad");
         assert!(e.is_caller_error());
         assert!(!e.is_transient());
 
-        let e = GenAiError::Api {
-            status: 503,
-            message: "busy".into(),
-        };
+        let e = GenAiError::api(503, "busy");
         assert!(e.is_transient());
         assert!(!e.is_caller_error());
 
@@ -337,6 +409,39 @@ mod tests {
             e.error_class().retry,
             RetryDecision::RetryAfter(Duration::from_secs(2))
         );
+    }
+
+    #[test]
+    fn only_failures_before_sending_are_retried() {
+        // G4: a transport failure after the connection was up may follow a
+        // processed (billed) request, so it is never repeated.
+        let sent = GenAiError::Transport("connection reset".into());
+        assert_eq!(sent.error_class().retry, RetryDecision::Stop);
+        assert_eq!(sent.error_class().outcome, Outcome::Failure);
+        assert!(!sent.is_transient());
+        let unsent = GenAiError::Connect("connection refused".into());
+        assert_eq!(unsent.error_class().retry, RetryDecision::Retry);
+        assert_eq!(unsent.kind_label(), "connect");
+    }
+
+    #[test]
+    fn api_error_carries_type_and_retry_after() {
+        let e = GenAiError::api(503, "busy")
+            .with_error_type("server_error")
+            .with_retry_after(Duration::from_secs(7));
+        assert_eq!(e.error_type(), Some("server_error"));
+        assert_eq!(e.retry_after(), Some(Duration::from_secs(7)));
+        assert_eq!(
+            e.error_class().retry,
+            RetryDecision::RetryAfter(Duration::from_secs(7))
+        );
+        assert!(matches!(e, GenAiError::Api { status: 503, .. }));
+        // A caller error is not retried whatever the header says.
+        let e = GenAiError::api(400, "bad").with_retry_after(Duration::from_secs(1));
+        assert_eq!(e.error_class().retry, RetryDecision::Stop);
+        // Setting a type on another variant is a no-op.
+        let e = GenAiError::Config("x".into()).with_error_type("t");
+        assert_eq!(e.error_type(), None);
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Derive macros for the Ferroly toolkit.
 //!
 //! Provides `#[derive(Encode)]` / `#[derive(Decode)]` (targeting the `Value`
-//! model and streaming traits of `ferroly::codec`) and `#[derive(FerrolyError)]`
-//! (a `thiserror`-subset), so the toolkit needs no external derive crates at
-//! runtime — only the standard proc-macro build tooling.
+//! model and streaming traits of `ferroly::codec`), `#[derive(FerrolyError)]`
+//! (a `thiserror`-subset) and the protobuf derives behind `ferroly::proto`, so
+//! the toolkit needs no external derive crates at runtime — only the standard
+//! proc-macro build tooling.
 //!
 //! This crate is an implementation detail of `ferroly`: use the derives through
 //! the re-exports in `ferroly::codec` (or `ferroly::FerrolyError`). The code
@@ -33,6 +34,11 @@
 //! Variant attributes: `rename = "..."`, `alias = "..."` (repeatable),
 //! `rename_all = "..."` (for the variant's own fields).
 //!
+//! ## JsonSchema
+//! `#[derive(JsonSchema)]` reads the same model and attributes and generates
+//! the JSON-Schema document of the encoded form, for
+//! `ferroly::codec::schema::Schema::of`.
+//!
 //! ## FerrolyError
 //! - `#[error("...")]` on a struct or on each enum variant (`{0}` positional
 //!   and `{field}` named placeholders, with any format spec such as `{0:?}`);
@@ -40,6 +46,13 @@
 //! - `#[from]` generates a `From` impl and a `source()`; `#[source]` marks a
 //!   source field. Both work on structs and on tuple or named variants.
 //! - Generic error types get the `Display` / `Error` bounds their fields need.
+//!
+//! ## Protobuf: ProtoMessage / ProtoOneof / ProtoEnumeration
+//! Re-exported as `ferroly::proto::{Message, Oneof, Enumeration}` (feature
+//! `protobuf`). Fields carry `#[proto(tag = N, …)]`; the generated code calls
+//! `::ferroly::proto::__private`, which holds all wire logic. Field numbers are
+//! checked (unique, non-zero, at most 2²⁹ − 1, outside 19000–19999), and a
+//! oneof sharing a number with its message fails a const assertion.
 //!
 //! Every unsupported shape or attribute is a compile error pointing at the
 //! offending tokens; nothing is silently ignored.
@@ -53,6 +66,8 @@ mod de;
 mod error;
 mod fmtstr;
 mod model;
+mod proto;
+mod schema;
 mod ser;
 
 #[cfg(doctest)]
@@ -138,6 +153,39 @@ pub fn derive_decode(input: TokenStream) -> TokenStream {
         .into()
 }
 
+/// Derives `ferroly::codec::schema::JsonSchema`: a JSON-Schema document
+/// describing what `#[derive(Encode)]` writes for the type, which
+/// `Schema::of::<T>()` compiles for validation.
+///
+/// It reads the same `#[ferroly(...)]` attributes: keys follow `rename` /
+/// `rename_all`; a field is `required` unless it is an `Option`, has a
+/// `default` or is `skip_none`; `skip` fields are left out; `flatten` merges
+/// the inner type's properties; `deny_unknown_fields` adds
+/// `"additionalProperties": false`. Enums follow their representation: unit
+/// variants become a string `enum`, data variants `anyOf` alternatives, and
+/// an internally tagged enum also requires its tag to be one of the variant
+/// names.
+///
+/// ```ignore
+/// use ferroly::codec::schema::{JsonSchema, Schema};
+///
+/// #[derive(JsonSchema)]
+/// #[ferroly(rename_all = "camelCase")]
+/// struct NewUser {
+///     user_name: String,
+///     age: Option<u8>,
+/// }
+///
+/// let schema = Schema::of::<NewUser>().unwrap();
+/// ```
+#[proc_macro_derive(JsonSchema, attributes(ferroly))]
+pub fn derive_json_schema(input: TokenStream) -> TokenStream {
+    let di = parse_macro_input!(input as DeriveInput);
+    schema::expand(di)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
 /// Derives `std::error::Error` + `Display` (+ `From` for `#[from]` fields).
 ///
 /// ```
@@ -187,6 +235,96 @@ pub fn derive_decode(input: TokenStream) -> TokenStream {
 pub fn derive_error(input: TokenStream) -> TokenStream {
     let di = parse_macro_input!(input as DeriveInput);
     error::expand(di)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Derives `ferroly::proto::Message` for a struct with named fields.
+///
+/// Use it as `#[derive(ferroly::proto::Message)]` (re-exported under that
+/// name). Each field carries `#[proto(...)]`:
+///
+/// - `tag = N` — the field number (1 to 2²⁹ − 1, outside 19000–19999; unique);
+/// - a protobuf type when the Rust type does not imply it: `int32`, `int64`,
+///   `uint32`, `uint64`, `sint32`, `sint64`, `fixed32`, `fixed64`,
+///   `sfixed32`, `sfixed64`, `float`, `double`, `bool`, `string`, `bytes`,
+///   `message`, `enumeration`;
+/// - `packed = false` on a repeated numeric field (packed is the default);
+/// - `map(key = "…", value = "…")` on a `HashMap` / `BTreeMap` field;
+/// - `required` (proto2) — always written, and decoding fails without it;
+/// - `oneof` on an `Option<E>` field where `E` derives `Oneof` (no tag);
+/// - `unknown` on one `UnknownFields` field, to keep undeclared fields;
+/// - `skip` — not encoded; decoded as `Default::default()`.
+///
+/// The shape comes from the type: `T` has implicit presence, `Option<T>`
+/// explicit presence, `Vec<T>` is repeated (`Vec<u8>` is `bytes`).
+///
+/// ```ignore
+/// #[derive(ferroly::proto::Message, Default)]
+/// struct SearchRequest {
+///     #[proto(tag = 1)]
+///     query: String,
+///     #[proto(tag = 2, sint32)]
+///     offset: i32,
+///     #[proto(tag = 3, packed = false)]
+///     ids: Vec<u64>,
+///     #[proto(unknown)]
+///     unknown: ferroly::proto::UnknownFields,
+/// }
+/// ```
+///
+/// Duplicate field numbers, number 0, the reserved range and attributes that
+/// do not fit the field's type are compile errors.
+#[proc_macro_derive(ProtoMessage, attributes(proto))]
+pub fn derive_proto_message(input: TokenStream) -> TokenStream {
+    let di = parse_macro_input!(input as DeriveInput);
+    proto::expand_message(di)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Derives `ferroly::proto::Oneof` for an enum of newtype variants.
+///
+/// Use it as `#[derive(ferroly::proto::Oneof)]`. Each variant carries
+/// `#[proto(tag = N)]` and, when needed, a protobuf type (`sint64`, …); the
+/// message holds the enum as an `Option<E>` field marked `#[proto(oneof)]`.
+///
+/// ```ignore
+/// #[derive(ferroly::proto::Oneof)]
+/// enum Contact {
+///     #[proto(tag = 4)]
+///     Email(String),
+///     #[proto(tag = 5, fixed64)]
+///     Phone(u64),
+/// }
+/// ```
+#[proc_macro_derive(ProtoOneof, attributes(proto))]
+pub fn derive_proto_oneof(input: TokenStream) -> TokenStream {
+    let di = parse_macro_input!(input as DeriveInput);
+    proto::expand_oneof(di)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Derives `ferroly::proto::Enumeration` for a fieldless enum.
+///
+/// Use it as `#[derive(ferroly::proto::Enumeration)]` together with
+/// `Clone, Copy`. The discriminants are the enum numbers; `#[proto(name =
+/// "…")]` on a variant sets its `.proto` name (the Rust name otherwise).
+///
+/// ```ignore
+/// #[derive(ferroly::proto::Enumeration, Clone, Copy)]
+/// enum Corpus {
+///     #[proto(name = "CORPUS_UNSPECIFIED")]
+///     Unspecified = 0,
+///     #[proto(name = "CORPUS_WEB")]
+///     Web = 1,
+/// }
+/// ```
+#[proc_macro_derive(ProtoEnumeration, attributes(proto))]
+pub fn derive_proto_enumeration(input: TokenStream) -> TokenStream {
+    let di = parse_macro_input!(input as DeriveInput);
+    proto::expand_enumeration(di)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

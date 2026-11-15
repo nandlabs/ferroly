@@ -121,10 +121,7 @@ mod mock_provider {
             .push_response(
                 CompletionResponse::from_text("served-model", "two").with_usage(Usage::new(3, 4)),
             )
-            .push_error(GenAiError::Api {
-                status: 503,
-                message: "busy".into(),
-            });
+            .push_error(GenAiError::api(503, "busy"));
         assert_eq!(mock.remaining(), 3);
 
         let first = mock.complete(request("a")).await.unwrap();
@@ -237,10 +234,7 @@ mod mock_provider {
 
         // Scripted vectors and errors.
         mock.push_embeddings(vec![vec![1.0, 0.0]]);
-        mock.push_embed_error(GenAiError::Api {
-            status: 500,
-            message: "x".into(),
-        });
+        mock.push_embed_error(GenAiError::api(500, "x"));
         assert_eq!(
             mock.embed(EmbedRequest::single("e", "z"))
                 .await
@@ -297,10 +291,7 @@ async fn metrics_observer_counts_routed_calls() {
     let ask = || CompletionRequest::new("", vec![Message::user("hi")]);
     mock.push_text("ok");
     router.route(&Task::new(), ask()).await.unwrap();
-    mock.push_error(GenAiError::Api {
-        status: 400,
-        message: "bad".into(),
-    });
+    mock.push_error(GenAiError::api(400, "bad"));
     let _ = router.route(&Task::new(), ask()).await;
 
     let text = metrics.encode();
@@ -375,13 +366,49 @@ async fn rag_index_embeds_upserts_and_queries_by_text() {
     assert_eq!(hits[0].id, "c");
 
     // Nothing is stored when embedding fails.
-    embedder.push_embed_error(GenAiError::Api {
-        status: 500,
-        message: "down".into(),
-    });
+    embedder.push_embed_error(GenAiError::api(500, "down"));
     assert!(index
         .upsert(vec![RagDocument::new("d", "new")])
         .await
         .is_err());
     assert_eq!(store.len(), 3);
+}
+
+/// Loaded document chunks go straight into a `RagIndex`, keeping their
+/// source and heading metadata.
+#[cfg(feature = "vectorstore")]
+#[tokio::test]
+async fn loaded_chunks_feed_a_rag_index() {
+    use ferroly::genai::rag::{RagDocument, RagIndex};
+    use ferroly::genai::MockProvider;
+    use ferroly::vectorstore::{Boundary, Chunker, LoadedText, MemoryStore, TextFormat};
+
+    let doc = LoadedText::new(
+        "guide.md",
+        TextFormat::Markdown,
+        "# Setup\n\nInstall the tool.\n\n# Usage\n\nRun the tool daily.\n",
+    );
+    let chunks = doc.chunks(&Chunker::new(32).boundary(Boundary::Paragraph));
+    let index = RagIndex::new(
+        Arc::new(MockProvider::new("mock")),
+        Arc::new(MemoryStore::new()),
+        "embed-model",
+    );
+    let stored = index
+        .upsert(chunks.into_iter().map(RagDocument::from).collect())
+        .await
+        .unwrap();
+    assert!(stored >= 2);
+    let hits = index
+        .query("# Usage\n\nRun the tool daily.", 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits[0].metadata.get("source").unwrap().as_str(),
+        Some("guide.md")
+    );
+    assert_eq!(
+        hits[0].metadata.get("heading").unwrap().as_str(),
+        Some("Usage")
+    );
 }

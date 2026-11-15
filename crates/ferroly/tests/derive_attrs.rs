@@ -613,6 +613,30 @@ enum ClosedEnum {
 }
 
 #[test]
+fn deny_unknown_fields_on_a_flattened_type_rejects_unknown_keys() {
+    // `deny_unknown_fields` next to `flatten` is a compile error (the
+    // flattened field takes every unnamed key); the documented alternative
+    // is to put it on the flattened type.
+    #[derive(Encode, Decode, Debug, PartialEq)]
+    #[ferroly(deny_unknown_fields)]
+    struct Paging {
+        page: u32,
+    }
+    #[derive(Encode, Decode, Debug, PartialEq)]
+    struct Query {
+        q: String,
+        #[ferroly(flatten)]
+        paging: Paging,
+    }
+    let good = Query {
+        q: "x".into(),
+        paging: Paging { page: 2 },
+    };
+    round_trip(&good, r#"{"q":"x","page":2}"#);
+    assert!(decode_both::<Query>(r#"{"q":"x","page":2,"extra":1}"#).is_err());
+}
+
+#[test]
 fn deny_unknown_fields_applies_to_struct_variants() {
     round_trip(
         &ClosedEnum::Point { x: 1, y: -1 },

@@ -27,9 +27,11 @@ use std::fmt;
 ///
 /// # The wipe is best-effort
 ///
-/// ferroly forbids `unsafe`, so the wipe is an ordinary write followed by
+/// The wipe uses no `unsafe`: it is an ordinary write followed by
 /// [`std::hint::black_box`]; there is no volatile write and the optimiser is
-/// *discouraged*, not prevented, from eliding it. It also cannot reach copies
+/// *discouraged*, not prevented, from eliding it. (The hashers,
+/// [`Hmac`](super::Hmac) states and KDF intermediates of this module are
+/// wiped the same way.) It also cannot reach copies
 /// that exist outside the `Secret`: the `&str`/`&[u8]` you built it from,
 /// anything you copy out of [`expose`](Secret::expose), a `String` that
 /// reallocated before being converted, swap or core dumps. Treat it as

@@ -684,6 +684,11 @@ let server = Server::builder(options).build();
 
   With TLS, handlers see `ctx.is_tls() == true` and, under mutual TLS,
   `ctx.peer_certificates()`.
+- **HTTP/2** (feature `http2`): set `http2: Some(Http2Config::default())` in the
+  `ServerConfig` and the server also speaks HTTP/2 — ALPN `h2` with `tls`, h2c prior
+  knowledge without — to the same handlers. On the client side, build a
+  `ferroly::http::Client` with `.http2(true)` (or `.http2_prior_knowledge(true)`) and pass it
+  to `ClientOptionsBuilder::http_client`. See [HTTP/2](http.md#http2).
 
 ## `ServerBuilder`
 
@@ -816,8 +821,9 @@ let server = Server::builder(ServerOptions::default())
 
 | Method | Description |
 | --- | --- |
-| `build(self) -> Server` | Never fails. A route with a malformed pattern is absent (`404`); of two conflicting routes the first wins. |
-| `try_build(self) -> Result<Server, RouteError>` | [Validates](turbo.md#validating-the-route-table) the routes first. |
+| `build(self) -> Server` | Never fails, but [validates](turbo.md#validating-the-route-table) the routes: with a routing mistake every `start` fails, before binding, with `LifecycleError::ComponentFailure` whose source is the `RouteError` (like the `turbo` `serve*` methods). |
+| `try_build(self) -> Result<Server, RouteError>` | Validates the routes and reports a mistake here. |
+| `build_lenient(self) -> Server` | No validation: a route with a malformed pattern is absent (`404`); of two conflicting routes the first wins. |
 
 ## `Server` and the lifecycle
 
@@ -904,8 +910,9 @@ Helpers: `status() -> Option<u16>`, `body() -> Option<&[u8]>` (for `Status`),
 [`Classify`](errutils.md) (`Status` maps by code, timeouts to `Timeout`, an open circuit to
 `Unavailable`, …).
 
-Server-side errors are `lifecycle::LifecycleError` from `start` / `stop`, and
-`turbo::RouteError` from `try_build`.
+Server-side errors are `lifecycle::LifecycleError` from `start` / `stop` (a routing
+mistake found by `build` is its `ComponentFailure` source), and `turbo::RouteError` from
+`try_build`.
 
 ## Upgrading to 0.4
 

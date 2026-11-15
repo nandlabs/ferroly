@@ -1,0 +1,1 @@
+{% set ns = namespace() %}{% set ns.me = ns %}{{ ns }}{{ ns | tojson }}

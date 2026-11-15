@@ -42,9 +42,10 @@ dependencies = [
 
 [[package]]
 name = "ferroly"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ferroly-derive",
+ "log",
  "rustls",
  "rustls-pki-types",
  "tokio",
@@ -54,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "ferroly-derive"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -92,6 +93,12 @@ checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
 ]
+
+[[package]]
+name = "log"
+version = "0.4.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "mio"

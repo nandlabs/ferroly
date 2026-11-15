@@ -1,0 +1,1 @@
+{{ s.strip().upper().split(' ') }}{{ 'a,b'.split(',') }}{{ m.get('a', 0) }}{{ m.keys() | list }}{{ s.startswith(('é', 'x')) }}{{ ', '.join(['p', 'q']) }}

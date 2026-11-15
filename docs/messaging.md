@@ -61,6 +61,12 @@ The optional [`LogObserver`](#logobserver) additionally requires the `log` featu
 ferroly = { version = "*", features = ["messaging", "log"] }
 ```
 
+The optional [`Traced`](#tracing-spans-traced) wrapper (producer and consumer spans) requires the `obs` feature:
+
+```toml
+ferroly = { version = "*", features = ["messaging", "obs"] }
+```
+
 ## Quick start
 
 ```rust
@@ -303,7 +309,7 @@ assert_eq!(msg.event_type(), Some("order.created"));
 
 **Properties and attributes are separate.** `with_id("m1")` and `with_attribute("message-id", "app")` set two different things: `id()` returns `"m1"`, `attribute_str("message-id")` returns `"app"`.
 
-**Trace propagation.** The module does not create spans and does not depend on `obs`. The convention is: when you send, copy the active span's W3C `traceparent` (and `tracestate`) into the message with `with_traceparent`; when you handle a message, start your consumer span from `msg.traceparent()`; and when a handler produces a follow-up message, call `with_trace_from(&msg)` so the trace continues.
+**Trace propagation.** Without the `obs` feature the module creates no spans; with it, wrap the provider in [`Traced`](#tracing-spans-traced) and the steps below happen for you. By hand, the convention is: when you send, copy the active span's W3C `traceparent` (and `tracestate`) into the message with `with_traceparent`; when you handle a message, start your consumer span from `msg.traceparent()`; and when a handler produces a follow-up message, call `with_trace_from(&msg)` so the trace continues.
 
 #### The wire form
 
@@ -1621,6 +1627,36 @@ impl Observer for Counters {
 bus.set_observer(Arc::new(Counters::default()));
 # }
 ```
+
+## Tracing spans: `Traced`
+
+With the `obs` feature, `Traced<P>` wraps any `Producer` / `Receiver` / `Provider` (it implements the same traits, so it can stand in as an `Arc<dyn Provider>`) and records [`ferroly::obs`](obs.md) spans. Without the wrapper nothing is traced.
+
+```rust
+# #[tokio::main]
+# async fn main() {
+use ferroly::messaging::{handler, Ack, LocalProvider, Message, Producer, Receiver, Traced};
+
+let bus = Traced::new(LocalProvider::new("bus"), "local"); // "local" = messaging.system
+bus.add_listener("chan://orders", handler(|_msg| async { Ack::Ok }), Default::default())
+    .await
+    .unwrap();
+bus.send("chan://orders", Message::text("order-1"), Default::default()).await.unwrap();
+bus.inner().shutdown(std::time::Duration::from_secs(5)).await;
+# }
+```
+
+| Operation | Span | Parent | Effect on the message |
+|---|---|---|---|
+| `send`, `send_with_receipt` | `Producer`, `send {destination}` | the message's own `traceparent` if it has one, else the current context (as seen when the returned future is first polled) | `traceparent` / `tracestate` set to the producer span's context |
+| `send_batch` | one `Producer` span for the batch, with `messaging.batch.message_count` | the current context; a message that carried a context is **linked** | every message gets the batch span's context |
+| `add_listener`, `add_delivery_listener` | `Consumer`, `process {destination}`, per delivery (each redelivery is its own span) | extracted from the message's `traceparent` | none |
+
+- The destination is the address without its scheme (`orders` for `chan://orders`); fields follow the OpenTelemetry messaging conventions (`messaging.system`, `messaging.destination.name`, `messaging.operation.type`, `messaging.message.id`, `messaging.message.delivery_count`).
+- A failed send marks the producer span as an error.
+- The consumer span is current while the handler runs, including the call that creates the handler's future (code a raw `Handler` runs before returning it), so the handler's own spans (and follow-up sends through the wrapper) are its children. A handler that panics ends the span with the error `handler panicked`.
+- The handler's verdict is recorded as `messaging.ack` = `ok`, `retry`, `retry_after`, `reject`, `dead_letter` or `pending`. Every verdict except `ok` and `pending` also sets an error status (`message not processed: retry`, …). A pending delivery's span ends when the handler returns, not when the message is settled later.
+- `inner()` / `into_inner()` reach the wrapped provider's own methods (`LocalProvider::shutdown`, …).
 
 ## LogObserver
 

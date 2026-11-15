@@ -94,7 +94,7 @@ impl std::fmt::Display for AsOf {
 /// compiled-in defaults that configuration may override.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelInfo {
-    /// The model identifier passed to the provider (e.g. `gpt-4o`).
+    /// The model identifier passed to the provider (e.g. `gpt-6.1-terra`).
     pub name: String,
     /// The name the serving provider is registered under (e.g. `openai`).
     pub provider: String,

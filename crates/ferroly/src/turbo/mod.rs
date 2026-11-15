@@ -4,7 +4,8 @@
 //! catch-alls, groups and mounted sub-routers, typed request extraction,
 //! filters and an authenticator hook (synchronous or asynchronous), onion
 //! middleware, and a set of ready-made middleware (CORS, security headers,
-//! request ids, rate limiting, static files), with no external web framework.
+//! request ids, rate limiting, conditional `GET` with `ETag`s, static files),
+//! with no external web framework.
 //!
 //! ```no_run
 //! use ferroly::turbo::Router;
@@ -36,9 +37,12 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "hash")]
+mod apikey;
 mod cookie;
 mod ctx;
 mod error;
+mod etag;
 mod form;
 #[cfg(feature = "auth")]
 mod jwt;
@@ -50,9 +54,15 @@ mod router;
 mod security;
 mod static_files;
 
+#[cfg(feature = "hash")]
+pub use apikey::{
+    hash_api_key, require_api_key_scopes, ApiKey, ApiKeyAuth, ApiKeyError, ApiKeyStore,
+    ApiKeyStoreError, MemoryApiKeyStore, API_KEY_HEADER,
+};
 pub use cookie::{parse_cookies, CookieError, SameSite, SetCookie};
 pub use ctx::{Ctx, Extensions};
 pub use error::{ParamError, RouteError};
+pub use etag::ETag;
 pub use form::{parse_multipart, Form, FormError, MultipartLimits, Part};
 #[cfg(feature = "auth")]
 pub use jwt::{

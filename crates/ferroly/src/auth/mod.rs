@@ -4,10 +4,15 @@
 //!   verify with [`decode_hs256_with`] / [`decode_hmac_with`] and a
 //!   [`Validation`] policy (expiry required by default, leeway, `aud`, `iss`,
 //!   `sub`, required claims, maximum age, `typ`).
-//! - **Asymmetric tokens** (`RS256`, `ES256`), verify-only, from JWK / JWKS
-//!   public keys — `Jwk`, `Jwks`, `RemoteJwks`. Available when the `http`
-//!   feature is also enabled (the signature verification is delegated to the
-//!   TLS stack's crypto provider).
+//! - **Asymmetric tokens** (`RS256/384/512`, `PS256/384/512`,
+//!   `ES256/384/512`, `EdDSA`), verify-only, from JWK / JWKS public keys —
+//!   `Jwk`, `Jwks`, `RemoteJwks` (including OpenID Connect discovery).
+//!   Available when the `http` feature is also enabled (RSA and ECDSA
+//!   verification is delegated to the TLS stack's crypto provider; EdDSA uses
+//!   [`ferroly::sig`](crate::sig)).
+//! - **Replay protection**: a [`ReplayCache`] (for example
+//!   [`MemoryReplayCache`]) wired in with [`Validation::replay_cache`] makes
+//!   every `jti` usable once.
 //! - **Authorization helpers**: [`Scopes`] reads `scope` / `scp` / `roles`
 //!   claims and checks them.
 //! - [`Secret`], re-exported from [`ferroly::hash`](crate::hash), keeps key
@@ -27,9 +32,10 @@
 //! assert_eq!(back.get("sub").and_then(Value::as_str), Some("u123"));
 //! ```
 //!
-//! The original [`encode_hs256`] / [`decode_hs256`] pair is kept for
-//! compatibility; it does not require `exp` and validates no audience or
-//! issuer. New code should use the `_with` functions.
+//! The original `encode_hs256` / `decode_hs256` pair is kept for
+//! compatibility but **deprecated**: it does not require `exp`, validates no
+//! audience or issuer and accepts short secrets. Use [`encode_hmac`] and the
+//! `_with` functions.
 //!
 //! The HMAC and SHA-2 primitives are ferroly's own
 //! ([`ferroly::hash`](crate::hash)): hand-rolled, vector-tested, not
@@ -40,18 +46,25 @@
 #[cfg(feature = "http")]
 mod jwk;
 mod jwt;
+mod replay;
 mod scope;
 
 pub use ferroly::hash::Secret;
+#[cfg(all(feature = "http", feature = "turbo"))]
+pub(crate) use jwk::lacks_crypto_provider;
 #[cfg(feature = "http")]
 pub use jwk::{Jwk, Jwks, KeyType, RemoteJwks};
 pub use jwt::{
-    decode_header, decode_hmac_with, decode_hs256, decode_hs256_with, encode_hmac, encode_hs256,
-    encode_with_header, Algorithm, Header, JwtError, Validation, MAX_TOKEN_LEN, MIN_SECRET_LEN,
+    decode_header, decode_hmac_with, decode_hs256_with, encode_hmac, encode_with_header, Algorithm,
+    Header, JwtError, Validation, MAX_TOKEN_LEN, MIN_SECRET_LEN,
 };
+#[allow(deprecated)]
+pub use jwt::{decode_hs256, encode_hs256};
+pub use replay::{MemoryReplayCache, ReplayCache};
 pub use scope::{ScopeError, Scopes};
 
 #[cfg(test)]
+#[allow(deprecated)] // deliberately exercises the legacy pair
 mod tests {
     use super::*;
     use ferroly::codec::Value;
@@ -129,6 +142,18 @@ mod tests {
         let claims = Value::Object(vec![("nbf".into(), Value::Int(1))]);
         let token = encode_hs256(&claims, b"s");
         assert!(decode_hs256(&token, b"s").is_ok());
+    }
+
+    #[test]
+    fn legacy_encode_refuses_an_empty_secret() {
+        let claims = Value::Object(vec![("sub".into(), "u1".into())]);
+        // No forgeable token: the result is not a JWT at all.
+        assert_eq!(encode_hs256(&claims, b""), "");
+        assert_eq!(decode_hs256("", b"s"), Err(JwtError::Malformed));
+        assert_eq!(
+            decode_hs256(&encode_hs256(&claims, b""), b""),
+            Err(JwtError::WeakSecret)
+        );
     }
 
     #[test]

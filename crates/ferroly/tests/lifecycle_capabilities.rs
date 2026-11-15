@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use ferroly::lifecycle::{
     CheckOptions, ComponentManager, ComponentOptions, ComponentState, HealthRegistry, HealthStatus,
-    LifecycleError, LifecycleObserver, ManagerOptions, ProbeKind, RestartPolicy, SimpleComponent,
-    StateChange,
+    LifecycleError, LifecycleObserver, LivenessWatch, ManagerOptions, ProbeKind, RestartPolicy,
+    SimpleComponent, StateChange,
 };
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::Instant;
@@ -876,4 +876,245 @@ async fn a_panicking_async_check_is_down() {
     let report = registry.check().await;
     assert_eq!(report.get("boom"), Some(HealthStatus::Down));
     assert_eq!(report.get("fine"), Some(HealthStatus::Up));
+}
+
+// ---- liveness-driven restarts ------------------------------------------------
+
+/// A component whose `health()` reports `status` (0 = Up, 1 = Degraded,
+/// 2 = Down); a start resets it to Up.
+struct Ailing {
+    component: Arc<SimpleComponent>,
+    status: Arc<AtomicU32>,
+    starts: Arc<AtomicU32>,
+}
+
+fn ailing(id: &'static str) -> Ailing {
+    let status = Arc::new(AtomicU32::new(0));
+    let starts = Arc::new(AtomicU32::new(0));
+    let (st, s2) = (status.clone(), status.clone());
+    let n = starts.clone();
+    let component = SimpleComponent::new(
+        id,
+        move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            st.store(0, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        },
+        || Box::pin(async { Ok(()) }),
+    )
+    .with_health(move || match s2.load(Ordering::SeqCst) {
+        0 => HealthStatus::Up,
+        1 => HealthStatus::Degraded,
+        _ => HealthStatus::Down,
+    });
+    Ailing {
+        component: Arc::new(component),
+        status,
+        starts,
+    }
+}
+
+fn watched(max_restarts: Option<u32>) -> ComponentOptions {
+    let options = match max_restarts {
+        Some(n) => policy(n),
+        None => ComponentOptions::new(),
+    };
+    options.watch_liveness(LivenessWatch::new(Duration::from_secs(1)).failure_threshold(3))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_liveness_check_triggers_the_restart_policy() {
+    let mgr = ComponentManager::new();
+    let recorder = Arc::new(Recorder::default());
+    mgr.set_observer(recorder.clone());
+    let svc = ailing("svc");
+    mgr.register_with(svc.component.clone(), watched(Some(3)))
+        .unwrap();
+    mgr.start_all().await.unwrap();
+
+    // Healthy, or merely degraded: never restarted.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    svc.status.store(1, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(svc.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(mgr.get_state("svc"), Some(ComponentState::Running));
+
+    // Down on three consecutive polls → reported failure → restart.
+    svc.status.store(2, Ordering::SeqCst);
+    let began = Instant::now();
+    tokio::time::timeout(GUARD, wait_state(&mgr, "svc", ComponentState::Error))
+        .await
+        .expect("the failing liveness check is reported");
+    let took = began.elapsed();
+    assert!(
+        took >= Duration::from_secs(2) && took <= Duration::from_secs(3),
+        "{took:?}"
+    );
+    tokio::time::timeout(GUARD, wait_state(&mgr, "svc", ComponentState::Running))
+        .await
+        .expect("the component is restarted");
+    assert_eq!(svc.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(*recorder.failures.lock().unwrap(), vec!["svc".to_string()]);
+    assert_eq!(recorder.restarts.lock().unwrap().len(), 1);
+
+    // The watch keeps going after the restart.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(svc.starts.load(Ordering::SeqCst), 2);
+    svc.status.store(2, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::timeout(GUARD, wait_state(&mgr, "svc", ComponentState::Running))
+        .await
+        .unwrap();
+    assert_eq!(svc.starts.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn down_answers_below_the_threshold_are_not_a_failure() {
+    let mgr = ComponentManager::new();
+    let svc = ailing("svc");
+    mgr.register_with(svc.component.clone(), watched(Some(3)))
+        .unwrap();
+    mgr.start_all().await.unwrap();
+    for _ in 0..5 {
+        // Down for two polls, then Up again: the count starts over.
+        svc.status.store(2, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        svc.status.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert_eq!(mgr.get_state("svc"), Some(ComponentState::Running));
+    assert_eq!(svc.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_restart_policy_a_dead_component_is_left_in_error() {
+    let mgr = ComponentManager::new();
+    let svc = ailing("svc");
+    mgr.register_with(svc.component.clone(), watched(None))
+        .unwrap();
+    // Without the option nothing is watched.
+    let plain = ailing("plain");
+    mgr.register(plain.component.clone()).unwrap();
+    mgr.start_all().await.unwrap();
+
+    svc.status.store(2, Ordering::SeqCst);
+    plain.status.store(2, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert_eq!(mgr.get_state("svc"), Some(ComponentState::Error));
+    assert_eq!(svc.starts.load(Ordering::SeqCst), 1);
+    assert!(!mgr.is_live());
+    assert_eq!(mgr.get_state("plain"), Some(ComponentState::Running));
+}
+
+#[tokio::test(start_paused = true)]
+async fn out_of_range_liveness_fields_are_clamped_when_the_watch_runs() {
+    // The fields are public: a threshold of 0 must not count a healthy
+    // component as failed, and an interval of 0 must not spin.
+    let mut watch = LivenessWatch::new(Duration::from_secs(1));
+    watch.failure_threshold = 0;
+    watch.interval = Duration::ZERO;
+    let mgr = ComponentManager::new();
+    let svc = ailing("svc");
+    mgr.register_with(svc.component.clone(), policy(3).watch_liveness(watch))
+        .unwrap();
+    mgr.start_all().await.unwrap();
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(mgr.get_state("svc"), Some(ComponentState::Running));
+    assert_eq!(svc.starts.load(Ordering::SeqCst), 1);
+
+    // Still watching: a `Down` answer is reported (threshold clamped to 1).
+    svc.status.store(2, Ordering::SeqCst);
+    tokio::time::timeout(GUARD, wait_state(&mgr, "svc", ComponentState::Error))
+        .await
+        .expect("the failing liveness check is reported");
+}
+
+#[tokio::test(start_paused = true)]
+async fn liveness_polling_waits_out_the_initial_delay() {
+    let mgr = ComponentManager::new();
+    let svc = ailing("svc");
+    mgr.register_with(
+        svc.component.clone(),
+        policy(3).watch_liveness(
+            LivenessWatch::new(Duration::from_secs(1))
+                .failure_threshold(3)
+                .initial_delay(Duration::from_secs(30)),
+        ),
+    )
+    .unwrap();
+    mgr.start_all().await.unwrap();
+
+    // `Down` while warming up: not polled during the grace period.
+    svc.status.store(2, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(32_500)).await;
+    assert_eq!(mgr.get_state("svc"), Some(ComponentState::Running));
+    assert_eq!(svc.starts.load(Ordering::SeqCst), 1);
+
+    // After it: the third `Down` poll (at 33 s) is a failure.
+    let began = Instant::now();
+    tokio::time::timeout(GUARD, wait_state(&mgr, "svc", ComponentState::Error))
+        .await
+        .expect("reported after the grace period");
+    assert!(
+        began.elapsed() <= Duration::from_secs(1),
+        "{:?}",
+        began.elapsed()
+    );
+    tokio::time::timeout(GUARD, wait_state(&mgr, "svc", ComponentState::Running))
+        .await
+        .unwrap();
+
+    // The grace period applies again to the restarted instance.
+    svc.status.store(2, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    assert_eq!(mgr.get_state("svc"), Some(ComponentState::Running));
+    assert_eq!(svc.starts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reset_after_restores_the_budget_after_a_long_uptime() {
+    let opts = ComponentOptions::new().restart(
+        RestartPolicy::new(1)
+            .with_backoff(Duration::from_millis(100), Duration::from_secs(1))
+            .reset_after(Duration::from_secs(60)),
+    );
+    let mgr = ComponentManager::new();
+    let svc = ailing("svc");
+    mgr.register_with(svc.component.clone(), opts).unwrap();
+    mgr.start_all().await.unwrap();
+
+    // Rare failures, each after a long uptime: restarted every time.
+    for n in 2..=4 {
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        mgr.report_failure("svc", "rare").unwrap();
+        tokio::time::timeout(GUARD, wait_state(&mgr, "svc", ComponentState::Running))
+            .await
+            .unwrap();
+        assert_eq!(svc.starts.load(Ordering::SeqCst), n);
+    }
+
+    // A failure soon after a restart still spends the budget.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    mgr.report_failure("svc", "quick").unwrap();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(mgr.get_state("svc"), Some(ComponentState::Error));
+    assert_eq!(svc.starts.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_reset_after_the_budget_is_spent_across_long_uptimes() {
+    let mgr = ComponentManager::new();
+    let svc = ailing("svc");
+    mgr.register_with(svc.component.clone(), policy(1)).unwrap();
+    mgr.start_all().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    mgr.report_failure("svc", "rare").unwrap();
+    tokio::time::timeout(GUARD, wait_state(&mgr, "svc", ComponentState::Running))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    mgr.report_failure("svc", "rare").unwrap();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(mgr.get_state("svc"), Some(ComponentState::Error));
 }

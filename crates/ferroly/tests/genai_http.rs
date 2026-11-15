@@ -86,6 +86,41 @@ mod openai {
         assert_eq!(out, "Hello");
     }
 
+    /// A `200` head then a dropped connection: the request was delivered, so
+    /// the provider's retry must not send it again.
+    #[tokio::test]
+    async fn a_body_cut_after_a_2xx_head_is_not_retried() {
+        use ferroly::clients::RetryPolicy;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let seen = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                            Content-Length: 500\r\n\r\n{\"model\":";
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+                // Dropping the socket cuts the body short.
+            }
+        });
+        let opts = ProviderOptions::with_base_url(format!("http://{addr}"))
+            .retry(RetryPolicy::fixed(3, Duration::from_millis(1)));
+        let provider = OpenAiProvider::new("sk-test", Some(opts));
+        let err = provider.complete(request()).await.unwrap_err();
+        assert!(matches!(err, GenAiError::Transport(_)), "{err:?}");
+        assert!(!err.is_transient());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn error_status() {
         let base = error_401("nope").await;

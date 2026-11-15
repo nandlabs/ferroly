@@ -32,7 +32,8 @@ updates:
       prefix: "ci"
     open-pull-requests-limit: 10
     ignore:
-      # `dtolnay/rust-toolchain@1.75.0` in the MSRV job pins the *minimum
-      # supported Rust version*, not an action release to keep current. Bumping
-      # it would silently stop the job from verifying MSRV 1.75.
+      # `dtolnay/rust-toolchain` publishes no releases: it is pinned to a
+      # commit of its `master` branch, and the toolchain is chosen with the
+      # `toolchain:` input ("1.75.0" in the MSRV job). Bump the commit by hand
+      # after reviewing the action's diff.
       - dependency-name: "dtolnay/rust-toolchain"

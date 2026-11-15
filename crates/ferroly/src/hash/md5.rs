@@ -39,6 +39,15 @@ pub struct Md5 {
     total: u64,
 }
 
+impl Drop for Md5 {
+    /// Wipes the chaining state; the block buffer wipes itself.
+    fn drop(&mut self) {
+        super::wipe(&mut self.h);
+        self.total = 0;
+        std::hint::black_box(&*self);
+    }
+}
+
 impl Default for Md5 {
     fn default() -> Self {
         Self::new()
@@ -89,6 +98,9 @@ impl HashAlgorithm for Md5 {
     }
     fn finalize(self) -> Digest<16> {
         Md5::finalize(self)
+    }
+    fn wipe_output(output: &mut Digest<16>) {
+        super::wipe(output.as_mut());
     }
 }
 

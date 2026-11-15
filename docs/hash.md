@@ -8,7 +8,7 @@ buffering the whole input in memory.
 Enable with the `hash` feature (std-only, no other feature or crate required):
 
 ```toml
-ferroly = { version = "0.5", features = ["hash"] }
+ferroly = { version = "0.6", features = ["hash"] }
 ```
 
 > **Hand-rolled, not FIPS-validated.** Every algorithm here is implemented
@@ -20,6 +20,25 @@ ferroly = { version = "0.5", features = ["hash"] }
 > acceleration**, and — apart from the explicit constant-time comparisons —
 > make **no side-channel guarantees**. If your environment mandates validated
 > cryptography, do not use this module for that purpose.
+
+### FIPS: what a FIPS provider does and does not cover
+
+ferroly has **no FIPS route for SHA, HMAC, HKDF or PBKDF2**: this module never
+calls the rustls `CryptoProvider`, so installing a FIPS provider
+(`rustls::crypto::default_fips_provider()` with the rustls `fips` feature)
+does not change it. What follows from that:
+
+| Goes through the installed rustls `CryptoProvider` (FIPS-capable) | Hand-rolled in ferroly (never FIPS-validated) |
+|---|---|
+| TLS in [`http`](http.md) (client and server) | SHA-1/2, MD5, CRC-32, HMAC, HKDF, PBKDF2 (this module) |
+| JWT `RS*`, `PS*` and `ES*` verification in [`auth`](auth.md) | JWT `HS*` signing and verification (HMAC from here) |
+| | JWT `EdDSA` verification and all of [`sig`](sig.md) (Ed25519) |
+| | AWS SigV4 signing (`store-s3`), OAuth helpers in `clients` |
+| | turbo CSRF tokens and API-key hashing |
+| | `random` (the OS CSPRNG, not a DRBG of the provider) |
+
+If a FIPS 140 boundary is mandatory, use only the left column for regulated
+operations, and use a validated library for the rest.
 
 ## Contents
 
@@ -140,7 +159,10 @@ assert!(check.verify(tag.as_bytes()));
 | `verify(tag: &[u8]) -> bool` | Finishes and compares in constant time. A tag of the wrong length (including a truncated one) is `false`. |
 
 A keyed `Hmac` is `Clone`: key it once and clone it per message to MAC many
-messages cheaply. An **empty key is accepted** (RFC 2104 allows it) but
+messages cheaply. Its inner and outer states are derived from the key, so
+they are **overwritten with zeros when dropped**, as is every hasher state
+(`Sha*`, `Md5`); the padded key block and the digest of an over-long key are
+wiped as soon as the states are built (best-effort, see [`Secret`](#secret)). An **empty key is accepted** (RFC 2104 allows it) but
 authenticates nothing — reject empty and short keys yourself when they come
 from configuration. RFC 2104 recommends a key at least as long as the hash
 output (32 bytes for HMAC-SHA256).
@@ -156,6 +178,11 @@ output (32 bytes for HMAC-SHA256).
 
 Errors are `kdf::KdfError`: `OutputTooLong` (HKDF produces at most
 `255 * hash_len` bytes — 8160 for SHA-256) and `ZeroIterations`.
+
+Intermediate values — the HKDF pseudorandom key and the previous output
+block, the PBKDF2 `U_i` chain and its accumulator — are overwritten with zeros
+before the function returns, and the keyed HMAC states wipe themselves on
+drop. The pseudorandom key returned by `hkdf_extract` is yours to wipe.
 
 ```rust
 use ferroly::hash::kdf;
@@ -305,7 +332,7 @@ assert!(key.ct_eq(b"s3cr3t-api-key"));
 `Secret` is re-exported as `ferroly::auth::Secret` and
 `ferroly::clients::Secret`.
 
-**The wipe is best-effort.** ferroly forbids `unsafe`, so the wipe is an
+**The wipe is best-effort.** It uses no `unsafe`: it is an
 ordinary write followed by `std::hint::black_box`: the optimiser is
 *discouraged*, not prevented, from removing it, and there is no volatile write.
 It also cannot reach copies that live outside the `Secret` — the `&str` you
@@ -349,18 +376,34 @@ fn make_credentials() -> Result<(), random::RandomError> {
 
 ### Platform support and limits
 
-ferroly allows neither extra dependencies nor `unsafe`, which rules out the
-`getrandom(2)` and `BCryptGenRandom` system calls. The only remaining portable
-route to the kernel CSPRNG is the device file.
+ferroly takes no dependency for this (no `getrandom`, no `libc`), so each
+platform's kernel CSPRNG is reached directly:
 
 | Platform | Source | Result |
 |---|---|---|
-| Unix (Linux, macOS, the BSDs, …) | `/dev/urandom` | random bytes |
-| Everything else (Windows, wasm, …) | none | `Err(RandomError::Unsupported)` |
+| Unix (Linux, macOS, iOS, Android, the BSDs, …) | `/dev/urandom` | random bytes |
+| Windows (`-msvc` and `-gnu`, including UWP) | `BCryptGenRandom` with `BCRYPT_USE_SYSTEM_PREFERRED_RNG`, linked from `bcrypt.dll` | random bytes |
+| wasm (`wasm32-unknown-unknown`, WASI) and anything else | none | `Err(RandomError::Unsupported)` |
 
 There is deliberately **no fallback** to a weaker source (time, addresses, a
 userspace PRNG). An unsupported platform is an explicit error, never silently
 predictable output.
+
+On Windows, `BCryptGenRandom` is called through a hand-written
+`extern "system"` declaration (ferroly takes no `windows-sys` dependency). It
+is the same system RNG the standard library and the `getrandom` crate use,
+available since Windows Vista, and needs no algorithm handle. The FFI lives
+in one small module, `hash/random/windows.rs`, one of the crate's four audited
+`unsafe` regions; a failure (an `NTSTATUS` error) is `RandomError::Io`.
+
+On wasm there is no OS randomness ferroly can reach without a dependency:
+`wasm32-unknown-unknown` gets randomness from the host (a JavaScript
+`crypto.getRandomValues` binding) and WASI from its `random_get` import, and
+ferroly ships neither glue. `random::is_supported()` is `false` there and
+every call is `Unsupported`; obtain random bytes from the host and pass them
+in. Features built on `random` behave accordingly: turbo's CSRF middleware
+answers `500` instead of issuing a token, and WebSocket masking keys fall
+back to a mixed-entropy seed (see [ws](ws.md)).
 
 On Unix:
 
@@ -389,7 +432,7 @@ A fixed-size (`N`-byte) hash output.
 | `ct_eq(&other)` | `bool` | **constant-time** equality (no early exit) |
 | `from_bytes([u8; N])` | `Digest<N>` | wrap existing bytes |
 
-`Digest` also implements `Display` (hex), `Debug`, `AsRef<[u8]>`, `PartialEq`,
+`Digest` also implements `Display` (hex), `Debug`, `AsRef<[u8]>`, `AsMut<[u8]>`, `PartialEq`,
 `Eq`, `Hash`, `Copy`. Use `ct_eq` — not `==` — when comparing a computed MAC
 against an untrusted value to avoid timing side channels.
 
@@ -415,8 +458,16 @@ pub trait HashAlgorithm: Clone {
     fn new() -> Self;
     fn update(&mut self, data: &[u8]);
     fn finalize(self) -> Self::Output;
+    fn wipe_output(output: &mut Self::Output) {} // provided: does nothing
 }
 ```
+
+`wipe_output` is how `Hmac<H>` and the KDFs overwrite intermediate digests
+(keyed material) when they are done with them. Every hash in this crate
+overrides it to zero the digest; the provided no-op keeps a hash implemented
+elsewhere compiling with an `Output` that is only `AsRef<[u8]>` (as in 0.5),
+at the cost of its intermediates not being wiped — override it if your
+`Output` can be written.
 
 Implemented by `Sha256`, `Sha384`, `Sha512`, `Sha1` and `Md5`; it is what makes
 `Hmac<H>`, `kdf::hkdf::<H>` and `kdf::pbkdf2_hmac::<H>` generic. The inherent
@@ -439,6 +490,17 @@ Nothing is compared against itself. `tests/hash_vectors.rs` checks:
 - HKDF-SHA256 against RFC 5869 cases 1–3, PBKDF2-HMAC-SHA256 against
   RFC 7914 §11.
 
+Unit tests in `src/hash/tests.rs` check that every hasher and `Hmac` runs a
+wiping `Drop` (and what the SHA-256 one clears), that wiping the
+intermediates leaves the RFC 4231 / 5869 / 7914 results unchanged, and that a
+hash implemented outside the crate needs no writable output.
+`tests/hash_wipe.rs` checks the wipe from the outside: a global allocator
+inspects the heap blocks of every hasher, `Hmac<Sha256>`, `Hmac<Sha512>` and
+`Secret` as they are freed and requires them to be zero, so an optimiser that
+dropped the wiping stores fails it (run it with `--release` too);
+`src/hash/random.rs` checks the CSPRNG on Unix and Windows and the explicit
+`Unsupported` elsewhere.
+
 ## Limitations
 
 - **Not FIPS-validated, not audited, no hardware acceleration** (see the note
@@ -446,12 +508,19 @@ Nothing is compared against itself. `tests/hash_vectors.rs` checks:
 - **No password hashing** — no Argon2, scrypt or bcrypt. PBKDF2 is available
   but is not memory-hard.
 - **No SHA-3, BLAKE2 or BLAKE3.**
-- **No encryption and no signing.** Signature *verification* for JWTs (RS256,
-  ES256) lives in [auth](auth.md) and is delegated to the TLS stack's crypto
+- **No encryption and no signing.** Signature *verification* lives elsewhere:
+  Ed25519 (built on this module's SHA-512) in [sig](sig.md), and JWTs (RS\*,
+  PS\*, ES\*) in [auth](auth.md), delegated to the TLS stack's crypto
   provider.
-- **Secure randomness is Unix-only** (see
+- **No FIPS route** for SHA, HMAC, HKDF or PBKDF2, so none for what is built
+  on them (see [FIPS](#fips-what-a-fips-provider-does-and-does-not-cover)).
+- **Secure randomness on Unix and Windows only**; not on wasm (see
   [Platform support](#platform-support-and-limits)).
-- `Secret`'s wipe is best-effort.
+- The wipes of `Secret`, the hasher and HMAC states and the KDF
+  intermediates are best-effort; stack temporaries inside the compression
+  functions (the message schedule, the working variables) are not wiped.
+  Blocks are compressed in place, without stack copies of the buffer or the
+  input.
 - SHA-1, MD5 and CRC-32 are included for interop, not for security.
 
 ## See also

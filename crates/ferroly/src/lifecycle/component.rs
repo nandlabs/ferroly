@@ -62,14 +62,20 @@ pub trait Component: Send + Sync {
 /// - **A failed start** (error, panic or per-component timeout) is retried
 ///   after a backoff while restarts remain.
 /// - **A reported failure** of a running component
-///   ([`ComponentManager::report_failure`](crate::lifecycle::ComponentManager::report_failure))
-///   triggers a `stop` (best effort) followed by a fresh `start`.
+///   ([`ComponentManager::report_failure`](crate::lifecycle::ComponentManager::report_failure),
+///   or a failing liveness signal under [`LivenessWatch`]) triggers a `stop`
+///   (best effort) followed by a fresh `start`.
 ///
 /// The delay before restart *n* (1-based) is `initial_backoff * 2^(n-1)`,
 /// capped at `max_backoff`. The restart budget is shared by both situations and
 /// is reset whenever the component is started or stopped explicitly through
-/// the manager.
+/// the manager, and — with [`reset_after`](Self::reset_after) — once the
+/// component has kept running for that long.
+///
+/// Build one with [`RestartPolicy::new`] and the builder methods (the struct is
+/// `#[non_exhaustive]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RestartPolicy {
     /// The most automatic restarts to attempt before giving up and leaving the
     /// component in [`Error`](crate::lifecycle::ComponentState::Error).
@@ -78,16 +84,22 @@ pub struct RestartPolicy {
     pub initial_backoff: Duration,
     /// The upper bound on the (doubling) delay.
     pub max_backoff: Duration,
+    /// When set, a component that has been `Running` for at least this long
+    /// when it fails gets a fresh restart budget, so rare failures spread over
+    /// a long uptime never exhaust it. `None` (the default) keeps counting
+    /// until the next explicit start/stop.
+    pub reset_after: Option<Duration>,
 }
 
 impl RestartPolicy {
     /// A policy allowing `max_restarts` restarts, with a 100 ms initial backoff
-    /// doubling up to 30 s.
+    /// doubling up to 30 s, and no [`reset_after`](Self::reset_after).
     pub fn new(max_restarts: u32) -> Self {
         Self {
             max_restarts,
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(30),
+            reset_after: None,
         }
     }
 
@@ -98,6 +110,13 @@ impl RestartPolicy {
         self
     }
 
+    /// Restores the full restart budget when the component fails after
+    /// having run for at least `uptime` since its last (re)start.
+    pub fn reset_after(mut self, uptime: Duration) -> Self {
+        self.reset_after = Some(uptime);
+        self
+    }
+
     /// The delay before restart number `restart` (1-based):
     /// `initial_backoff * 2^(restart-1)`, capped at `max_backoff`.
     pub fn delay(&self, restart: u32) -> Duration {
@@ -105,6 +124,87 @@ impl RestartPolicy {
         self.initial_backoff
             .checked_mul(1u32 << shift)
             .map_or(self.max_backoff, |d| d.min(self.max_backoff))
+    }
+}
+
+/// Turns a failing liveness signal into a reported failure, so the
+/// [`RestartPolicy`] can act on it — opt in with
+/// [`ComponentOptions::watch_liveness`].
+///
+/// While the component is `Running`, the manager polls its
+/// [`Component::health`] every `interval`. After `failure_threshold`
+/// consecutive [`Down`](HealthStatus::Down) answers (a panicking `health()`
+/// counts as `Down`; `Degraded` and `None` do not), it calls
+/// [`ComponentManager::report_failure`](crate::lifecycle::ComponentManager::report_failure):
+/// the component moves to `Error` and, with a restart policy and restarts
+/// left, is restarted. Without a restart policy it stays in `Error`, which
+/// makes [`ComponentManager::is_live`](crate::lifecycle::ComponentManager::is_live)
+/// fail.
+///
+/// The count starts over whenever the component leaves `Running`. Each time
+/// the component (re)enters `Running`, the first poll waits for
+/// [`initial_delay`](Self::initial_delay) plus one `interval`, a grace period
+/// for components that report `Down` while they warm up. Polling starts the
+/// first time the component is started through the manager (it needs the
+/// Tokio runtime) and ends when the component is unregistered or the manager
+/// dropped.
+///
+/// Build one with [`LivenessWatch::new`] and the builder methods (the struct
+/// is `#[non_exhaustive]`). The bounds are also enforced when the watch runs,
+/// so a field set out of range is clamped.
+///
+/// ```
+/// use std::time::Duration;
+/// use ferroly::lifecycle::{ComponentOptions, LivenessWatch, RestartPolicy};
+///
+/// let opts = ComponentOptions::new()
+///     .restart(RestartPolicy::new(5))
+///     .watch_liveness(
+///         LivenessWatch::new(Duration::from_secs(10))
+///             .failure_threshold(3)
+///             .initial_delay(Duration::from_secs(60)),
+///     );
+/// assert_eq!(opts.liveness.unwrap().failure_threshold, 3);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LivenessWatch {
+    /// How often `health()` is polled while the component runs (at least
+    /// 1 ms).
+    pub interval: Duration,
+    /// Consecutive `Down` answers that count as a failure (at least 1).
+    pub failure_threshold: u32,
+    /// Extra wait before the first poll after each entry into `Running`
+    /// (default zero).
+    pub initial_delay: Duration,
+}
+
+impl LivenessWatch {
+    /// The smallest polling interval.
+    pub(crate) const MIN_INTERVAL: Duration = Duration::from_millis(1);
+
+    /// Polls every `interval`; three consecutive `Down` answers are a failure;
+    /// no initial delay.
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval: interval.max(Self::MIN_INTERVAL),
+            failure_threshold: 3,
+            initial_delay: Duration::ZERO,
+        }
+    }
+
+    /// Sets how many consecutive `Down` answers count as a failure (at
+    /// least 1).
+    pub fn failure_threshold(mut self, threshold: u32) -> Self {
+        self.failure_threshold = threshold.max(1);
+        self
+    }
+
+    /// Sets a grace period after each entry into `Running` before polling
+    /// begins, for a component whose `health()` is `Down` while it warms up.
+    pub fn initial_delay(mut self, delay: Duration) -> Self {
+        self.initial_delay = delay;
+        self
     }
 }
 
@@ -133,10 +233,14 @@ pub struct ComponentOptions {
     pub stop_timeout: Option<Duration>,
     /// Automatic restart policy; `None` (the default) disables supervision.
     pub restart: Option<RestartPolicy>,
+    /// Liveness polling that reports a failure (and so triggers `restart`)
+    /// when the component's `health()` keeps answering `Down`; `None` (the
+    /// default) polls nothing.
+    pub liveness: Option<LivenessWatch>,
 }
 
 impl ComponentOptions {
-    /// Options with no timeouts and no restart policy.
+    /// Options with no timeouts, no restart policy and no liveness polling.
     pub fn new() -> Self {
         Self::default()
     }
@@ -156,6 +260,14 @@ impl ComponentOptions {
     /// Enables automatic restarts.
     pub fn restart(mut self, policy: RestartPolicy) -> Self {
         self.restart = Some(policy);
+        self
+    }
+
+    /// Polls the component's liveness and reports a failure when it keeps
+    /// failing; combined with [`restart`](Self::restart), a component that is
+    /// running but dead gets restarted. See [`LivenessWatch`].
+    pub fn watch_liveness(mut self, watch: LivenessWatch) -> Self {
+        self.liveness = Some(watch);
         self
     }
 }

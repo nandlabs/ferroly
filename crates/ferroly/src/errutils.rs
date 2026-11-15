@@ -546,9 +546,329 @@ impl Classify for MultiError {
     }
 }
 
+// ---- module error types ------------------------------------------------------
+//
+// The module error enums classify themselves, so a caller holding an
+// `HttpError` (say) need not convert it to `ferroly::Error` first; the root
+// `Error` delegates to these. Variants are matched with `{ .. }` and a trailing
+// wildcard so a module adding variants or fields never breaks the mapping (a
+// new variant classifies as `Unknown` until it is listed here).
+
+/// The kind of the `std::io::Error` directly behind `e`, when that is what its
+/// `source()` is.
+#[cfg(any(feature = "fsutils", feature = "http", feature = "vfs"))]
+pub(crate) fn io_source_kind(e: &(dyn Error + 'static)) -> Option<ErrorKind> {
+    e.source()
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .map(Classify::kind)
+}
+
+/// The conventional kind of a remote HTTP status (`401` → `Unauthenticated`,
+/// `429` → `RateLimited`, `5xx` → `Unavailable`, other `4xx` → `InvalidInput`).
+#[cfg(any(feature = "genai", feature = "ws"))]
+fn status_kind(status: u16) -> ErrorKind {
+    match status {
+        401 => ErrorKind::Unauthenticated,
+        403 => ErrorKind::PermissionDenied,
+        404 => ErrorKind::NotFound,
+        408 => ErrorKind::Timeout,
+        409 => ErrorKind::Conflict,
+        429 => ErrorKind::RateLimited,
+        400..=499 => ErrorKind::InvalidInput,
+        500..=599 => ErrorKind::Unavailable,
+        _ => ErrorKind::Unknown,
+    }
+}
+
+#[cfg(feature = "http")]
+#[allow(unknown_lints, clippy::unneeded_struct_pattern)]
+impl Classify for ferroly::http::HttpError {
+    /// `InvalidInput` for a bad URL, `Timeout` for a request or connect
+    /// timeout, the I/O kind for an I/O failure, `Internal` for a panicked
+    /// handler. An HTTP/2 failure maps by its [`Http2Cause`]: a timer is
+    /// `Timeout`, an I/O failure its I/O kind, a protocol violation `Internal`,
+    /// and a reset, refusal, GOAWAY, close or local limit `Unavailable`. A
+    /// reset this side made for its own reasons is `Unavailable` when it
+    /// refused the stream (`REFUSED_STREAM`), `Internal` when a handler
+    /// failed (`INTERNAL_ERROR`), and `Unknown` when it just gave the
+    /// stream up (`CANCEL`, `NO_ERROR`). Otherwise `Unknown`.
+    ///
+    /// [`Http2Cause`]: ferroly::http::Http2Cause
+    fn kind(&self) -> ErrorKind {
+        use ferroly::http::HttpError;
+        #[allow(unreachable_patterns)]
+        match self {
+            HttpError::InvalidUrl { .. } => ErrorKind::InvalidInput,
+            e if e.is_timeout() => ErrorKind::Timeout,
+            HttpError::HandlerPanic { .. } => ErrorKind::Internal,
+            HttpError::Http2(e) => {
+                use ferroly::http::Http2Cause as C;
+                match e.cause() {
+                    C::Timeout => ErrorKind::Timeout,
+                    C::Io(io) => Classify::kind(&std::io::Error::from(io)),
+                    C::Protocol(_) => ErrorKind::Internal,
+                    C::LocalReset(code) => match code {
+                        ferroly::http::Http2ErrorCode::REFUSED_STREAM => ErrorKind::Unavailable,
+                        ferroly::http::Http2ErrorCode::INTERNAL_ERROR => ErrorKind::Internal,
+                        _ => ErrorKind::Unknown,
+                    },
+                    _ => ErrorKind::Unavailable,
+                }
+            }
+            other => io_source_kind(other).unwrap_or(ErrorKind::Unknown),
+        }
+    }
+}
+
+#[cfg(feature = "vfs")]
+#[allow(unknown_lints, clippy::unneeded_struct_pattern)]
+impl Classify for ferroly::vfs::VfsError {
+    /// By variant: `NotFound`, `PermissionDenied`, `InvalidInput` (not a
+    /// directory / is a directory), `Unsupported`, `Conflict` (already exists,
+    /// precondition failed), `Unavailable`, `Timeout`, `Unauthenticated`; the
+    /// I/O kind for an I/O failure.
+    fn kind(&self) -> ErrorKind {
+        use ferroly::vfs::VfsError as V;
+        #[allow(unreachable_patterns)]
+        match self {
+            V::NotFound { .. } => ErrorKind::NotFound,
+            V::Permission { .. } => ErrorKind::PermissionDenied,
+            V::NotDir { .. } | V::IsDir { .. } => ErrorKind::InvalidInput,
+            V::Unsupported { .. } => ErrorKind::Unsupported,
+            V::AlreadyExists { .. } | V::PreconditionFailed { .. } => ErrorKind::Conflict,
+            V::Unavailable { .. } => ErrorKind::Unavailable,
+            V::Timeout { .. } => ErrorKind::Timeout,
+            V::Unauthenticated { .. } => ErrorKind::Unauthenticated,
+            other => io_source_kind(other).unwrap_or(ErrorKind::Unknown),
+        }
+    }
+}
+
+#[cfg(feature = "genai")]
+#[allow(unknown_lints, clippy::unneeded_struct_pattern)]
+impl Classify for ferroly::genai::GenAiError {
+    /// By variant, and by HTTP status for provider responses (`401` →
+    /// `Unauthenticated`, `429` → `RateLimited`, `5xx` → `Unavailable`, other
+    /// `4xx` → `InvalidInput`).
+    fn kind(&self) -> ErrorKind {
+        use ferroly::genai::GenAiError as G;
+        #[allow(unreachable_patterns)]
+        match self {
+            G::Template { .. } | G::Config { .. } => ErrorKind::InvalidInput,
+            G::TemplateNotFound { .. } => ErrorKind::NotFound,
+            G::Unsupported { .. } => ErrorKind::Unsupported,
+            G::Transport { .. } | G::Connect { .. } => ErrorKind::Unavailable,
+            G::Api { status, .. } => status_kind(*status),
+            G::ResponseParse { .. } => ErrorKind::Internal,
+            G::Timeout { .. } => ErrorKind::Timeout,
+            G::RateLimited { .. } => ErrorKind::RateLimited,
+            G::Auth { status, .. } => match *status {
+                403 => ErrorKind::PermissionDenied,
+                _ => ErrorKind::Unauthenticated,
+            },
+            G::ContentFilter { .. } | G::ContextLengthExceeded { .. } => ErrorKind::InvalidInput,
+            G::Overloaded { .. } => ErrorKind::Unavailable,
+            _ => ErrorKind::Unknown,
+        }
+    }
+}
+
+#[cfg(feature = "auth")]
+#[allow(unknown_lints, clippy::unneeded_struct_pattern)]
+impl Classify for ferroly::auth::JwtError {
+    /// `Unauthenticated` for a rejected token (malformed, bad signature,
+    /// expired, a claim or header not accepted, no matching key, replayed).
+    /// The exceptions are not the caller's fault: a key-set fetch failure is
+    /// `Unavailable`, a secret that is too short is `InvalidInput` (a
+    /// configuration error), an unusable key or JWK is `Internal`, and a
+    /// missing crypto provider is `Unsupported`. A variant added later is
+    /// `Unknown` until it is classified here.
+    fn kind(&self) -> ErrorKind {
+        use ferroly::auth::JwtError as J;
+        #[allow(unreachable_patterns)]
+        match self {
+            J::Malformed { .. }
+            | J::UnsupportedAlg { .. }
+            | J::InvalidSignature { .. }
+            | J::Expired { .. }
+            | J::NotYetValid { .. }
+            | J::MissingClaim { .. }
+            | J::InvalidAudience { .. }
+            | J::InvalidIssuer { .. }
+            | J::InvalidSubject { .. }
+            | J::IssuedInFuture { .. }
+            | J::TooOld { .. }
+            | J::InvalidType { .. }
+            | J::UnsupportedCritical { .. }
+            | J::UnknownKey { .. }
+            | J::Replayed { .. } => ErrorKind::Unauthenticated,
+            J::KeyFetch { .. } => ErrorKind::Unavailable,
+            J::WeakSecret { .. } => ErrorKind::InvalidInput,
+            J::InvalidKey { .. } => ErrorKind::Internal,
+            J::NoCryptoProvider { .. } => ErrorKind::Unsupported,
+            _ => ErrorKind::Unknown,
+        }
+    }
+}
+
+#[cfg(feature = "ws")]
+#[allow(unknown_lints, clippy::unneeded_struct_pattern)]
+impl Classify for ferroly::ws::WsError {
+    /// `Timeout` for a timeout, the conventional kind of the HTTP status for a
+    /// rejected upgrade, `Internal` for a protocol error (the application
+    /// asked for something RFC 6455 forbids, so retrying cannot help), and
+    /// `Unavailable` when the connection failed, closed or its queue is
+    /// full. A variant added later is `Unknown` until it is classified here.
+    fn kind(&self) -> ErrorKind {
+        use ferroly::ws::WsError as W;
+        #[allow(unreachable_patterns)]
+        match self {
+            W::Timeout { .. } => ErrorKind::Timeout,
+            W::Rejected { status, .. } => match status_kind(*status) {
+                ErrorKind::Unknown => ErrorKind::Unavailable,
+                kind => kind,
+            },
+            W::Protocol { .. } => ErrorKind::Internal,
+            W::Connect { .. }
+            | W::Send { .. }
+            | W::Closed { .. }
+            | W::QueueFull { .. }
+            | W::Transport { .. } => ErrorKind::Unavailable,
+            _ => ErrorKind::Unknown,
+        }
+    }
+}
+
+#[cfg(feature = "messaging")]
+#[allow(unknown_lints, clippy::unneeded_struct_pattern)]
+impl Classify for ferroly::messaging::MessagingError {
+    /// `Unavailable` for a full buffer, a send timeout, a closed provider or a
+    /// transient backend failure or refusal; `NotFound` for no listeners;
+    /// `Timeout` for a request timeout; `InvalidInput` for a bad address or
+    /// options; `Unsupported` for an unsupported operation; otherwise
+    /// `Unknown`.
+    fn kind(&self) -> ErrorKind {
+        use ferroly::messaging::MessagingError as M;
+        #[allow(unreachable_patterns)]
+        match self {
+            M::BufferFull { .. } | M::SendTimeout { .. } | M::Closed { .. } => {
+                ErrorKind::Unavailable
+            }
+            M::NoListeners { .. } => ErrorKind::NotFound,
+            M::RequestTimeout { .. } => ErrorKind::Timeout,
+            M::InvalidAddress { .. } | M::InvalidOptions { .. } => ErrorKind::InvalidInput,
+            M::Unsupported { .. } => ErrorKind::Unsupported,
+            M::Backend {
+                transient: true, ..
+            }
+            | M::Refused {
+                transient: true, ..
+            } => ErrorKind::Unavailable,
+            _ => ErrorKind::Unknown,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `JwtError` variant with its kind. The exhaustive `match` (allowed
+    /// inside the crate despite `#[non_exhaustive]`) stops compiling when a
+    /// variant is added, so the new one has to be classified on purpose.
+    #[cfg(feature = "auth")]
+    #[test]
+    fn every_jwt_error_variant_is_classified() {
+        use ferroly::auth::JwtError as J;
+        fn expected(e: &J) -> ErrorKind {
+            match e {
+                J::Malformed
+                | J::UnsupportedAlg
+                | J::InvalidSignature
+                | J::Expired
+                | J::NotYetValid
+                | J::MissingClaim(_)
+                | J::InvalidAudience
+                | J::InvalidIssuer
+                | J::InvalidSubject
+                | J::IssuedInFuture
+                | J::TooOld
+                | J::InvalidType
+                | J::UnsupportedCritical
+                | J::UnknownKey
+                | J::Replayed => ErrorKind::Unauthenticated,
+                J::KeyFetch(_) => ErrorKind::Unavailable,
+                J::WeakSecret => ErrorKind::InvalidInput,
+                J::InvalidKey => ErrorKind::Internal,
+                J::NoCryptoProvider => ErrorKind::Unsupported,
+            }
+        }
+        let all = [
+            J::Malformed,
+            J::UnsupportedAlg,
+            J::InvalidSignature,
+            J::Expired,
+            J::NotYetValid,
+            J::WeakSecret,
+            J::InvalidKey,
+            J::MissingClaim("sub".into()),
+            J::InvalidAudience,
+            J::InvalidIssuer,
+            J::InvalidSubject,
+            J::IssuedInFuture,
+            J::TooOld,
+            J::InvalidType,
+            J::UnsupportedCritical,
+            J::UnknownKey,
+            J::KeyFetch("down".into()),
+            J::NoCryptoProvider,
+            J::Replayed,
+        ];
+        for e in &all {
+            assert_eq!(e.kind(), expected(e), "{e:?}");
+        }
+        // A local key problem is neither the caller's fault nor retryable.
+        assert!(!J::InvalidKey.is_user_error());
+        assert!(!J::InvalidKey.is_retryable());
+    }
+
+    /// Every `WsError` variant with its kind; exhaustive like the JWT test.
+    #[cfg(feature = "ws")]
+    #[test]
+    fn every_ws_error_variant_is_classified() {
+        use ferroly::ws::WsError as W;
+        fn expected(e: &W) -> ErrorKind {
+            match e {
+                W::Timeout(_) => ErrorKind::Timeout,
+                W::Rejected { status } => match *status {
+                    401 => ErrorKind::Unauthenticated,
+                    403 => ErrorKind::PermissionDenied,
+                    _ => ErrorKind::Unavailable,
+                },
+                W::Protocol(_) => ErrorKind::Internal,
+                W::Connect(_) | W::Send(_) | W::Closed | W::QueueFull | W::Transport(_) => {
+                    ErrorKind::Unavailable
+                }
+            }
+        }
+        let all = [
+            W::Connect("refused".into()),
+            W::Rejected { status: 401 },
+            W::Rejected { status: 403 },
+            W::Rejected { status: 503 },
+            W::Timeout("connect".into()),
+            W::Send("x".into()),
+            W::Closed,
+            W::QueueFull,
+            W::Protocol("close code 1005 may not be sent".into()),
+            W::Transport("reset".into()),
+        ];
+        for e in &all {
+            assert_eq!(e.kind(), expected(e), "{e:?}");
+        }
+        // A protocol violation by the application is not worth retrying.
+        assert!(!W::Protocol("x".into()).is_retryable());
+    }
 
     #[test]
     fn empty_multi_error_reports_no_errors() {

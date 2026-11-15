@@ -9,19 +9,21 @@ point-in-time note on a span). Spans nest: a span started while another is
 current becomes its child, inheriting the same trace id and pointing back at its
 parent — so a whole request forms one causally-linked tree, across threads,
 `.await` points and (through the W3C `traceparent` header) across services.
-Finished spans are handed to pluggable **exporters** (JSON to a writer, or OTLP
-to a collector).
+Finished spans are handed to pluggable **exporters** (JSON or human-readable
+text to a writer, or OTLP to a collector).
 
 This complements [`log`](log.md) (structured logging) and
 [`metrics`](metrics.md) (counters/gauges/histograms + Prometheus) — it is the
 *tracing* leg of observability.
 
 Enable with the `obs` feature (`obs = ["codec"]`, std-only); the OTLP exporter
-also needs `http`:
+and the HTTP client trace interceptor also need `http`:
 
 ```toml
-ferroly = { version = "0.5", features = ["obs"] }              # spans + JSON export
-ferroly = { version = "0.5", features = ["obs", "http"] }      # + OTLP/HTTP export
+ferroly = { version = "0.6", features = ["obs"] }                     # spans + JSON / plain-text export
+ferroly = { version = "0.6", features = ["obs", "http"] }             # + OTLP/HTTP (JSON) export
+ferroly = { version = "0.6", features = ["obs", "http", "protobuf"] } # + OTLP/HTTP protobuf
+ferroly = { version = "0.6", features = ["obs", "grpc"] }             # + OTLP/gRPC
 ```
 
 ## At a glance
@@ -380,6 +382,7 @@ impl Exporter for Count {
 | `flush()` | flush every installed exporter |
 | `shutdown()` | shut every exporter down (each flushes) and remove them — call once at exit |
 | `JsonExporter::new(writer)` | built-in: one JSON object per span to any `Write` |
+| `PlainExporter::new(writer)` | built-in: human-readable lines in `log`'s plain style ([below](#plainexporter-output)) |
 
 Exporters are called with **no internal lock held**: an exporter may call
 `set_exporter`, `flush`, or start spans of its own. Spans that finish on a
@@ -421,10 +424,78 @@ struct-update syntax: `FinishedSpan { name: "x".into(), ..Default::default() }`.
 `kind` and `status` are always present; `status_message`, `links`, `trace_state`
 and `parent_remote` only when they carry something.
 
+### `PlainExporter` output
+
+The span counterpart of [`log`](log.md)'s plain format, for an application
+that offers a human output mode: pick one format and both logs and spans follow
+it.
+
+```rust
+use std::time::Duration;
+use ferroly::{log, obs};
+
+# let human = true;
+if human {
+    log::set_global(log::Logger::new());
+    obs::set_exporter(Box::new(
+        obs::PlainExporter::new(std::io::stderr()).min_duration(Duration::from_micros(100)),
+    ));
+} else {
+    log::set_global(log::Logger::json());
+    obs::set_exporter(Box::new(obs::JsonExporter::new(std::io::stderr())));
+}
+```
+
+One line per finished span, written when it ends, then one indented line per
+event:
+
+```text
+2026-11-15T09:12:03.120Z INFO  server listening addr=0.0.0.0:8080
+2026-11-15T09:12:03.121Z INFO  span request 48.2ms trace=4bf92f35 route=/v1/chat/completions tokens=24
+  event "first token" +12.3ms n=1
+2026-11-15T09:12:03.170Z INFO  request finished status=200
+```
+
+| Part | Format |
+|---|---|
+| span line | `<start> <LEVEL> span <name> <duration> trace=<8 hex> key=value …` |
+| event line | `  event <name> +<offset from span start> key=value …` |
+| status | a failed span (`Status::Error`) gets `status=error error=<message>` after the ids (`error=` left out for an empty message); `Ok` and `Unset` print nothing |
+| start | RFC 3339, UTC, milliseconds (see the options below) |
+| `LEVEL` | uppercase, padded to five columns, as in `log` |
+| duration / offset | `ns` below 1 µs, then `µs`, `ms`, `s` with three significant digits (`750ns`, `12.3µs`, `48.2ms`, `2.50s`); whole seconds from 1000 s |
+| names, keys, values | exactly as `log`'s plain format (the same code): strings bare unless empty or holding whitespace, a control character, `=`, `"` or `\` (then quoted and escaped); numbers, booleans and `null` as is; arrays and objects as compact JSON |
+
+A repeated field key prints once with its last value, and a field named like
+one of the line's own keys (`trace`, and `span` / `parent` / `status` / `error`
+when printed) moves to the end as `fields.<key>=…`. A standalone event (the
+zero-duration `event` span that `obs::event` emits with no current span) is
+written as one line, `<time> <LEVEL> event <message> trace=… key=value …`.
+`obs::event` marks that span as it hands it to the exporters, so any other
+span — even a real one named `event` — is written as a span.
+
+| Option | Effect |
+|---|---|
+| `.with_ids(true)` | full ids: `trace=<32 hex> span=<16 hex>` instead of the 8-digit trace prefix |
+| `.with_parent(true)` | adds `parent=<id>` to spans that have a parent (8 hex digits, or 16 with `with_ids`) |
+| `.min_duration(Duration)` | skips spans shorter than this (and their events); standalone events are always written |
+| `.time_precision(Precision)` | `Seconds`, `Millis` (default), `Micros`, `Nanos` — the same type as `log::Precision` |
+| `.utc_offset(seconds_east)` | timestamps at a fixed offset (`+05:30`), like `log::Logger::utc_offset` |
+| `.redact(log::Redactor)` | masks sensitive span and event fields like a `log::Logger` does (with the `log` feature; no redaction otherwise) |
+
+Like `JsonExporter`, the writer sits behind a mutex and each span — its line and
+its event lines — is written with one `write_all` under it, so spans finishing
+on many threads never interleave within a line. Nothing is buffered by the
+exporter: wrap the writer in a `BufWriter` to batch, and `obs::flush()` /
+`obs::shutdown()` flush it. Span kind, status and links are not printed; use
+`JsonExporter` or OTLP when you need them.
+
 ## OTLP export (`obs` + `http`)
 
 `OtlpHttpExporter` batches spans and `POST`s them to an OTLP `/v1/traces`
-endpoint as OTLP JSON, using the in-house [`http`](http.md) client.
+endpoint as OTLP JSON (the default), using the in-house [`http`](http.md)
+client — or as OTLP protobuf over HTTP, or over OTLP/gRPC (see
+[Protocols](#protocols)).
 
 ```rust,no_run
 use std::time::Duration;
@@ -463,6 +534,10 @@ settings.
 |---|---|---|
 | `resource(Resource)` / `service_name(name)` | `service.name = unknown_service` | who emits the spans |
 | `header(name, value)` | none | sent with every request — auth tokens, tenant ids |
+| `protocol(OtlpProtocol)` | `HttpJson` | the wire protocol; see [Protocols](#protocols) |
+| `tls(ClientTlsConfig)` | web PKI roots, TLS 1.2+ | trusted roots (a private CA), a client certificate (mutual TLS), minimum version |
+| `proxy(Proxy)` | none | a forward proxy (`https` collectors through a `CONNECT` tunnel) |
+| `http_client(Client)` | none | send with this client instead; `tls` and `proxy` are then ignored |
 | `timeout(Duration)` | 10 s | one request, connect to last byte |
 | `batch_size(n)` | 512 | spans per request; a full batch is sent at once |
 | `queue_size(n)` | 2048 | finished spans waiting to be sent |
@@ -471,15 +546,47 @@ settings.
 | `retry_backoff(Duration)` | 200 ms | first retry pause; doubles each time, capped at 30 s |
 | `flush_timeout(Duration)` | 5 s | the longest `flush` / `shutdown` wait |
 
+**Transport precedence.** A client given to `http_client` wins: it keeps its
+own TLS, proxy, pool and interceptors, and the exporter only sets its
+response-head timeout to `timeout` (`Client::with_timeout`) and bounds each
+export as a whole by the same timeout. Otherwise the exporter builds a client
+from `tls` and `proxy`. TLS options that cannot be built (for example no
+trusted root at all) do not fail `build()`: every batch then fails, without a
+retry, and `stats().last_error` says why. A TLS handshake failure (an
+untrusted certificate) is not retried either.
+
+A collector behind a private CA, with mutual TLS:
+
+```rust,no_run
+use ferroly::http::ClientTlsConfig;
+use ferroly::obs::OtlpHttpExporter;
+
+# async fn setup() -> Result<(), ferroly::http::HttpError> {
+# let (ca_pem, cert_pem, key_pem) = (b"", b"", b"");
+let tls = ClientTlsConfig::new()
+    .without_web_pki_roots()
+    .add_root_pem(ca_pem)?
+    .identity_pem(cert_pem, key_pem)?;
+let exporter = OtlpHttpExporter::builder("https://otel.internal:4318/v1/traces")
+    .tls(tls)
+    .build();
+# let _ = exporter;
+# Ok(())
+# }
+```
+
 ### Delivery guarantees
 
 - **Bounded.** `export` never blocks: it `try_send`s into a queue of
   `queue_size`. When the collector is slow or down and the queue is full, the
   span is **dropped and counted** (`dropped_spans`) — memory does not grow.
 - **Checked.** A batch counts as exported only on a **2xx** response.
-- **Retried.** A transport error, a timeout, or HTTP **429 / 502 / 503 / 504** is
-  retried with exponential backoff (a `Retry-After` header in seconds is
-  honoured). Any other status is a permanent failure and is not retried.
+- **Retried.** A transport error (other than a TLS failure), a timeout, or HTTP
+  **429 / 502 / 503 / 504** is retried with exponential backoff (a
+  `Retry-After` header in seconds is honoured). Over gRPC the retried statuses
+  are the ones the OTLP specification lists: `CANCELLED`, `DEADLINE_EXCEEDED`,
+  `RESOURCE_EXHAUSTED`, `ABORTED`, `OUT_OF_RANGE`, `UNAVAILABLE`, `DATA_LOSS`.
+  Any other status is a permanent failure and is not retried.
 - **Reported.** A batch that is given up on is counted (`failed_batches`,
   `failed_spans`) and described in `last_error`; it is then released, so a broken
   collector cannot pin memory.
@@ -499,6 +606,34 @@ thread), so there the call queues the request and returns immediately: use the
 `stats()` returns an `OtlpStats` snapshot: `exported_spans`, `dropped_spans`,
 `failed_spans`, `sent_batches`, `failed_batches`, `retries`, `last_error`.
 
+### Protocols
+
+| `OtlpProtocol` | Feature | Endpoint | Body |
+|---|---|---|---|
+| `HttpJson` (default) | `http` | `http(s)://host:4318/v1/traces` | OTLP JSON, `application/json` |
+| `HttpProtobuf` | `http` + `protobuf` | `http(s)://host:4318/v1/traces` | `ExportTraceServiceRequest`, `application/x-protobuf` |
+| `Grpc` | `grpc` | `http://host:4317` (h2c) or `https://host:4317`, no path | a unary `opentelemetry.proto.collector.trace.v1.TraceService/Export` call |
+
+```rust,no_run
+# #[cfg(feature = "protobuf")]
+# async fn setup() {
+use ferroly::obs::{OtlpHttpExporter, OtlpProtocol};
+
+let exporter = OtlpHttpExporter::builder("http://localhost:4318/v1/traces")
+    .protocol(OtlpProtocol::HttpProtobuf)
+    .build();
+# let _ = exporter;
+# }
+```
+
+The protobuf body is encoded by hand with [`ferroly::proto::wire`](proto.md)
+from the opentelemetry-proto field numbers: ids are raw bytes (16 and 8),
+times `fixed64` nanoseconds, `flags` a `fixed32`. Over gRPC, `header(..)`
+values are sent as metadata (names lowercased), the per-call deadline is
+`timeout`, and `http_client(..)` must have HTTP/2 enabled for the endpoint;
+through a `proxy` only an `https` collector can be reached (HTTP/2 needs the
+`CONNECT` tunnel).
+
 ### Wire format
 
 Standard OTLP/JSON (`resourceSpans → scopeSpans → spans`):
@@ -517,9 +652,13 @@ Standard OTLP/JSON (`resourceSpans → scopeSpans → spans`):
 | `resource.attributes` | the `Resource` |
 | `scope` | `{name: "ferroly", version}` |
 
-**Not implemented:** OTLP over protobuf (`application/x-protobuf`) and OTLP/gRPC,
-gzip compression, and parsing of a `partialSuccess` response body. Point the
-exporter at a collector's OTLP/HTTP JSON endpoint.
+The protobuf encoding carries the same values. One difference: an unsigned
+field above `i64::MAX`, which `int_value` cannot hold, is sent as its decimal
+`string_value`.
+
+**Not implemented:** gzip compression, and parsing of a `partialSuccess`
+response (JSON, protobuf or gRPC). Only traces are exported (no OTLP logs or
+metrics).
 
 ## Semantic-convention helpers
 
@@ -548,9 +687,46 @@ Built-in instrumentation that uses these helpers (each behind the `obs` feature)
   and runs a server span per request.
 - The [rest](rest.md) client injects `traceparent` into outgoing requests.
 - [genai](genai.md)'s `ObsObserver` records a span per model call with token usage.
+- `obs::TraceInterceptor` traces a raw [`http`](http.md) client (below).
+- [messaging](messaging.md)'s `Traced` wrapper records producer and consumer
+  spans around any provider and carries the context in the message.
 
-The raw `http` client and `messaging` do not create spans by themselves; use the
-helpers above (and `obs::inject` / `obs::extract`) at those boundaries.
+### Tracing a raw `http::Client` (`obs` + `http`)
+
+```rust,no_run
+use ferroly::http::{Client, Method, Request};
+use ferroly::obs::TraceInterceptor;
+
+# async fn ex() -> Result<(), ferroly::http::HttpError> {
+let client = Client::builder().interceptor(TraceInterceptor::new()).build()?;
+let resp = client
+    .send(Request::builder(Method::Get, "http://inventory:8080/items")?.build())
+    .await?;
+# let _ = resp;
+# Ok(())
+# }
+```
+
+For every request (every redirect hop) `TraceInterceptor` starts a `Client`
+span with `obs::http::client_span` as a child of the current context, injects
+its `traceparent` / `tracestate`, and ends it when the response head arrives
+(`record_client_status`: `4xx`/`5xx` → error) or the request fails (the error
+becomes the status). The span covers the time to the response head, not the
+body.
+
+- A request that already has a `traceparent` (set by the caller) is left
+  alone: no span, no header change.
+- With no recorded span (level filter, `obs::suppress`) the current context,
+  if any, is still injected.
+- At most 1024 spans are open at once (`TraceInterceptor::with_capacity(n)`);
+  beyond that the oldest is ended early, so requests that never complete (a
+  dropped future) cannot leak. An evicted span carries the attribute
+  `ferroly.span.evicted = true` (`obs::EVICTED_ATTRIBUTE`) and no status: the
+  request may still succeed, its outcome is just not recorded. `open_spans()`
+  reports the open count and `evicted_spans()` the evictions so far. Set the
+  capacity above the most requests the client has in flight at once; past it,
+  spans of live requests are evicted too. A redirect hop of an evicted request
+  is still recognised as the interceptor's own.
 
 ## Linking logs to traces
 
@@ -560,10 +736,12 @@ current span's `trace_id` and `span_id` to every log record — see
 
 ## Limitations
 
-- **OTLP is JSON over HTTP only** — no protobuf, gRPC or compression.
+- **OTLP export is traces only and uncompressed** (no gzip); a
+  `partialSuccess` answer is not inspected.
 - **Head sampling only**; no tail sampling, no per-span sampling attributes.
-- **No automatic instrumentation** of `http`, `turbo`, `genai` or `messaging` in
-  this module; use the helpers above.
+- **Instrumentation is opt-in**: turbo's `trace_context()`, the
+  `TraceInterceptor` for an `http::Client`, messaging's `Traced`, genai's
+  `ObsObserver`. The `http` server creates no spans by itself.
 - **`tracestate` is opaque** — passed through, never modified.
 - **Bare `SpanGuard`s across `.await`** can mis-parent sibling futures polled on
   the same thread (never corrupt them); wrap futures with `instrument` or
@@ -571,6 +749,9 @@ current span's `trace_id` and `span_id` to every log record — see
 - **Ids are not secrets.** After `fork()` without `exec`, a child process would
   continue the parent's per-thread id sequence.
 - Exporter, level and sampler are **process-global**.
+- **`PlainExporter` prints a subset** — no kind, links, `tracestate` or
+  per-event levels (a span's status only when it is an error); it is meant for
+  people at a terminal, not for machines.
 
 ## See also
 

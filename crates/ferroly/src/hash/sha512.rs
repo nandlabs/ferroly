@@ -119,6 +119,15 @@ struct Engine {
     total: u128,
 }
 
+impl Drop for Engine {
+    /// Wipes the chaining state; the block buffer wipes itself.
+    fn drop(&mut self) {
+        super::wipe(&mut self.h);
+        self.total = 0;
+        std::hint::black_box(&*self);
+    }
+}
+
 impl Engine {
     fn new(h: [u64; 8]) -> Self {
         Engine {
@@ -232,6 +241,9 @@ impl HashAlgorithm for Sha512 {
     fn finalize(self) -> Digest<64> {
         Sha512::finalize(self)
     }
+    fn wipe_output(output: &mut Digest<64>) {
+        super::wipe(output.as_mut());
+    }
 }
 
 /// An incremental SHA-384 hasher (FIPS 180-4): SHA-512 with a different
@@ -275,6 +287,9 @@ impl HashAlgorithm for Sha384 {
     }
     fn finalize(self) -> Digest<48> {
         Sha384::finalize(self)
+    }
+    fn wipe_output(output: &mut Digest<48>) {
+        super::wipe(output.as_mut());
     }
 }
 

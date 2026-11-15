@@ -815,7 +815,7 @@ pub fn event(level: Level, message: impl Into<String>, fields: Vec<(String, Valu
     if !sampler::should_sample(current.as_ref(), trace_id) || !super::has_exporter() {
         return;
     }
-    super::export(&FinishedSpan {
+    let span = FinishedSpan {
         name: "event".to_string(),
         trace_id: trace_id.to_string(),
         span_id: SpanId::random().to_string(),
@@ -828,7 +828,33 @@ pub fn event(level: Level, message: impl Into<String>, fields: Vec<(String, Valu
         parent_remote: current.as_ref().is_some_and(Context::is_remote),
         events: vec![event],
         ..FinishedSpan::default()
-    });
+    };
+    as_standalone_event(|| super::export(&span));
+}
+
+thread_local! {
+    /// Set while [`event`] hands its synthetic span to the exporters, so an
+    /// exporter can tell it from a real span of the same shape.
+    static STANDALONE_EVENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with [`exporting_standalone_event`] true on this thread.
+pub(super) fn as_standalone_event<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STANDALONE_EVENT.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(STANDALONE_EVENT.with(|flag| flag.replace(true)));
+    f()
+}
+
+/// True while an exporter is being handed the standalone-event span that
+/// [`event`] emits when no span is current (exporters run synchronously on
+/// the thread that finished the span).
+pub(super) fn exporting_standalone_event() -> bool {
+    STANDALONE_EVENT.with(std::cell::Cell::get)
 }
 
 /// Adds a field to the current span. Returns `false` when no span is current.

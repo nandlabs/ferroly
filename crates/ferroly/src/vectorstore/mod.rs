@@ -1,5 +1,6 @@
 //! Vector search abstraction — a [`VectorStore`] trait, an in-memory backend,
-//! similarity metrics, metadata filters, and a text chunker.
+//! similarity metrics, metadata filters, a text chunker, and plain-text /
+//! Markdown document loaders.
 //!
 //! Application code depends on the trait; construct the backend you want (or
 //! hold an `Arc<dyn VectorStore>` for runtime indirection). The trait is the
@@ -56,11 +57,17 @@ use ferroly_derive::FerrolyError;
 
 mod chunk;
 mod filter;
+mod loader;
 mod memory;
+mod offload;
 
 pub use chunk::{split_paragraphs, split_sentences, Boundary, Chunk, Chunker};
 pub use filter::Filter;
-pub use memory::MemoryStore;
+pub use loader::{
+    load_dir, load_dir_with, load_file, load_file_with, LoadOptions, LoadedText, TextChunk,
+    TextFormat,
+};
+pub use memory::{MemoryStore, DEFAULT_OFFLOAD_THRESHOLD};
 
 /// A boxed, `Send` future — the manual `async fn`-in-trait desugaring that keeps
 /// [`VectorStore`] object-safe without `async-trait`.

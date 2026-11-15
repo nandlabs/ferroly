@@ -1,6 +1,6 @@
 [package]
 name = "ferroly-derive"
-description = "Derive macros for the Ferroly toolkit (Encode, Decode, FerrolyError)."
+description = "Derive macros for the Ferroly toolkit (Encode, Decode, FerrolyError, protobuf Message)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

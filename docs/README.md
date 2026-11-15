@@ -11,7 +11,9 @@ Its defining constraint: **near-zero external dependencies.** The entire runtime
 dependency tree is just **`tokio`** (async runtime) and the **`rustls`** TLS
 stack. Everything else — JSON/XML/YAML/TOML codecs, HTTP/1.1, WebSocket framing,
 SHA-1/SHA-2/HMAC/HKDF, base64, JWT, the derive macros — is implemented in-house. If a
-module doesn't need async or TLS, it compiles with **no external crates at all**.
+module doesn't need async or TLS, it compiles with **no external crates at all**. The
+one optional exception is the opt-in `log-bridge` feature, which adds the dependency-free
+`log` facade crate (see [Bridging the `log` crate](log.md#bridging-the-log-crate)).
 
 > New here? Start with **[Getting Started](getting-started.md)**.
 
@@ -26,12 +28,13 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 |---|---|---|
 | [`codec`](codec.md) | `codec` *(default)* | `Value` model + `Encode`/`Decode` traits & derives; JSON/XML/YAML/TOML; content-type dispatch; shared parser limits; a streaming JSON fast path |
 | [`codec::schema`](schema.md) | `codec` | JSON-Schema **subset** validator over `Value` |
-| [derive macros](derive.md) | (with `codec`) | `#[derive(Encode, Decode)]` and `#[derive(FerrolyError)]` |
+| [derive macros](derive.md) | (with `codec`) | `#[derive(Encode, Decode)]` and `#[derive(FerrolyError)]` (and, with `protobuf`, `proto::Message` / `Oneof` / `Enumeration`) |
 | [`cli`](cli.md) | `cli` | Command-line parser: subcommands, typed, repeated and counted flags, groups, global flags, help, bash/zsh completion |
-| [`config`](config.md) | `config` | Layered configuration: env + files (JSON/YAML/TOML/XML/.properties) + CLI args; profiles, `${VAR}` interpolation, secrets from files, validation, provenance |
+| [`config`](config.md) | `config` | Layered configuration: env + files (JSON/YAML/TOML/XML/.properties) + CLI args; profiles, `${VAR}` interpolation, secrets from files, validation, provenance, unknown-key checks, config file discovery, secret references |
 | [`errutils`](errutils.md) | `errutils` *(default)* | `MultiError`, `.context()`, error classification (`Classify` / `ErrorKind`); the `#[derive(FerrolyError)]` typed-error macro |
 | [`hash`](hash.md) | `hash` | SHA-256/384/512, SHA-1, generic HMAC, HKDF, PBKDF2, base64, hex, `Secret`, random bytes; MD5 / CRC-32 checksums |
-| [`fsutils`](fsutils.md) | `fsutils` | Content-type detection; atomic writes, temp files, lock files; memory-mapped reads (`Mmap`) |
+| [`sig`](sig.md) | `sig` | Verify-only Ed25519 (RFC 8032): Ed25519, Ed25519ctx, Ed25519ph; strict decoding; streaming verifiers that compose with `hash` |
+| [`fsutils`](fsutils.md) | `fsutils` | Content-type detection; atomic writes, temp files, lock files; memory-mapped reads (`Mmap`); human-readable byte sizes (`size`, `ByteSize`) |
 | [`lifecycle`](lifecycle.md) | `lifecycle` | `Component` + `ComponentManager`: dependency-ordered start/stop, rollback, supervision, async health and readiness probes, shutdown and reload handles |
 
 ### Data & AI
@@ -39,12 +42,16 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 |---|---|---|
 | [`genai`](genai.md) | `genai` (+ `openai`/`claude`/`ollama`) | Provider-agnostic LLM interface: chat, typed streaming, tools, structured output, embeddings, prompt templates, observers, a mock provider |
 | [`genai::router`](model-router.md) | `genai` | Model router: capability, cost and rank-based selection; budgets; sticky routing; breaker-guarded, error-classified fallback |
+| [`proto`](proto.md) | `protobuf` | Protocol Buffers wire codec, `#[derive(proto::Message)]`, `.proto` parser and `build.rs` code generator with service descriptors — no `protoc` |
+| [`template`](template.md) | `template` | Sandboxed, bounded Jinja2-subset template engine: runs LLM chat templates (`tokenizer.chat_template`) with typed, positioned errors and limits |
 | [`vectorstore`](vectorstore.md) | `vectorstore` | `VectorStore` trait + in-memory backend with metadata filters, namespaces and snapshots; text chunking |
 
 ### Web & networking
 | Module | Feature | What it does |
 |---|---|---|
 | [`http`](http.md) | `http` | Hand-rolled HTTP/1.1 client + server: strict parsing, limits and timeouts, TLS / mTLS and certificate reload, proxies, redirects, SSE, resumable downloads |
+| [`http` (HTTP/2)](http.md#http2) | `http2` | Hand-rolled HTTP/2 for the same server and client: ALPN `h2`, h2c prior knowledge, HPACK, flow control, multiplexing, trailers, bidirectional streaming |
+| [`grpc`](grpc.md) | `grpc` | gRPC over HTTP/2: the four call shapes, status, metadata, deadlines, a `.proto` service generator and the health service |
 | [`turbo`](turbo.md) | `turbo` | Router: groups and mounts, async auth, JWT / JWKS, CORS, security headers, rate limiting, cookies, forms, multipart, static files, problem+json |
 | [`rest`](rest.md) | `rest` | REST client (retries, breakers, pagination) + lifecycle-managed server with TLS and health endpoints |
 | [`ws`](ws.md) | `ws` | RFC 6455 WebSocket client + server: async handlers, hub and rooms, origin policy, upgrade hook, keepalive, reconnect |
@@ -56,9 +63,11 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 |---|---|---|
 | [`messaging`](messaging.md) | `messaging` | Provider-agnostic messaging + an in-process bus: queues and topics, typed attributes, subscription filters, delivery context and deferred acks, priority, scheduling, ack / retry / DLQ with reasons, request-reply, graceful drain |
 | [`vfs`](vfs.md) | `vfs` | Virtual filesystem trait; rooted local and in-memory backends, scheme registry, atomic and streaming writes with abort, write preconditions, etags, glob |
+| [`store`](store.md) | `store`, `store-s3`, `store-hf`, `store-oci` | Content-addressed artifact cache (verify-on-write, atomic commit, resume, concurrent-safe) with S3 (SigV4), Hugging Face Hub and OCI registry fetch adapters |
 | [`log`](log.md) | `log` | Structured logger: JSON / text, multiple sinks, rotation, redaction, per-target levels, sampling, trace correlation |
+| [`log::bridge`](log.md#bridging-the-log-crate) | `log-bridge` | Routes records from the `log` facade crate into a ferroly `Logger` |
 | [`metrics`](metrics.md) | `metrics` | Counters, gauges, histograms (int and float); Prometheus and OpenMetrics text; cardinality guard; RED middleware for `turbo` |
-| [`obs`](obs.md) | `obs` | Tracing: async-safe spans, W3C trace context, sampling, exporters (JSON, OTLP/HTTP) |
+| [`obs`](obs.md) | `obs` | Tracing: async-safe spans, W3C trace context, sampling, exporters (JSON, plain text, OTLP/HTTP) |
 | [`auth`](auth.md) | `auth` | JWT: HS256/384/512 with a `Validation` policy; RS256 / ES256 via JWKS (with `http`); scopes and roles |
 
 ---
@@ -72,6 +81,7 @@ Enable only what you use — unused modules and their dependencies never compile
 | `errutils` | ✅ | — | — | — |
 | `codec` | ✅ | — | — | — |
 | `hash` | | — | — | — |
+| `sig` | | `hash` | — | — |
 | `cli` | | — | — | — |
 | `rt` | | tokio (all of it) | ✅ | — |
 | `rt-test-util` | | `rt` + tokio `test-util` (paused clock; for dev-dependencies) | ✅ | — |
@@ -79,6 +89,8 @@ Enable only what you use — unused modules and their dependencies never compile
 | `fsutils` | | — | — | — |
 | `lifecycle` | | tokio | ✅ | — |
 | `http` | | tokio + rustls | ✅ | ✅ |
+| `http2` | | `http` | ✅ | for ALPN `h2` |
+| `tls-ring` | ✅ | `ring` as the rustls crypto backend (only with `http`; see [TLS crypto backend](http.md#tls-crypto-backend)) | — | — |
 | `clients` | | `http`, `hash`, `codec` | ✅ | ✅ |
 | `turbo` | | `http`, `codec` | ✅ | ✅ |
 | `rest` | | `turbo`, `clients`, `lifecycle`, `codec` | ✅ | ✅ |
@@ -87,20 +99,27 @@ Enable only what you use — unused modules and their dependencies never compile
 | `openai` / `claude` / `ollama` | | `genai` | ✅ | ✅ |
 | `all-providers` | | all three | ✅ | ✅ |
 | `vectorstore` | | `codec` | — | — |
+| `template` | | `codec` | — | — |
 | `auth` | | `codec`, `hash` | — | — |
 | `log` | | `codec` | — | — |
+| `log-bridge` | | `log` + the `log` facade crate (no transitive deps) | — | — |
 | `metrics` | | — | — | — |
 | `obs` | | `codec` (+ `http` for OTLP) | for OTLP | — |
 | `messaging` | | `codec`, `lifecycle` | ✅ | — |
 | `vfs` | | tokio | ✅ | — |
+| `store` | | `http`, `hash` | ✅ | ✅ |
+| `store-s3` / `store-oci` | | `store`, `codec` | ✅ | ✅ |
+| `store-hf` | | `store` | ✅ | ✅ |
+| `protobuf` | | — | — | — |
+| `grpc` | | `http2`, `protobuf`, `hash` | ✅ | for ALPN `h2` |
 | `full` | | everything above | ✅ | ✅ |
 
 ```toml
 [dependencies]
 # just what you need
-ferroly = { version = "0.5", default-features = false, features = ["genai", "openai", "vectorstore"] }
+ferroly = { version = "0.6", default-features = false, features = ["genai", "openai", "vectorstore"] }
 # or everything
-ferroly = { version = "0.5", features = ["full"] }
+ferroly = { version = "0.6", features = ["full"] }
 ```
 
 ---

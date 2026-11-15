@@ -57,12 +57,13 @@ mod strategy;
 mod strategy_capability;
 mod strategy_composite;
 mod task;
+mod tenant;
 
 pub use budget::{Budget, BudgetStore, InMemoryBudgetStore};
 pub use capability::{parse_capability, AsOf, ModelInfo};
 pub use config::{
     CostOverride, CustomModel, DisabledCaps, ModelRef, RankOverride, RoutingConfig, RuleConfig,
-    DEFAULT_COST_STALENESS_DAYS,
+    TenantConfig, DEFAULT_COST_STALENESS_DAYS,
 };
 pub use default_router::{DefaultRouter, ModelRouter, RouterBuilder};
 pub use embedding_router::EmbeddingRouter;
@@ -76,3 +77,4 @@ pub use strategy::{default_output_estimate, satisfies, RoutingStrategy, RuleBase
 pub use strategy_capability::CapabilityStrategy;
 pub use strategy_composite::CompositeStrategy;
 pub use task::{Pin, Priority, Task, TaskKind};
+pub use tenant::TenantPolicy;

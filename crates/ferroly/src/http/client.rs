@@ -19,7 +19,7 @@ use super::message::{Body, BodyLimits, Framing, Reclaim, Request, Response};
 use super::pool::{Pool, PoolKey};
 use super::proxy::{Proxy, ProxyServer, Route};
 use super::transport::{self, ClientTlsConfig, Conn};
-use super::{HeaderMap, HttpError, Method, StatusCode, Uri};
+use super::{BodyStream, HeaderMap, HttpError, Method, Protocol, StatusCode, Uri};
 
 /// The `User-Agent` sent when the request does not carry one.
 const DEFAULT_USER_AGENT: &str = concat!("ferroly/", env!("CARGO_PKG_VERSION"));
@@ -32,7 +32,41 @@ const MAX_INTERIM_RESPONSES: usize = 16;
 const REDIRECT_DRAIN_BYTES: u64 = 64 * 1024;
 
 /// A body streamed from an async reader.
-type BodyStream<'a> = &'a mut (dyn AsyncRead + Send + Unpin);
+type UploadReader<'a> = &'a mut (dyn AsyncRead + Send + Unpin);
+
+/// Where a request's body comes from.
+enum Outgoing<'a> {
+    /// [`Request::body`].
+    Buffered,
+    /// A borrowed reader ([`Client::send_streaming`]).
+    Reader(UploadReader<'a>),
+    /// An owned stream ([`Client::send_body_stream`]); `None` once handed to
+    /// an HTTP/2 connection.
+    Stream(Option<BodyStream>),
+}
+
+/// How an HTTP/2 attempt ended.
+#[cfg(feature = "http2")]
+enum H2Attempt {
+    Done(Box<Response>),
+    /// The server chose HTTP/1.1 with ALPN on this new connection.
+    Http1(Conn),
+    /// Not over HTTP/2 (the origin is known to speak only HTTP/1.1).
+    Skip,
+}
+
+/// The client's HTTP/2 settings.
+#[cfg(feature = "http2")]
+#[derive(Clone)]
+struct H2Settings {
+    alpn: bool,
+    prior_knowledge: bool,
+    config: super::Http2Config,
+    idle_timeout: Option<Duration>,
+    /// Fail a request instead of sending it over HTTP/1.1 (set by
+    /// `ferroly::grpc`, which cannot work over HTTP/1.1).
+    required: bool,
+}
 
 /// Observes and adjusts the requests a [`Client`] sends — for example to
 /// inject trace or auth headers, or to record metrics.
@@ -81,7 +115,8 @@ pub trait Interceptor: Send + Sync {
 
 #[derive(Clone)]
 struct Config {
-    tls: Arc<rustls::ClientConfig>,
+    /// `None`: the shared default, resolved at the first TLS handshake.
+    tls: Option<Arc<rustls::ClientConfig>>,
     timeout: Option<Duration>,
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
@@ -93,6 +128,9 @@ struct Config {
     interceptors: Vec<Arc<dyn Interceptor>>,
     decompress: bool,
     head_limits: HeadLimits,
+    /// HTTP/2, when enabled.
+    #[cfg(feature = "http2")]
+    h2: Option<H2Settings>,
 }
 
 /// A low-level HTTP/1.1 client. Higher-level ergonomics (auth, retry,
@@ -103,6 +141,8 @@ struct Config {
 pub struct Client {
     cfg: Arc<Config>,
     pool: Arc<Pool>,
+    #[cfg(feature = "http2")]
+    h2: Arc<super::h2::client::H2Pool>,
 }
 
 impl std::fmt::Debug for Client {
@@ -138,16 +178,21 @@ impl Default for Client {
 /// | [`user_agent`](Self::user_agent) | `ferroly/<version>` |
 /// | [`pool_max_idle_per_host`](Self::pool_max_idle_per_host) | 32 |
 /// | [`pool_idle_timeout`](Self::pool_idle_timeout) | 90 s |
+/// | [`pool_max_active_per_host`](Self::pool_max_active_per_host) | unlimited |
 /// | [`max_redirects`](Self::max_redirects) | 0 (redirects not followed) |
 /// | [`proxy`](Self::proxy) | none |
 /// | [`decompress`](Self::decompress) | off |
 /// | [`tls`](Self::tls) | web PKI roots, TLS 1.2+ |
+/// | `http2` / `http2_prior_knowledge` (feature `http2`) | off: HTTP/1.1 only |
 #[must_use]
 pub struct ClientBuilder {
     cfg: Config,
     tls: Option<ClientTlsConfig>,
     pool_max_idle_per_host: usize,
     pool_idle_timeout: Option<Duration>,
+    pool_max_active_per_host: Option<usize>,
+    #[cfg(feature = "http2")]
+    h2: H2Settings,
 }
 
 impl std::fmt::Debug for ClientBuilder {
@@ -160,7 +205,7 @@ impl ClientBuilder {
     fn new() -> Self {
         Self {
             cfg: Config {
-                tls: transport::tls_config(),
+                tls: None,
                 timeout: Some(Duration::from_secs(60)),
                 connect_timeout: Some(Duration::from_secs(30)),
                 read_timeout: Some(Duration::from_secs(300)),
@@ -172,11 +217,68 @@ impl ClientBuilder {
                 interceptors: Vec::new(),
                 decompress: false,
                 head_limits: HeadLimits::client(),
+                #[cfg(feature = "http2")]
+                h2: None,
             },
             tls: None,
             pool_max_idle_per_host: 32,
             pool_idle_timeout: Some(Duration::from_secs(90)),
+            pool_max_active_per_host: None,
+            #[cfg(feature = "http2")]
+            h2: H2Settings {
+                alpn: false,
+                prior_knowledge: false,
+                config: super::Http2Config::default(),
+                idle_timeout: None,
+                required: false,
+            },
         }
+    }
+
+    /// Offers HTTP/2 to `https` servers with ALPN (`h2`, then `http/1.1`).
+    /// A server that selects `h2` gets its concurrent requests multiplexed
+    /// over a few connections per origin (a further one only when every
+    /// existing one is saturated, up to `Http2Config::max_connections_per_origin`,
+    /// default 4); a server that
+    /// selects HTTP/1.1 (or does not negotiate) is spoken to as before. Off by
+    /// default. Requests through a forward (non-tunnelling) proxy always use
+    /// HTTP/1.1. Requires the `http2` feature.
+    #[cfg(feature = "http2")]
+    pub fn http2(mut self, enabled: bool) -> Self {
+        self.h2.alpn = enabled;
+        self
+    }
+
+    /// Speaks cleartext HTTP/2 (h2c) to `http` URLs without negotiation
+    /// ("prior knowledge", RFC 9113 §3.3): use it only for servers known to
+    /// support it — an HTTP/1.1-only server fails the request. The h2c
+    /// `Upgrade` mechanism is not supported (RFC 9113 deprecates it). Off by
+    /// default. Requires the `http2` feature.
+    #[cfg(feature = "http2")]
+    pub fn http2_prior_knowledge(mut self, enabled: bool) -> Self {
+        self.h2.prior_knowledge = enabled;
+        self
+    }
+
+    /// Sets the HTTP/2 limits and windows used by this client's connections
+    /// (see [`Http2Config`](super::Http2Config)). Does not by itself enable
+    /// HTTP/2; see [`http2`](Self::http2). Requires the `http2` feature.
+    #[cfg(feature = "http2")]
+    pub fn http2_config(mut self, config: super::Http2Config) -> Self {
+        self.h2.config = config;
+        self
+    }
+
+    /// Makes every request fail with [`HttpError::Protocol`] instead of
+    /// going over HTTP/1.1: when HTTP/2 is not enabled for its URL (an `http`
+    /// URL without prior knowledge, an `https` URL without ALPN, a forward
+    /// proxy) or the server's ALPN answer is not `h2`. For protocols that
+    /// exist only over HTTP/2, such as gRPC.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(not(feature = "grpc"), allow(dead_code))]
+    pub(crate) fn require_http2(mut self) -> Self {
+        self.h2.required = true;
+        self
     }
 
     /// Deadline for getting a response **head**: it covers taking or opening a
@@ -252,6 +354,27 @@ impl ClientBuilder {
         self
     }
 
+    /// Caps the HTTP/1.1 connections to one target (host, port, scheme and
+    /// proxy) that are in use at once — being opened or carrying a request
+    /// and its response body — at `max` (at least 1). `None`, the default,
+    /// does not limit them.
+    ///
+    /// A request that finds every slot taken waits, in order, for one to be
+    /// released: when a response body has been read to the end (the
+    /// connection goes back to the pool, or is closed when it cannot be kept
+    /// alive), at once for a response without a body, or when the response
+    /// is dropped. The wait
+    /// counts against the response-head [`timeout`](Self::timeout) (and the
+    /// [`total_timeout`](Self::total_timeout)); running out of it fails with
+    /// [`HttpError::Timeout`]. Idle pooled connections do not count; they
+    /// are capped by [`pool_max_idle_per_host`](Self::pool_max_idle_per_host).
+    /// It does not apply to HTTP/2, whose connections per origin are capped
+    /// by `Http2Config::max_connections_per_origin` instead.
+    pub fn pool_max_active_per_host(mut self, max: Option<usize>) -> Self {
+        self.pool_max_active_per_host = max;
+        self
+    }
+
     /// Follows up to `max` redirects (`301`, `302`, `303`, `307`, `308`).
     /// `0`, the default, returns the redirect response to the caller.
     ///
@@ -306,14 +429,29 @@ impl ClientBuilder {
         self
     }
 
-    /// Builds the client. Fails only when the TLS options are invalid.
+    /// Builds the client. Fails only when the TLS options set with
+    /// [`tls`](Self::tls) are invalid or no rustls crypto provider is
+    /// available for them ([`HttpError::Tls`]). A client without custom TLS
+    /// options needs no provider until its first `https` request.
     pub fn build(mut self) -> Result<Client, HttpError> {
         if let Some(tls) = &self.tls {
-            self.cfg.tls = tls.build()?;
+            self.cfg.tls = Some(tls.build()?);
+        }
+        #[cfg(feature = "http2")]
+        if self.h2.alpn || self.h2.prior_knowledge {
+            let mut h2 = self.h2.clone();
+            h2.idle_timeout = self.pool_idle_timeout;
+            self.cfg.h2 = Some(h2);
         }
         Ok(Client {
             cfg: Arc::new(self.cfg),
-            pool: Pool::new(self.pool_max_idle_per_host, self.pool_idle_timeout),
+            pool: Pool::new(
+                self.pool_max_idle_per_host,
+                self.pool_idle_timeout,
+                self.pool_max_active_per_host,
+            ),
+            #[cfg(feature = "http2")]
+            h2: Arc::default(),
         })
     }
 }
@@ -354,7 +492,14 @@ enum Payload<'a> {
     Streaming {
         head: &'a [u8],
         encoding: BodyEncoding,
-        body: BodyStream<'a>,
+        body: UploadReader<'a>,
+    },
+    /// An encoded head followed by a body (and trailers) from a
+    /// [`BodyStream`].
+    Piped {
+        head: &'a [u8],
+        encoding: BodyEncoding,
+        body: &'a mut BodyStream,
     },
 }
 
@@ -366,8 +511,14 @@ impl Client {
     pub fn new() -> Self {
         let builder = ClientBuilder::new();
         Client {
-            pool: Pool::new(builder.pool_max_idle_per_host, builder.pool_idle_timeout),
+            pool: Pool::new(
+                builder.pool_max_idle_per_host,
+                builder.pool_idle_timeout,
+                builder.pool_max_active_per_host,
+            ),
             cfg: Arc::new(builder.cfg),
+            #[cfg(feature = "http2")]
+            h2: Arc::default(),
         }
     }
 
@@ -382,6 +533,44 @@ impl Client {
     /// timeouts keep their values.
     pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
         Arc::make_mut(&mut self.cfg).timeout = timeout;
+        self
+    }
+
+    /// Sets how many redirects are followed (`0` returns every redirect to
+    /// the caller). Equivalent to [`ClientBuilder::max_redirects`]; the
+    /// connection pool and the other settings are kept.
+    pub fn with_max_redirects(mut self, max: usize) -> Self {
+        if self.cfg.max_redirects != max {
+            Arc::make_mut(&mut self.cfg).max_redirects = max;
+        }
+        self
+    }
+
+    /// This client with HTTP/2 required (see `ClientBuilder::require_http2`),
+    /// sharing its pools; `None` when HTTP/2 is not enabled for `https`
+    /// (ALPN) or `http` (prior knowledge) URLs, whichever `https` names.
+    #[cfg(feature = "grpc")]
+    pub(crate) fn requiring_http2(mut self, https: bool) -> Option<Self> {
+        let h2 = self.cfg.h2.as_ref()?;
+        let enabled = if https { h2.alpn } else { h2.prior_knowledge };
+        if !enabled {
+            return None;
+        }
+        if !h2.required {
+            if let Some(h2) = Arc::make_mut(&mut self.cfg).h2.as_mut() {
+                h2.required = true;
+            }
+        }
+        Some(self)
+    }
+
+    /// Turns transparent response decompression on or off. Equivalent to
+    /// [`ClientBuilder::decompress`]; the connection pool and the other
+    /// settings are kept.
+    pub fn with_decompress(mut self, enabled: bool) -> Self {
+        if self.cfg.decompress != enabled {
+            Arc::make_mut(&mut self.cfg).decompress = enabled;
+        }
         self
     }
 
@@ -415,7 +604,43 @@ impl Client {
         within(deadline, async {
             let mut req = req;
             self.before(&mut req)?;
-            let result = self.send_once(&req, Some(&mut body), deadline).await;
+            let result = self
+                .send_once(&req, Outgoing::Reader(&mut body), deadline)
+                .await;
+            self.after(&req, result)
+        })
+        .await
+    }
+
+    /// Sends a request whose body is read from `body`, instead of from
+    /// [`Request::body`] (which is ignored), and returns as soon as the
+    /// response head arrives.
+    ///
+    /// Over HTTP/2 the body is uploaded by a background task while the
+    /// response is read — both directions stream at once on one stream, as
+    /// gRPC's bidirectional calls need — and the trailers the body ends with
+    /// ([`BodySender::send_trailers`](super::BodySender::send_trailers)) are
+    /// sent as a trailing HEADERS frame. If the body fails (its sender is
+    /// dropped without finishing) the stream is reset. Over HTTP/1.1 the
+    /// body is uploaded first, with chunked transfer encoding and its
+    /// trailers in the trailer section (or as exactly `Content-Length` bytes
+    /// when the request sets one), and then the response is read.
+    ///
+    /// Like [`send_streaming`](Self::send_streaming), the request is never
+    /// redirected, and is retried (on HTTP/2) only when the server refused
+    /// it before any of the body was taken.
+    pub async fn send_body_stream(
+        &self,
+        req: Request,
+        body: BodyStream,
+    ) -> Result<Response, HttpError> {
+        let deadline = self.deadline();
+        within(deadline, async {
+            let mut req = req;
+            self.before(&mut req)?;
+            let result = self
+                .send_once(&req, Outgoing::Stream(Some(body)), deadline)
+                .await;
             self.after(&req, result)
         })
         .await
@@ -455,7 +680,7 @@ impl Client {
         let mut hops = 0usize;
         loop {
             self.before(&mut req)?;
-            let result = self.send_once(&req, None, deadline).await;
+            let result = self.send_once(&req, Outgoing::Buffered, deadline).await;
             let resp = self.after(&req, result)?;
             if self.cfg.max_redirects == 0 || !resp.status().is_redirection() {
                 return Ok(resp);
@@ -486,9 +711,11 @@ impl Client {
     async fn send_once(
         &self,
         req: &Request,
-        stream: Option<BodyStream<'_>>,
+        body: Outgoing<'_>,
         deadline: Option<Instant>,
     ) -> Result<Response, HttpError> {
+        #[cfg(feature = "http2")]
+        let mut body = body;
         let route = self.route(&req.uri);
         let (absolute_form, proxy_authorization, proxy_id) = match &route {
             Route::Direct => (false, None, None),
@@ -508,41 +735,103 @@ impl Client {
             proxy: proxy_id,
         };
 
-        match stream {
-            None => {
+        // A connection opened while trying HTTP/2 whose ALPN answer was
+        // HTTP/1.1: used for this request instead of a new one.
+        #[allow(unused_mut)]
+        let mut fresh: Option<Conn> = None;
+        #[cfg(feature = "http2")]
+        let required = self.cfg.h2.as_ref().is_some_and(|h2| h2.required);
+        #[cfg(feature = "http2")]
+        let no_h2 = || {
+            HttpError::Protocol(format!(
+                "{} did not negotiate HTTP/2 (or HTTP/2 is not enabled for it), \
+                 which this client requires",
+                req.uri.authority()
+            ))
+        };
+        #[cfg(feature = "http2")]
+        if required && self.h2_mode(req, &route).is_none() {
+            return Err(no_h2());
+        }
+        #[cfg(feature = "http2")]
+        if let Some(prior_knowledge) = self.h2_mode(req, &route) {
+            let buffered = matches!(body, Outgoing::Buffered);
+            let attempt = self.try_h2(
+                req,
+                &mut body,
+                &route,
+                &key,
+                &wire,
+                prior_knowledge,
+                deadline,
+            );
+            let attempt = match (buffered, self.cfg.timeout) {
+                (true, Some(limit)) => match tokio::time::timeout(limit, attempt).await {
+                    Ok(result) => result?,
+                    Err(_) => return Err(HttpError::Timeout),
+                },
+                _ => attempt.await?,
+            };
+            match attempt {
+                H2Attempt::Done(resp) => return Ok(*resp),
+                H2Attempt::Http1(_) | H2Attempt::Skip if required => return Err(no_h2()),
+                H2Attempt::Http1(conn) => fresh = Some(conn),
+                H2Attempt::Skip => {}
+            }
+        }
+
+        match body {
+            Outgoing::Buffered => {
                 // Encode before touching a connection: a request that cannot
                 // be sent safely must not cost a pooled connection.
                 let (first, rest) = io::encode_request(req, &wire)?;
                 let exchange = async {
-                    if let Some(reader) = self.pool.take(&key) {
-                        let payload = Payload::Buffered {
-                            first: &first,
-                            rest,
-                        };
-                        match self.exchange(reader, req, payload, &key, deadline).await {
-                            Ok(resp) => return Ok(resp),
-                            Err(failure) => {
-                                // The connection was reused, so the failure may
-                                // only mean the server had closed it. Re-send
-                                // on a fresh one when that cannot repeat a
-                                // side effect.
-                                let safe = !failure.response_started
-                                    && !matches!(failure.error, HttpError::Timeout)
-                                    && (failure.nothing_written || req.method.is_idempotent());
-                                if !safe {
-                                    return Err(failure.error);
+                    // A slot under the per-host cap, for whichever connection
+                    // ends up carrying the request (waiting is timed with it).
+                    let mut slot = self.pool.acquire(&key).await;
+                    if fresh.is_none() {
+                        if let Some(reader) = self.pool.take(&key) {
+                            let payload = Payload::Buffered {
+                                first: &first,
+                                rest,
+                            };
+                            let attempt =
+                                self.exchange(reader, req, payload, &key, deadline, &mut slot);
+                            match attempt.await {
+                                Ok(resp) => return Ok(resp),
+                                Err(failure) => {
+                                    // The connection was reused, so the
+                                    // failure may only mean the server had
+                                    // closed it. Re-send on a fresh one when
+                                    // that cannot repeat a side effect.
+                                    let safe = !failure.response_started
+                                        && !matches!(failure.error, HttpError::Timeout)
+                                        && (failure.nothing_written || req.method.is_idempotent());
+                                    if !safe {
+                                        return Err(failure.error);
+                                    }
                                 }
                             }
                         }
                     }
-                    let conn = self.connect(&req.uri, &route).await?;
+                    let conn = match fresh {
+                        Some(conn) => conn,
+                        None => self.connect(&req.uri, &route).await?,
+                    };
                     let payload = Payload::Buffered {
                         first: &first,
                         rest,
                     };
-                    self.exchange(BufReader::new(conn), req, payload, &key, deadline)
-                        .await
-                        .map_err(|f| f.error)
+                    self.exchange(
+                        BufReader::new(conn),
+                        req,
+                        payload,
+                        &key,
+                        deadline,
+                        &mut slot,
+                    )
+                    .await
+                    .map_err(|f| f.error)
                 };
                 match self.cfg.timeout {
                     Some(limit) => match tokio::time::timeout(limit, exchange).await {
@@ -552,41 +841,324 @@ impl Client {
                     None => exchange.await,
                 }
             }
-            Some(body) => {
+            Outgoing::Reader(body) => {
                 let (head, encoding) = io::encode_request_head(req, &wire, None)?;
-                let conn = match self.cfg.timeout {
-                    Some(limit) => {
-                        match tokio::time::timeout(limit, self.connect(&req.uri, &route)).await {
-                            Ok(result) => result?,
-                            Err(_) => return Err(HttpError::Timeout),
-                        }
-                    }
-                    None => self.connect(&req.uri, &route).await?,
-                };
+                let mut slot = self.acquire_timed(&key).await?;
+                let conn = self.connect_timed(&req.uri, &route, fresh).await?;
                 let payload = Payload::Streaming {
                     head: &head,
                     encoding,
                     body,
                 };
-                self.exchange(BufReader::new(conn), req, payload, &key, deadline)
-                    .await
-                    .map_err(|f| f.error)
+                self.exchange(
+                    BufReader::new(conn),
+                    req,
+                    payload,
+                    &key,
+                    deadline,
+                    &mut slot,
+                )
+                .await
+                .map_err(|f| f.error)
+            }
+            Outgoing::Stream(stream) => {
+                let mut stream = stream.unwrap_or_else(BodyStream::empty);
+                let (head, encoding) = io::encode_request_head(req, &wire, None)?;
+                let mut slot = self.acquire_timed(&key).await?;
+                let conn = self.connect_timed(&req.uri, &route, fresh).await?;
+                let payload = Payload::Piped {
+                    head: &head,
+                    encoding,
+                    body: &mut stream,
+                };
+                self.exchange(
+                    BufReader::new(conn),
+                    req,
+                    payload,
+                    &key,
+                    deadline,
+                    &mut slot,
+                )
+                .await
+                .map_err(|f| f.error)
             }
         }
+    }
+
+    /// A slot under the per-host active-connection cap, within the
+    /// response-head timeout.
+    async fn acquire_timed(
+        &self,
+        key: &PoolKey,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, HttpError> {
+        match self.cfg.timeout {
+            Some(limit) => tokio::time::timeout(limit, self.pool.acquire(key))
+                .await
+                .map_err(|_| HttpError::Timeout),
+            None => Ok(self.pool.acquire(key).await),
+        }
+    }
+
+    /// `fresh`, or a new connection within the response-head timeout.
+    async fn connect_timed(
+        &self,
+        target: &Uri,
+        route: &Route<'_>,
+        fresh: Option<Conn>,
+    ) -> Result<Conn, HttpError> {
+        if let Some(conn) = fresh {
+            return Ok(conn);
+        }
+        match self.cfg.timeout {
+            Some(limit) => match tokio::time::timeout(limit, self.connect(target, route)).await {
+                Ok(result) => result,
+                Err(_) => Err(HttpError::Timeout),
+            },
+            None => self.connect(target, route).await,
+        }
+    }
+
+    /// Whether `req` goes over HTTP/2: `Some(false)` to offer `h2` with ALPN
+    /// (https, direct or through a CONNECT tunnel), `Some(true)` for
+    /// cleartext h2c with prior knowledge (http, direct only).
+    #[cfg(feature = "http2")]
+    fn h2_mode(&self, req: &Request, route: &Route<'_>) -> Option<bool> {
+        let h2 = self.cfg.h2.as_ref()?;
+        if matches!(req.method, Method::Connect) {
+            return None;
+        }
+        match (req.uri.scheme.as_str(), route) {
+            ("https", Route::Direct | Route::Tunnel(_)) if h2.alpn => Some(false),
+            ("http", Route::Direct) if h2.prior_knowledge => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Sends `req` over HTTP/2 when the origin speaks it: on the origin's
+    /// existing connection, or on a new one (set up once even for concurrent
+    /// first requests), never more than `max_connections_per_origin`. A
+    /// refused stream is retried once when the body can be replayed: on
+    /// another connection with a free stream slot whose server has announced
+    /// its stream limit, else on a new one while the origin is below
+    /// `max_connections_per_origin`, else on the least loaded one (which may
+    /// be the one that refused it).
+    #[cfg(feature = "http2")]
+    #[allow(clippy::too_many_arguments)]
+    async fn try_h2(
+        &self,
+        req: &Request,
+        body: &mut Outgoing<'_>,
+        route: &Route<'_>,
+        key: &PoolKey,
+        wire: &RequestWire<'_>,
+        prior_knowledge: bool,
+        deadline: Option<Instant>,
+    ) -> Result<H2Attempt, HttpError> {
+        use super::h2::client::{self as h2c, Failure, Upload};
+        let Some(settings) = self.cfg.h2.as_ref() else {
+            return Ok(H2Attempt::Skip);
+        };
+        let buffered = matches!(body, Outgoing::Buffered);
+        let fields = h2c::request_fields(req, wire, buffered.then_some(req.body.len()))?;
+        let head_request = matches!(req.method, Method::Head);
+        // A buffered exchange is timed as a whole by the caller; a streamed
+        // one times only the wait for the response head.
+        let head_timeout = if buffered { None } else { self.cfg.timeout };
+        use super::h2::client::Pick;
+        let max_conns = settings.config.normalized().max_connections_per_origin;
+        let refused = || {
+            super::h2::error::h2_error(super::Http2Cause::Refused, "the server refused the request")
+        };
+        // The connection the first attempt failed on.
+        let mut failed: Option<super::h2::client::H2Conn> = None;
+        for attempt in 0..2 {
+            // The first attempt takes a connection with a free stream slot; a
+            // retry (after a refusal or a lost connection) takes one other
+            // than the connection that failed, dialing below `max_conns` and
+            // going back to the least loaded one only at the limit. A new
+            // connection is dialed only under the origin's setup lock and
+            // below `max_conns`, so neither a burst nor its retries open more
+            // than that.
+            let pick = |pool: &super::h2::client::H2Pool| match &failed {
+                Some(f) => pool.get_retry(key, max_conns, f),
+                None => pool.get(key, max_conns),
+            };
+            let existing = match pick(&self.h2) {
+                Pick::Use(conn) => Some(conn),
+                _ => None,
+            };
+            let reused = existing.is_some();
+            let conn = match existing {
+                Some(conn) => conn,
+                None => {
+                    if !prior_knowledge && self.h2.is_h1_only(key) {
+                        return Ok(H2Attempt::Skip);
+                    }
+                    let _setup = self.h2.setup_lock(key).await;
+                    // Someone may have dialed while we waited.
+                    match pick(&self.h2) {
+                        Pick::Use(conn) => conn,
+                        _ => {
+                            let (io, is_h2) =
+                                self.connect_h2(&req.uri, route, prior_knowledge).await?;
+                            if !is_h2 {
+                                self.h2.mark_h1_only(key.clone());
+                                return Ok(H2Attempt::Http1(io));
+                            }
+                            let conn = h2c::start(
+                                io,
+                                &settings.config,
+                                settings.idle_timeout,
+                                self.cfg.read_timeout,
+                            );
+                            self.h2.insert(key.clone(), conn.clone());
+                            conn
+                        }
+                    }
+                }
+            };
+            let (result, left) = {
+                let mut upload = match body {
+                    Outgoing::Buffered => Upload::Buffered(&req.body),
+                    Outgoing::Reader(r) => Upload::Reader(&mut **r),
+                    Outgoing::Stream(s) => Upload::Stream(s.take()),
+                };
+                let result = h2c::exchange(
+                    &conn,
+                    fields.clone(),
+                    &mut upload,
+                    head_request,
+                    self.cfg.read_timeout,
+                    head_timeout,
+                )
+                .await;
+                let left = match upload {
+                    Upload::Stream(s) => s,
+                    _ => None,
+                };
+                (result, left)
+            };
+            if let (Some(left), Outgoing::Stream(slot)) = (left, &mut *body) {
+                *slot = Some(left);
+            }
+            failed = Some(conn);
+            match result {
+                Ok(head) => {
+                    let resp = self.h2_response(req, head, deadline);
+                    return Ok(H2Attempt::Done(Box::new(resp)));
+                }
+                Err(Failure::Refused { sent }) => {
+                    let replayable = buffered || !sent;
+                    if !replayable || attempt == 1 {
+                        return Err(refused());
+                    }
+                }
+                Err(Failure::Lost { sent, error }) => {
+                    // A reused connection that died without GOAWAY (a TCP
+                    // reset, a NAT timeout): like the HTTP/1.1 pool, retry
+                    // once on a new connection when that cannot repeat a
+                    // side effect.
+                    let replayable = buffered || !sent;
+                    let safe = reused && replayable && req.method.is_idempotent();
+                    if !safe || attempt == 1 {
+                        return Err(error);
+                    }
+                }
+                Err(Failure::Error(e)) => return Err(e),
+            }
+        }
+        Err(refused())
+    }
+
+    /// Opens a connection for HTTP/2: TLS offering `h2` with ALPN (returning
+    /// whether the server chose it), or plain TCP for prior knowledge.
+    #[cfg(feature = "http2")]
+    async fn connect_h2(
+        &self,
+        target: &Uri,
+        route: &Route<'_>,
+        prior_knowledge: bool,
+    ) -> Result<(Conn, bool), HttpError> {
+        let open = async {
+            if prior_knowledge {
+                let tcp = transport::connect_tcp(&target.host, target.port).await?;
+                return Ok((Box::new(tcp) as Conn, true));
+            }
+            let tls = self.h2.alpn_config(&self.tls()?);
+            let conn: Conn = match route {
+                Route::Tunnel(proxy) => {
+                    let conn = self.dial(&proxy.uri).await?;
+                    self.open_tunnel(conn, target, proxy).await?
+                }
+                _ => Box::new(transport::connect_tcp(&target.host, target.port).await?),
+            };
+            let (conn, alpn) = transport::tls_handshake_alpn(conn, &target.host, &tls).await?;
+            Ok((conn, alpn.as_deref() == Some(transport::ALPN_H2)))
+        };
+        match self.cfg.connect_timeout {
+            Some(limit) => match tokio::time::timeout(limit, open).await {
+                Ok(result) => result,
+                Err(_) => Err(HttpError::ConnectTimeout),
+            },
+            None => open.await,
+        }
+    }
+
+    /// Wraps an HTTP/2 response head and body stream in a [`Response`].
+    #[cfg(feature = "http2")]
+    fn h2_response(
+        &self,
+        req: &Request,
+        head: super::h2::client::Head,
+        deadline: Option<Instant>,
+    ) -> Response {
+        let limits = BodyLimits {
+            max_bytes: self.cfg.max_body,
+            read_timeout: self.cfg.read_timeout,
+            deadline,
+            head: self.cfg.head_limits,
+        };
+        let status = StatusCode(head.status);
+        let mut headers = head.headers;
+        let body = Body::h2(head.body, limits, head.upload);
+        let has_body = !matches!(req.method, Method::Head) && !matches!(head.status, 204 | 304);
+        let body = self.decoded(body, &mut headers, has_body);
+        Response::new(status, headers, req.uri.clone(), body).with_protocol(Protocol::Http2)
+    }
+
+    /// Applies transparent decompression when it is on and the body is
+    /// encoded with a single supported coding.
+    fn decoded(&self, mut body: Body, headers: &mut HeaderMap, has_body: bool) -> Body {
+        if self.cfg.decompress && has_body {
+            let decoder = {
+                let mut encodings = headers.get_all("content-encoding");
+                match (encodings.next(), encodings.next()) {
+                    (Some(encoding), None) => Decoder::for_content_encoding(encoding),
+                    _ => None,
+                }
+            };
+            if let Some(decoder) = decoder {
+                body = body.with_decoder(decoder);
+                // The headers describe the encoded form, which the caller no
+                // longer sees.
+                headers.remove("content-encoding");
+                headers.remove("content-length");
+            }
+        }
+        body
     }
 
     /// Opens a connection for `target` along `route`, within the connect
     /// timeout.
     async fn connect(&self, target: &Uri, route: &Route<'_>) -> Result<Conn, HttpError> {
-        let tls = &self.cfg.tls;
         let open = async {
             match route {
-                Route::Direct => transport::connect(target, tls).await,
-                Route::Forward(proxy) => transport::connect(&proxy.uri, tls).await,
+                Route::Direct => self.dial(target).await,
+                Route::Forward(proxy) => self.dial(&proxy.uri).await,
                 Route::Tunnel(proxy) => {
-                    let conn = transport::connect(&proxy.uri, tls).await?;
+                    let conn = self.dial(&proxy.uri).await?;
                     let conn = self.open_tunnel(conn, target, proxy).await?;
-                    transport::tls_handshake(conn, &target.host, tls).await
+                    transport::tls_handshake(conn, &target.host, &self.tls()?).await
                 }
             }
         };
@@ -596,6 +1168,25 @@ impl Client {
                 Err(_) => Err(HttpError::ConnectTimeout),
             },
             None => open.await,
+        }
+    }
+
+    /// The TLS configuration for a handshake: the one given to
+    /// [`ClientBuilder::tls`], else the shared default. Resolved only when a
+    /// handshake happens, so plain-text traffic needs no crypto provider.
+    fn tls(&self) -> Result<Arc<rustls::ClientConfig>, HttpError> {
+        match &self.cfg.tls {
+            Some(tls) => Ok(tls.clone()),
+            None => transport::tls_config(),
+        }
+    }
+
+    /// Opens a connection to the URI's host, wrapping it in TLS for `https`.
+    async fn dial(&self, uri: &Uri) -> Result<Conn, HttpError> {
+        if uri.is_tls() {
+            transport::connect(uri, &self.tls()?).await
+        } else {
+            Ok(Box::new(transport::connect_tcp(&uri.host, uri.port).await?))
         }
     }
 
@@ -647,6 +1238,7 @@ impl Client {
         payload: Payload<'_>,
         key: &PoolKey,
         deadline: Option<Instant>,
+        slot: &mut Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Response, Failure> {
         let mut streamed = false;
         match payload {
@@ -676,6 +1268,21 @@ impl Client {
                 let write = async {
                     io::bounded(idle, reader.write_all(head)).await?;
                     io::write_body_stream(&mut reader, encoding, body, idle).await
+                };
+                if let Err(e) = write.await {
+                    return Err(Failure::after_write(e, false));
+                }
+            }
+            Payload::Piped {
+                head,
+                encoding,
+                body,
+            } => {
+                streamed = true;
+                let idle = self.cfg.read_timeout;
+                let write = async {
+                    io::bounded(idle, reader.write_all(head)).await?;
+                    io::write_piped_body(&mut reader, encoding, body, idle).await
                 };
                 if let Err(e) = write.await {
                     return Err(Failure::after_write(e, false));
@@ -741,7 +1348,7 @@ impl Client {
             deadline,
             head: self.cfg.head_limits,
         };
-        let mut body = if reusable {
+        let body = if reusable {
             Body::pooled(
                 reader,
                 framing,
@@ -754,24 +1361,14 @@ impl Client {
         } else {
             Body::new(reader, framing, limits)
         };
+        let body = body.holding(slot.take());
 
-        if self.cfg.decompress && has_body {
-            let decoder = {
-                let mut encodings = headers.get_all("content-encoding");
-                match (encodings.next(), encodings.next()) {
-                    (Some(encoding), None) => Decoder::for_content_encoding(encoding),
-                    _ => None,
-                }
-            };
-            if let Some(decoder) = decoder {
-                body = body.with_decoder(decoder);
-                // The headers describe the encoded form, which the caller no
-                // longer sees.
-                headers.remove("content-encoding");
-                headers.remove("content-length");
-            }
-        }
-        Ok(Response::new(status, headers, req.uri.clone(), body))
+        let body = self.decoded(body, &mut headers, has_body);
+        let protocol = match head.version {
+            Version::Http10 => Protocol::Http10,
+            Version::Http11 => Protocol::Http11,
+        };
+        Ok(Response::new(status, headers, req.uri.clone(), body).with_protocol(protocol))
     }
 }
 

@@ -1,0 +1,1 @@
+{% for v in x if v is not none %}{{ loop.index }}/{{ loop.length }}{{ loop.previtem }}{{ loop.cycle('a','b') }}{% else %}e{% endfor %}

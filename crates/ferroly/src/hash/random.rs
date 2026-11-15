@@ -14,30 +14,33 @@
 //!
 //! # Platform support
 //!
-//! ferroly allows neither extra dependencies nor `unsafe`, which rules out the
-//! `getrandom(2)` / `BCryptGenRandom` system calls. The only remaining portable
-//! route to the kernel CSPRNG is the device file:
+//! ferroly takes no dependency for this (no `getrandom`, no `libc`), so each
+//! platform's kernel CSPRNG is reached directly:
 //!
 //! | Platform | Source | Result |
 //! |---|---|---|
-//! | Unix (Linux, macOS, the BSDs, …) | `/dev/urandom` | random bytes |
-//! | Everything else (Windows, wasm, …) | none | [`RandomError::Unsupported`] |
+//! | Unix (Linux, macOS, iOS, Android, the BSDs, …) | `/dev/urandom` | random bytes |
+//! | Windows (every target, including UWP and `-gnu`) | `BCryptGenRandom` with `BCRYPT_USE_SYSTEM_PREFERRED_RNG` (`bcrypt.dll`) | random bytes |
+//! | wasm (`wasm32-unknown-unknown`, WASI) and anything else | none | [`RandomError::Unsupported`] |
 //!
 //! There is deliberately **no fallback** to a weaker source (time, addresses,
 //! a userspace PRNG): an unsupported platform is an explicit error, never
 //! silently predictable output.
 //!
-//! Limits of the Unix path:
+//! **Windows** goes through a hand-written `extern "system"` declaration of
+//! `BCryptGenRandom`, linked against `bcrypt` (part of every Windows since
+//! Vista; the same system RNG the standard library and the `getrandom` crate
+//! use). This is one of ferroly's four audited `unsafe` regions: the
+//! `random/windows.rs` module, a single FFI call per 4 GiB chunk.
 //!
-//! - `/dev/urandom` must exist and be a character device. In a `chroot`,
-//!   container or sandbox without it, every call fails with
-//!   [`RandomError::Io`].
-//! - It consumes a file descriptor (opened once, kept for the process
-//!   lifetime), so it can fail under descriptor exhaustion on first use.
-//! - On Linux, `/dev/urandom` does not block before the kernel pool has been
-//!   initialised. That matters only very early at boot (initramfs, first boot
-//!   of an embedded device); do not generate long-lived keys there.
-
+//! **wasm** has no OS randomness ferroly can reach without a dependency: on
+//! `wasm32-unknown-unknown` randomness comes from the host (a JavaScript
+//! `crypto.getRandomValues` binding), and on WASI from the `random_get`
+//! import. Both need glue that ferroly does not ship, so every call returns
+//! [`RandomError::Unsupported`] and [`is_supported`] is `false`. Code that
+//! needs random bytes there must obtain them from the host and pass them in.
+//!
+//! Limits of the Unix path:
 use std::fmt;
 
 use super::{base64, hex, Secret};
@@ -46,8 +49,8 @@ use super::{base64, hex, Secret};
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RandomError {
-    /// This platform has no OS randomness source reachable without `unsafe`
-    /// or a dependency (anything that is not Unix).
+    /// This platform has no OS randomness source ferroly can reach without a
+    /// dependency (anything that is neither Unix nor Windows, such as wasm).
     Unsupported,
     /// The OS source exists but could not be opened or read.
     Io(std::io::Error),
@@ -79,10 +82,11 @@ impl From<std::io::Error> for RandomError {
     }
 }
 
-/// Whether [`fill`] can work on this platform (it may still fail at runtime
-/// if `/dev/urandom` is missing).
+/// Whether [`fill`] can work on this platform: `true` on Unix and Windows,
+/// `false` elsewhere (wasm). It may still fail at runtime, for example if
+/// `/dev/urandom` is missing.
 pub const fn is_supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
 }
 
 /// Fills `buf` with cryptographically secure random bytes from the OS.
@@ -120,7 +124,17 @@ fn os_fill(buf: &mut [u8]) -> Result<(), RandomError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn os_fill(buf: &mut [u8]) -> Result<(), RandomError> {
+    windows::fill(buf)
+}
+
+/// The Windows FFI: the crate's second audited `unsafe` region.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows;
+
+#[cfg(not(any(unix, windows)))]
 fn os_fill(_buf: &mut [u8]) -> Result<(), RandomError> {
     Err(RandomError::Unsupported)
 }
@@ -166,7 +180,7 @@ pub fn token_base64url(byte_len: usize) -> Result<String, RandomError> {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn fill_produces_distinct_non_constant_output() {
         let mut a = [0u8; 64];
@@ -179,7 +193,7 @@ mod tests {
         assert!(a.iter().any(|&x| x != a[0]));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn helpers_have_the_documented_shapes() {
         assert!(is_supported());
@@ -206,7 +220,7 @@ mod tests {
         assert_eq!(base64::decode_url_no_pad(&url_token).unwrap().len(), 32);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn large_requests_are_filled_completely() {
         // Larger than any single read the kernel is obliged to satisfy.
@@ -217,7 +231,7 @@ mod tests {
         assert!(big[big.len() - 4096..].iter().any(|&b| b != 0));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn concurrent_callers_get_independent_bytes() {
         let handles: Vec<_> = (0..8)
@@ -229,7 +243,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     #[test]
     fn unsupported_platforms_fail_explicitly() {
         assert!(!is_supported());

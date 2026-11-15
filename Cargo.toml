@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0 OR MIT"
@@ -20,10 +20,19 @@ authors = ["nandlabs"]
 tokio = { version = "1.38", default-features = false }
 
 # TLS engine (single crypto exception, isolated behind an internal transport trait)
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# No crypto backend is selected here: ferroly's `tls-ring` feature (on by
+# default) adds `ring`; without it the application installs its own rustls
+# CryptoProvider (e.g. aws-lc-rs).
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-pki-types = "1"
 webpki-roots = "1"
+
+# The single optional exception to the budget: the `log` facade crate, used only
+# by ferroly's `log-bridge` feature (off by default). Renamed because ferroly
+# already has a `log` feature for its own module. Its `std` feature (needed for
+# `set_boxed_logger`) and `kv` feature (key-value pairs) pull in no other crate.
+log-facade = { package = "log", version = "0.4.21", default-features = false, features = ["std", "kv"] }
 
 # build-time only — for our own derive macros
 proc-macro2 = "1"
@@ -31,17 +40,21 @@ quote = "1"
 syn = { version = "3", features = ["full"] }
 
 # internal proc-macro crate — the only companion crate to `ferroly`
-ferroly-derive    = { path = "crates/ferroly-derive",    version = "0.5.0" }
+ferroly-derive    = { path = "crates/ferroly-derive",    version = "0.6.0" }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 
 # Centralized lints applied to every workspace crate. The codebase is
-# `unsafe`-free except for a single audited region: `fsutils/mmap.rs`, a
-# `#[allow(unsafe_code)]` module wrapping the `mmap`/`munmap` FFI behind the
-# `unsafe fn Mmap::map` (the safe `Mmap::open` copies the file instead). `deny`
-# keeps every other `unsafe` a hard error while permitting that one reviewed
-# exception.
+# `unsafe`-free except for four audited regions, each an `#[allow(unsafe_code)]`
+# module: `fsutils/mmap.rs`, wrapping the `mmap`/`munmap` FFI behind the
+# `unsafe fn Mmap::map` (the safe `Mmap::open` copies the file instead);
+# `fsutils/oslock.rs`, the `flock` / `LockFileEx` calls behind the safe
+# `FileLock`; `hash/random/windows.rs`, the one `BCryptGenRandom` call of the
+# Windows CSPRNG; and `mod ffi` in `metrics/process.rs`, the read-only macOS
+# (`getrusage`, `getrlimit`, `proc_pidinfo`) and Windows (kernel32
+# process-statistics) calls behind the process collector. `deny` keeps every
+# other `unsafe` a hard error while permitting those reviewed exceptions.
 [workspace.lints.rust]
 unsafe_code = "deny"

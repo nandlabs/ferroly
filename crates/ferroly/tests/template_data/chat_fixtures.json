@@ -1,0 +1,2110 @@
+{
+ "generator": "Jinja2 3.1.4",
+ "templates": [
+  {
+   "name": "chatml",
+   "kind": "verbatim",
+   "repo": "HuggingFaceTB/SmolLM2-135M-Instruct",
+   "revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+   "licence": "Apache-2.0",
+   "template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n' }}{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}",
+   "bos_token": "<|im_start|>",
+   "eos_token": "<|im_end|>"
+  },
+  {
+   "name": "zephyr",
+   "kind": "verbatim",
+   "repo": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+   "revision": "fe8a4ea1ffedaf415f4da2f062534de366a451e6",
+   "licence": "Apache-2.0",
+   "template": "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}",
+   "bos_token": "<s>",
+   "eos_token": "</s>"
+  },
+  {
+   "name": "mistral-v0.2",
+   "kind": "verbatim",
+   "repo": "unsloth/mistral-7b-instruct-v0.2",
+   "revision": "5d88c8e8dbf7446e665a3633b2f047689f4e6547",
+   "licence": "Apache-2.0",
+   "template": "{%- if messages[0]['role'] == 'system' %}\n    {%- set system_message = messages[0]['content'] %}\n    {%- set loop_messages = messages[1:] %}\n{%- else %}\n    {%- set loop_messages = messages %}\n{%- endif %}\n\n{{- bos_token }}\n{%- for message in loop_messages %}\n    {%- if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}\n        {{- raise_exception('After the optional system message, conversation roles must alternate user/assistant/user/assistant/...') }}\n    {%- endif %}\n    {%- if message['role'] == 'user' %}\n        {%- if loop.first and system_message is defined %}\n            {{- ' [INST] ' + system_message + '\\n\\n' + message['content'] + ' [/INST]' }}\n        {%- else %}\n            {{- ' [INST] ' + message['content'] + ' [/INST]' }}\n        {%- endif %}\n    {%- elif message['role'] == 'assistant' %}\n        {{- ' ' + message['content'] + eos_token}}\n    {%- else %}\n        {{- raise_exception('Only user and assistant roles are supported, with the exception of an initial optional system message!') }}\n    {%- endif %}\n{%- endfor %}\n",
+   "bos_token": "<s>",
+   "eos_token": "</s>"
+  },
+  {
+   "name": "phi-3",
+   "kind": "verbatim",
+   "repo": "microsoft/Phi-3-mini-4k-instruct",
+   "revision": "f39ac1d28e925b323eae81227eaba4464caced4e",
+   "licence": "MIT",
+   "template": "{% for message in messages %}{% if message['role'] == 'system' %}{{'<|system|>\n' + message['content'] + '<|end|>\n'}}{% elif message['role'] == 'user' %}{{'<|user|>\n' + message['content'] + '<|end|>\n'}}{% elif message['role'] == 'assistant' %}{{'<|assistant|>\n' + message['content'] + '<|end|>\n'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>\n' }}{% else %}{{ eos_token }}{% endif %}",
+   "bos_token": "<s>",
+   "eos_token": "<|endoftext|>"
+  },
+  {
+   "name": "mistral-v0.3",
+   "kind": "verbatim",
+   "repo": "unsloth/mistral-7b-instruct-v0.3",
+   "revision": "60b99dcbc7f853b7cd18472a607e8d045b96f03e",
+   "licence": "Apache-2.0",
+   "template": "{%- if messages[0][\"role\"] == \"system\" %}\n    {%- set system_message = messages[0][\"content\"] %}\n    {%- set loop_messages = messages[1:] %}\n{%- else %}\n    {%- set loop_messages = messages %}\n{%- endif %}\n{%- if not tools is defined %}\n    {%- set tools = none %}\n{%- endif %}\n{%- set user_messages = loop_messages | selectattr(\"role\", \"equalto\", \"user\") | list %}\n\n{#- This block checks for alternating user/assistant messages, skipping tool calling messages #}\n{%- set ns = namespace() %}\n{%- set ns.index = 0 %}\n{%- for message in loop_messages %}\n    {%- if not (message.role == \"tool\" or message.role == \"tool_results\" or (message.tool_calls is defined and message.tool_calls is not none)) %}\n        {%- if (message[\"role\"] == \"user\") != (ns.index % 2 == 0) %}\n            {{- raise_exception(\"After the optional system message, conversation roles must alternate user/assistant/user/assistant/...\") }}\n        {%- endif %}\n        {%- set ns.index = ns.index + 1 %}\n    {%- endif %}\n{%- endfor %}\n\n{{- bos_token }}\n{%- for message in loop_messages %}\n    {%- if message[\"role\"] == \"user\" %}\n        {%- if tools is not none and (message == user_messages[-1]) %}\n            {{- \"[AVAILABLE_TOOLS] [\" }}\n            {%- for tool in tools %}\n                {%- set tool = tool.function %}\n                {{- '{\"type\": \"function\", \"function\": {' }}\n                {%- for key, val in tool.items() if key != \"return\" %}\n                    {%- if val is string %}\n                        {{- '\"' + key + '\": \"' + val + '\"' }}\n                    {%- else %}\n                        {{- '\"' + key + '\": ' + val|tojson }}\n                    {%- endif %}\n                    {%- if not loop.last %}\n                        {{- \", \" }}\n                    {%- endif %}\n                {%- endfor %}\n                {{- \"}}\" }}\n                {%- if not loop.last %}\n                    {{- \", \" }}\n                {%- else %}\n                    {{- \"]\" }}\n                {%- endif %}\n            {%- endfor %}\n            {{- \"[/AVAILABLE_TOOLS]\" }}\n            {%- endif %}\n        {%- if loop.last and system_message is defined %}\n            {{- \"[INST] \" + system_message + \"\\n\\n\" + message[\"content\"] + \"[/INST]\" }}\n        {%- else %}\n            {{- \"[INST] \" + message[\"content\"] + \"[/INST]\" }}\n        {%- endif %}\n    {%- elif message.tool_calls is defined and message.tool_calls is not none %}\n        {{- \"[TOOL_CALLS] [\" }}\n        {%- for tool_call in message.tool_calls %}\n            {%- set out = tool_call.function|tojson %}\n            {{- out[:-1] }}\n            {%- if not tool_call.id is defined or tool_call.id|length != 9 %}\n                {{- raise_exception(\"Tool call IDs should be alphanumeric strings with length 9!\") }}\n            {%- endif %}\n            {{- ', \"id\": \"' + tool_call.id + '\"}' }}\n            {%- if not loop.last %}\n                {{- \", \" }}\n            {%- else %}\n                {{- \"]\" + eos_token }}\n            {%- endif %}\n        {%- endfor %}\n    {%- elif message[\"role\"] == \"assistant\" %}\n        {{- \" \" + message[\"content\"]|trim + eos_token}}\n    {%- elif message[\"role\"] == \"tool_results\" or message[\"role\"] == \"tool\" %}\n        {%- if message.content is defined and message.content.content is defined %}\n            {%- set content = message.content.content %}\n        {%- else %}\n            {%- set content = message.content %}\n        {%- endif %}\n        {{- '[TOOL_RESULTS] {\"content\": ' + content|string + \", \" }}\n        {%- if not message.tool_call_id is defined or message.tool_call_id|length != 9 %}\n            {{- raise_exception(\"Tool call IDs should be alphanumeric strings with length 9!\") }}\n        {%- endif %}\n        {{- '\"call_id\": \"' + message.tool_call_id + '\"}[/TOOL_RESULTS]' }}\n    {%- else %}\n        {{- raise_exception(\"Only user and assistant roles are supported, with the exception of an initial optional system message!\") }}\n    {%- endif %}\n{%- endfor %}\n",
+   "bos_token": "<s>",
+   "eos_token": "</s>"
+  },
+  {
+   "name": "qwen2.5",
+   "kind": "verbatim",
+   "repo": "Qwen/Qwen2.5-7B-Instruct",
+   "revision": "a09a35458c702b33eeacc393d103063234e8bc28",
+   "licence": "Apache-2.0",
+   "template": "{%- if tools %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- messages[0]['content'] }}\n    {%- else %}\n        {{- 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' }}\n    {%- endif %}\n    {{- \"\\n\\n# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}\\n</tool_call><|im_end|>\\n\" }}\n{%- else %}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}\n    {%- else %}\n        {{- '<|im_start|>system\\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- for message in messages %}\n    {%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) or (message.role == \"assistant\" and not message.tool_calls) %}\n        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {{- '<|im_start|>' + message.role }}\n        {%- if message.content %}\n            {{- '\\n' + message.content }}\n        {%- endif %}\n        {%- for tool_call in message.tool_calls %}\n            {%- if tool_call.function is defined %}\n                {%- set tool_call = tool_call.function %}\n            {%- endif %}\n            {{- '\\n<tool_call>\\n{\"name\": \"' }}\n            {{- tool_call.name }}\n            {{- '\", \"arguments\": ' }}\n            {{- tool_call.arguments | tojson }}\n            {{- '}\\n</tool_call>' }}\n        {%- endfor %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != \"tool\") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- message.content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n{%- endif %}\n",
+   "bos_token": "",
+   "eos_token": "<|im_end|>"
+  },
+  {
+   "name": "llama-2-style",
+   "kind": "handmade",
+   "format": "Llama-2-chat ([INST] / <<SYS>>)",
+   "note": "Same constructs as Meta's Llama-2-chat template: a leading-system split with a slice, the alternation check with raise_exception, `!= false`, `\\n` escapes, `.strip()`.",
+   "template": "{#- Hand-written for ferroly: renders the Llama-2-chat prompt format. -#}\n{%- if messages[0]['role'] == 'system' -%}\n  {%- set system = messages[0]['content'] -%}\n  {%- set turns = messages[1:] -%}\n{%- else -%}\n  {%- set system = false -%}\n  {%- set turns = messages -%}\n{%- endif -%}\n{%- for turn in turns -%}\n  {%- if (turn['role'] == 'user') != (loop.index0 % 2 == 0) -%}\n    {{- raise_exception('Roles must alternate between user and assistant.') -}}\n  {%- endif -%}\n  {%- set text = turn['content'] -%}\n  {%- if loop.index0 == 0 and system != false -%}\n    {%- set text = '<<SYS>>\\n' + system + '\\n<</SYS>>\\n\\n' + turn['content'] -%}\n  {%- endif -%}\n  {%- if turn['role'] == 'user' -%}\n    {{- bos_token + '[INST] ' + text.strip() + ' [/INST]' -}}\n  {%- elif turn['role'] == 'assistant' -%}\n    {{- ' ' + text.strip() + ' ' + eos_token -}}\n  {%- endif -%}\n{%- endfor -%}\n",
+   "bos_token": "<s>",
+   "eos_token": "</s>"
+  },
+  {
+   "name": "llama-3-style",
+   "kind": "handmade",
+   "format": "Llama-3-instruct (header ids, <|eot_id|>)",
+   "note": "Same constructs as Meta's Llama-3-instruct template: `| trim` binding tighter than `+`, a `set` inside an `if` that reassigns a loop-body variable.",
+   "template": "{#- Hand-written for ferroly: renders the Llama-3-instruct prompt format. -#}\n{%- for turn in messages -%}\n  {%- set block = '<|start_header_id|>' + turn['role'] + '<|end_header_id|>\\n\\n' + turn['content'] | trim + '<|eot_id|>' -%}\n  {%- if loop.index0 == 0 -%}\n    {%- set block = bos_token + block -%}\n  {%- endif -%}\n  {{- block -}}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n  {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' -}}\n{%- endif -%}\n",
+   "bos_token": "<|begin_of_text|>",
+   "eos_token": "<|eot_id|>"
+  },
+  {
+   "name": "gemma-2-style",
+   "kind": "handmade",
+   "format": "Gemma-2 instruct (<start_of_turn> / model)",
+   "note": "Same constructs as Google's Gemma-2 template: refusing a system role, the alternation check, a role set inside if/else in the loop body, `| trim` over `+`.",
+   "template": "{#- Hand-written for ferroly: renders the Gemma-2 instruct prompt format. -#}\n{{- bos_token -}}\n{%- if messages[0]['role'] == 'system' -%}\n  {{- raise_exception('The system role is not supported.') -}}\n{%- endif -%}\n{%- for turn in messages -%}\n  {%- if (turn['role'] == 'user') != (loop.index0 % 2 == 0) -%}\n    {{- raise_exception('Roles must alternate between user and model.') -}}\n  {%- endif -%}\n  {%- if (turn['role'] == 'assistant') -%}\n    {%- set speaker = 'model' -%}\n  {%- else -%}\n    {%- set speaker = turn['role'] -%}\n  {%- endif -%}\n  {{- '<start_of_turn>' + speaker + '\\n' + turn['content'] | trim + '<end_of_turn>\\n' -}}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n  {{- '<start_of_turn>model\\n' -}}\n{%- endif -%}\n",
+   "bos_token": "<bos>",
+   "eos_token": "<eos>"
+  }
+ ],
+ "cases": [
+  {
+   "template": "chatml",
+   "conversation": "single",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<|im_start|>",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "template": "chatml",
+   "conversation": "single",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<|im_start|>",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n"
+  },
+  {
+   "template": "chatml",
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<|im_start|>",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "template": "chatml",
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<|im_start|>",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n"
+  },
+  {
+   "template": "chatml",
+   "conversation": "multi",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<|im_start|>",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me a joke.<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "template": "chatml",
+   "conversation": "multi",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<|im_start|>",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me a joke.<|im_end|>\n"
+  },
+  {
+   "template": "chatml",
+   "conversation": "special",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<|im_start|>",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  <|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "template": "chatml",
+   "conversation": "special",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<|im_start|>",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  <|im_end|>\n"
+  },
+  {
+   "template": "chatml",
+   "conversation": "double_user",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<|im_start|>",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nFirst question<|im_end|>\n<|im_start|>user\nSecond question<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "template": "chatml",
+   "conversation": "double_user",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<|im_start|>",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nFirst question<|im_end|>\n<|im_start|>user\nSecond question<|im_end|>\n"
+  },
+  {
+   "template": "zephyr",
+   "conversation": "single",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<|user|>\nHello!</s>\n<|assistant|>\n"
+  },
+  {
+   "template": "zephyr",
+   "conversation": "single",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<|user|>\nHello!</s>\n"
+  },
+  {
+   "template": "zephyr",
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nWhat is the capital of France?</s>\n<|assistant|>\n"
+  },
+  {
+   "template": "zephyr",
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nWhat is the capital of France?</s>\n"
+  },
+  {
+   "template": "zephyr",
+   "conversation": "multi",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<|user|>\nHi</s>\n<|assistant|>\nHello! How can I help?</s>\n<|user|>\nTell me a joke.</s>\n<|assistant|>\n"
+  },
+  {
+   "template": "zephyr",
+   "conversation": "multi",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<|user|>\nHi</s>\n<|assistant|>\nHello! How can I help?</s>\n<|user|>\nTell me a joke.</s>\n"
+  },
+  {
+   "template": "zephyr",
+   "conversation": "special",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<|user|>\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  </s>\n<|assistant|>\n"
+  },
+  {
+   "template": "zephyr",
+   "conversation": "special",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<|user|>\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  </s>\n"
+  },
+  {
+   "template": "zephyr",
+   "conversation": "double_user",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "expect": "<|user|>\nFirst question</s>\n<|user|>\nSecond question</s>\n<|assistant|>\n"
+  },
+  {
+   "template": "zephyr",
+   "conversation": "double_user",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "expect": "<|user|>\nFirst question</s>\n<|user|>\nSecond question</s>\n"
+  },
+  {
+   "template": "mistral-v0.2",
+   "conversation": "single",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<s> [INST] Hello! [/INST]"
+  },
+  {
+   "template": "mistral-v0.2",
+   "conversation": "single",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<s> [INST] Hello! [/INST]"
+  },
+  {
+   "template": "mistral-v0.2",
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<s> [INST] You are a helpful assistant.\n\nWhat is the capital of France? [/INST]"
+  },
+  {
+   "template": "mistral-v0.2",
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<s> [INST] You are a helpful assistant.\n\nWhat is the capital of France? [/INST]"
+  },
+  {
+   "template": "mistral-v0.2",
+   "conversation": "multi",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<s> [INST] Hi [/INST] Hello! How can I help?</s> [INST] Tell me a joke. [/INST]"
+  },
+  {
+   "template": "mistral-v0.2",
+   "conversation": "multi",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<s> [INST] Hi [/INST] Hello! How can I help?</s> [INST] Tell me a joke. [/INST]"
+  },
+  {
+   "template": "mistral-v0.2",
+   "conversation": "special",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<s> [INST] He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>   [/INST]"
+  },
+  {
+   "template": "mistral-v0.2",
+   "conversation": "special",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<s> [INST] He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>   [/INST]"
+  },
+  {
+   "template": "mistral-v0.2",
+   "conversation": "double_user",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "raised": "After the optional system message, conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "template": "mistral-v0.2",
+   "conversation": "double_user",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "raised": "After the optional system message, conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "template": "phi-3",
+   "conversation": "single",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<|user|>\nHello!<|end|>\n<|assistant|>\n"
+  },
+  {
+   "template": "phi-3",
+   "conversation": "single",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<|user|>\nHello!<|end|>\n<|endoftext|>"
+  },
+  {
+   "template": "phi-3",
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<|system|>\nYou are a helpful assistant.<|end|>\n<|user|>\nWhat is the capital of France?<|end|>\n<|assistant|>\n"
+  },
+  {
+   "template": "phi-3",
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<|system|>\nYou are a helpful assistant.<|end|>\n<|user|>\nWhat is the capital of France?<|end|>\n<|endoftext|>"
+  },
+  {
+   "template": "phi-3",
+   "conversation": "multi",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<|user|>\nHi<|end|>\n<|assistant|>\nHello! How can I help?<|end|>\n<|user|>\nTell me a joke.<|end|>\n<|assistant|>\n"
+  },
+  {
+   "template": "phi-3",
+   "conversation": "multi",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<|user|>\nHi<|end|>\n<|assistant|>\nHello! How can I help?<|end|>\n<|user|>\nTell me a joke.<|end|>\n<|endoftext|>"
+  },
+  {
+   "template": "phi-3",
+   "conversation": "special",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<|user|>\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  <|end|>\n<|assistant|>\n"
+  },
+  {
+   "template": "phi-3",
+   "conversation": "special",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<|user|>\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  <|end|>\n<|endoftext|>"
+  },
+  {
+   "template": "phi-3",
+   "conversation": "double_user",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "expect": "<|user|>\nFirst question<|end|>\n<|user|>\nSecond question<|end|>\n<|assistant|>\n"
+  },
+  {
+   "template": "phi-3",
+   "conversation": "double_user",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "<|endoftext|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "expect": "<|user|>\nFirst question<|end|>\n<|user|>\nSecond question<|end|>\n<|endoftext|>"
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "single",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<s>[INST] Hello![/INST]"
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "single",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<s>[INST] Hello![/INST]"
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<s>[INST] You are a helpful assistant.\n\nWhat is the capital of France?[/INST]"
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<s>[INST] You are a helpful assistant.\n\nWhat is the capital of France?[/INST]"
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "multi",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<s>[INST] Hi[/INST] Hello! How can I help?</s>[INST] Tell me a joke.[/INST]"
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "multi",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<s>[INST] Hi[/INST] Hello! How can I help?</s>[INST] Tell me a joke.[/INST]"
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "special",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<s>[INST] He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  [/INST]"
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "special",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<s>[INST] He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  [/INST]"
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "double_user",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "raised": "After the optional system message, conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "double_user",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "raised": "After the optional system message, conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "tools",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "What's the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call12345",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris",
+          "unit": "celsius"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call12345",
+      "content": "{\"temperature\": 18}"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 18 °C in Paris."
+     },
+     {
+      "role": "user",
+      "content": "Thanks!"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "expect": "<s>[INST] What's the weather in Paris?[/INST][TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"unit\": \"celsius\"}, \"id\": \"call12345\"}]</s>[TOOL_RESULTS] {\"content\": {\"temperature\": 18}, \"call_id\": \"call12345\"}[/TOOL_RESULTS] It is 18 °C in Paris.</s>[AVAILABLE_TOOLS] [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}][/AVAILABLE_TOOLS][INST] Thanks![/INST]"
+  },
+  {
+   "template": "mistral-v0.3",
+   "conversation": "tools",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "What's the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call12345",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris",
+          "unit": "celsius"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call12345",
+      "content": "{\"temperature\": 18}"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 18 °C in Paris."
+     },
+     {
+      "role": "user",
+      "content": "Thanks!"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "expect": "<s>[INST] What's the weather in Paris?[/INST][TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"unit\": \"celsius\"}, \"id\": \"call12345\"}]</s>[TOOL_RESULTS] {\"content\": {\"temperature\": 18}, \"call_id\": \"call12345\"}[/TOOL_RESULTS] It is 18 °C in Paris.</s>[AVAILABLE_TOOLS] [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}][/AVAILABLE_TOOLS][INST] Thanks![/INST]"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "single",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "single",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "multi",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me a joke.<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "multi",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me a joke.<|im_end|>\n"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "special",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  <|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "special",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  <|im_end|>\n"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "double_user",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nFirst question<|im_end|>\n<|im_start|>user\nSecond question<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "double_user",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nFirst question<|im_end|>\n<|im_start|>user\nSecond question<|im_end|>\n"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "tools",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "What's the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call12345",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris",
+          "unit": "celsius"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call12345",
+      "content": "{\"temperature\": 18}"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 18 °C in Paris."
+     },
+     {
+      "role": "user",
+      "content": "Thanks!"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat's the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"unit\": \"celsius\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature\": 18}\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is 18 °C in Paris.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "template": "qwen2.5",
+   "conversation": "tools",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "",
+    "eos_token": "<|im_end|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "What's the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call12345",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris",
+          "unit": "celsius"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call12345",
+      "content": "{\"temperature\": 18}"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 18 °C in Paris."
+     },
+     {
+      "role": "user",
+      "content": "Thanks!"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "expect": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat's the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"unit\": \"celsius\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature\": 18}\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is 18 °C in Paris.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n"
+  },
+  {
+   "template": "llama-2-style",
+   "conversation": "single",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<s>[INST] Hello! [/INST]"
+  },
+  {
+   "template": "llama-2-style",
+   "conversation": "single",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<s>[INST] Hello! [/INST]"
+  },
+  {
+   "template": "llama-2-style",
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<s>[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\n\nWhat is the capital of France? [/INST]"
+  },
+  {
+   "template": "llama-2-style",
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<s>[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\n\nWhat is the capital of France? [/INST]"
+  },
+  {
+   "template": "llama-2-style",
+   "conversation": "multi",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<s>[INST] Hi [/INST] Hello! How can I help? </s><s>[INST] Tell me a joke. [/INST]"
+  },
+  {
+   "template": "llama-2-style",
+   "conversation": "multi",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<s>[INST] Hi [/INST] Hello! How can I help? </s><s>[INST] Tell me a joke. [/INST]"
+  },
+  {
+   "template": "llama-2-style",
+   "conversation": "special",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<s>[INST] He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b> [/INST]"
+  },
+  {
+   "template": "llama-2-style",
+   "conversation": "special",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<s>[INST] He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b> [/INST]"
+  },
+  {
+   "template": "llama-2-style",
+   "conversation": "double_user",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "raised": "Roles must alternate between user and assistant."
+  },
+  {
+   "template": "llama-2-style",
+   "conversation": "double_user",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "raised": "Roles must alternate between user and assistant."
+  },
+  {
+   "template": "llama-3-style",
+   "conversation": "single",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|eot_id|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello!<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+  },
+  {
+   "template": "llama-3-style",
+   "conversation": "single",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|eot_id|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello!<|eot_id|>"
+  },
+  {
+   "template": "llama-3-style",
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|eot_id|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+  },
+  {
+   "template": "llama-3-style",
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|eot_id|>",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|>"
+  },
+  {
+   "template": "llama-3-style",
+   "conversation": "multi",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|eot_id|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHello! How can I help?<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nTell me a joke.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+  },
+  {
+   "template": "llama-3-style",
+   "conversation": "multi",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|eot_id|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHello! How can I help?<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nTell me a joke.<|eot_id|>"
+  },
+  {
+   "template": "llama-3-style",
+   "conversation": "special",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|eot_id|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b><|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+  },
+  {
+   "template": "llama-3-style",
+   "conversation": "special",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|eot_id|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b><|eot_id|>"
+  },
+  {
+   "template": "llama-3-style",
+   "conversation": "double_user",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|eot_id|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "expect": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nFirst question<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nSecond question<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+  },
+  {
+   "template": "llama-3-style",
+   "conversation": "double_user",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<|begin_of_text|>",
+    "eos_token": "<|eot_id|>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "expect": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nFirst question<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nSecond question<|eot_id|>"
+  },
+  {
+   "template": "gemma-2-style",
+   "conversation": "single",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<bos><start_of_turn>user\nHello!<end_of_turn>\n<start_of_turn>model\n"
+  },
+  {
+   "template": "gemma-2-style",
+   "conversation": "single",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ]
+   },
+   "expect": "<bos><start_of_turn>user\nHello!<end_of_turn>\n"
+  },
+  {
+   "template": "gemma-2-style",
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "You are a helpful assistant.\nWhat is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<bos><start_of_turn>user\nYou are a helpful assistant.\nWhat is the capital of France?<end_of_turn>\n<start_of_turn>model\n"
+  },
+  {
+   "template": "gemma-2-style",
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "You are a helpful assistant.\nWhat is the capital of France?"
+     }
+    ]
+   },
+   "expect": "<bos><start_of_turn>user\nYou are a helpful assistant.\nWhat is the capital of France?<end_of_turn>\n"
+  },
+  {
+   "template": "gemma-2-style",
+   "conversation": "multi",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<bos><start_of_turn>user\nHi<end_of_turn>\n<start_of_turn>model\nHello! How can I help?<end_of_turn>\n<start_of_turn>user\nTell me a joke.<end_of_turn>\n<start_of_turn>model\n"
+  },
+  {
+   "template": "gemma-2-style",
+   "conversation": "multi",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ]
+   },
+   "expect": "<bos><start_of_turn>user\nHi<end_of_turn>\n<start_of_turn>model\nHello! How can I help?<end_of_turn>\n<start_of_turn>user\nTell me a joke.<end_of_turn>\n"
+  },
+  {
+   "template": "gemma-2-style",
+   "conversation": "special",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<bos><start_of_turn>user\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b><end_of_turn>\n<start_of_turn>model\n"
+  },
+  {
+   "template": "gemma-2-style",
+   "conversation": "special",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "He said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b>  "
+     }
+    ]
+   },
+   "expect": "<bos><start_of_turn>user\nHe said \"hi\" and 'bye'.\tTabbed, naïve café, 日本語, 😀\nLiteral {{ not_a_var }} and {% if %} must print as is. <b>&amp;</b><end_of_turn>\n"
+  },
+  {
+   "template": "gemma-2-style",
+   "conversation": "double_user",
+   "add_generation_prompt": true,
+   "context": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "raised": "Roles must alternate between user and model."
+  },
+  {
+   "template": "gemma-2-style",
+   "conversation": "double_user",
+   "add_generation_prompt": false,
+   "context": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "messages": [
+     {
+      "role": "user",
+      "content": "First question"
+     },
+     {
+      "role": "user",
+      "content": "Second question"
+     }
+    ]
+   },
+   "raised": "Roles must alternate between user and model."
+  }
+ ]
+}

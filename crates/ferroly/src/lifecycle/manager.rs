@@ -12,7 +12,7 @@ use tokio::time::Instant;
 
 use ferroly::lifecycle::{
     Component, ComponentOptions, ComponentState, HealthReport, HealthStatus, LifecycleError,
-    StateChange,
+    LivenessWatch, StateChange,
 };
 
 /// Default per-component stop deadline used by
@@ -206,6 +206,11 @@ struct Entry {
     /// Bumped by every explicit start/stop; lets a scheduled restart detect
     /// that someone else has acted on the component in the meantime.
     epoch: u64,
+    /// Bumped every time the component enters `Running`; lets the liveness
+    /// watchdog tell the instance it sampled from a later one.
+    instance: u64,
+    /// Whether the liveness watchdog ([`LivenessWatch`]) has been spawned.
+    watchdog: bool,
 }
 
 #[derive(Default)]
@@ -308,6 +313,8 @@ impl ComponentManager {
                 since: Instant::now(),
                 restarts: 0,
                 epoch: 0,
+                instance: 0,
+                watchdog: false,
             },
         );
         Ok(())
@@ -613,63 +620,7 @@ impl ComponentManager {
         id: &str,
         reason: impl Into<String>,
     ) -> Result<(), LifecycleError> {
-        enum Plan {
-            Ignore,
-            Fail,
-            Restart {
-                epoch: u64,
-                restart: u32,
-                delay: Duration,
-            },
-        }
-        let plan = self
-            .shared
-            .transition_with(id, |entry, from| {
-                if from != ComponentState::Running {
-                    return (None, Plan::Ignore);
-                }
-                let plan = match &entry.options.restart {
-                    Some(policy) if entry.restarts < policy.max_restarts => {
-                        entry.restarts += 1;
-                        Plan::Restart {
-                            epoch: entry.epoch,
-                            restart: entry.restarts,
-                            delay: policy.delay(entry.restarts),
-                        }
-                    }
-                    _ => Plan::Fail,
-                };
-                (Some(ComponentState::Error), plan)
-            })
-            .ok_or_else(|| LifecycleError::ComponentNotFound(id.to_string()))?;
-
-        if matches!(plan, Plan::Ignore) {
-            return Ok(());
-        }
-        let reason: String = reason.into();
-        let cause = LifecycleError::ComponentFailure {
-            id: id.to_string(),
-            source: reason.into(),
-        };
-        self.shared.notify(|o| o.on_failure(id, &cause));
-        if let Plan::Restart {
-            epoch,
-            restart,
-            delay,
-        } = plan
-        {
-            self.shared
-                .notify(|o| o.on_restart(id, restart, delay, &cause));
-            let weak = Arc::downgrade(&self.shared);
-            let id = id.to_string();
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                if let Some(shared) = weak.upgrade() {
-                    shared.supervised_restart(&id, epoch).await;
-                }
-            });
-        }
-        Ok(())
+        self.shared.report_failure(id, reason.into(), None)
     }
 
     /// The health of every registered component, sorted by id.
@@ -712,6 +663,7 @@ impl ComponentManager {
     ) -> Result<(), LifecycleError> {
         let shared = &self.shared;
         shared.stopped.send_replace(false);
+        shared.spawn_watchdogs();
 
         let started = Arc::new(Mutex::new(Vec::new()));
         let (alive, mut alive_rx) = mpsc::channel::<()>(1);
@@ -751,6 +703,76 @@ impl ComponentManager {
         error.flatten_into(&mut all);
         all.extend(rollback_errors);
         LifecycleError::collect(all)
+    }
+}
+
+/// Polls `id`'s health while it runs and reports a failure after
+/// `policy.failure_threshold` consecutive `Down` answers; see
+/// [`LivenessWatch`]. Ends when the component is unregistered (its state
+/// channel closes) or the manager is dropped.
+async fn liveness_watchdog(
+    shared: std::sync::Weak<Shared>,
+    id: String,
+    policy: LivenessWatch,
+    mut state: watch::Receiver<ComponentState>,
+) {
+    // The fields are public, so enforce the documented bounds here too.
+    let interval = policy.interval.max(LivenessWatch::MIN_INTERVAL);
+    let threshold = policy.failure_threshold.max(1);
+    'running: loop {
+        if state
+            .wait_for(|s| *s == ComponentState::Running)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if !policy.initial_delay.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(policy.initial_delay) => {}
+                changed = state.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    continue 'running;
+                }
+            }
+        }
+        let mut failures = 0u32;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                changed = state.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    // Left `Running` (or went through a restart): start over.
+                    continue 'running;
+                }
+            }
+            let Some(manager) = shared.upgrade() else {
+                return;
+            };
+            let instance = match manager.running_health(&id) {
+                None => continue 'running,
+                Some((HealthStatus::Down, instance)) => instance,
+                Some(_) => {
+                    failures = 0;
+                    continue;
+                }
+            };
+            failures += 1;
+            if failures >= threshold {
+                // Charged only to the instance that answered `Down`: if it was
+                // stopped or restarted meanwhile, the report is ignored.
+                let _ = manager.report_failure(
+                    &id,
+                    format!("liveness check failed {failures} times in a row"),
+                    Some(instance),
+                );
+                continue 'running;
+            }
+        }
     }
 }
 
@@ -865,6 +887,9 @@ impl Shared {
                     let now = Instant::now();
                     let elapsed = now.saturating_duration_since(entry.since);
                     entry.since = now;
+                    if to == ComponentState::Running {
+                        entry.instance += 1;
+                    }
                     entry.state.send_replace(to);
                     let change = StateChange {
                         id: id.to_string(),
@@ -1173,6 +1198,118 @@ impl Shared {
             LifecycleError::collect(errors)?;
         }
         Ok(())
+    }
+
+    /// [`ComponentManager::report_failure`]. With `instance`, the report is
+    /// ignored unless the component is still the `Running` instance it names
+    /// (see `Entry::instance`).
+    fn report_failure(
+        self: &Arc<Self>,
+        id: &str,
+        reason: String,
+        instance: Option<u64>,
+    ) -> Result<(), LifecycleError> {
+        enum Plan {
+            Ignore,
+            Fail,
+            Restart {
+                epoch: u64,
+                restart: u32,
+                delay: Duration,
+            },
+        }
+        let plan = self
+            .transition_with(id, |entry, from| {
+                let stale = instance.is_some_and(|i| i != entry.instance);
+                if from != ComponentState::Running || stale {
+                    return (None, Plan::Ignore);
+                }
+                let reset_after = entry.options.restart.as_ref().and_then(|p| p.reset_after);
+                if let Some(uptime) = reset_after {
+                    // Ran long enough since the last (re)start: a fresh budget.
+                    if entry.since.elapsed() >= uptime {
+                        entry.restarts = 0;
+                    }
+                }
+                let plan = match &entry.options.restart {
+                    Some(policy) if entry.restarts < policy.max_restarts => {
+                        entry.restarts += 1;
+                        Plan::Restart {
+                            epoch: entry.epoch,
+                            restart: entry.restarts,
+                            delay: policy.delay(entry.restarts),
+                        }
+                    }
+                    _ => Plan::Fail,
+                };
+                (Some(ComponentState::Error), plan)
+            })
+            .ok_or_else(|| LifecycleError::ComponentNotFound(id.to_string()))?;
+
+        if matches!(plan, Plan::Ignore) {
+            return Ok(());
+        }
+        let cause = LifecycleError::ComponentFailure {
+            id: id.to_string(),
+            source: reason.into(),
+        };
+        self.notify(|o| o.on_failure(id, &cause));
+        if let Plan::Restart {
+            epoch,
+            restart,
+            delay,
+        } = plan
+        {
+            self.notify(|o| o.on_restart(id, restart, delay, &cause));
+            let weak = Arc::downgrade(self);
+            let id = id.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Some(shared) = weak.upgrade() {
+                    shared.supervised_restart(&id, epoch).await;
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Spawns the liveness watchdog of every component that asks for one and
+    /// has none yet. Needs the Tokio runtime, hence called from the start
+    /// paths rather than at registration.
+    fn spawn_watchdogs(self: &Arc<Self>) {
+        let pending: Vec<(String, LivenessWatch, watch::Receiver<ComponentState>)> = {
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .entries
+                .iter_mut()
+                .filter(|(_, entry)| !entry.watchdog)
+                .filter_map(|(id, entry)| {
+                    let policy = entry.options.liveness.clone()?;
+                    entry.watchdog = true;
+                    Some((id.clone(), policy, entry.state.subscribe()))
+                })
+                .collect()
+        };
+        for (id, policy, state) in pending {
+            tokio::spawn(liveness_watchdog(Arc::downgrade(self), id, policy, state));
+        }
+    }
+
+    /// `id`'s own [`Component::health`] while it is `Running` (`Down` if it
+    /// panics, `Up` for `None`), with the instance it was sampled from; `None`
+    /// when it is not running or unknown.
+    fn running_health(&self, id: &str) -> Option<(HealthStatus, u64)> {
+        let (component, instance) = {
+            let inner = self.inner.lock().unwrap();
+            let entry = inner.entries.get(id)?;
+            if *entry.state.borrow() != ComponentState::Running {
+                return None;
+            }
+            (entry.component.clone(), entry.instance)
+        };
+        let status = catch_unwind(AssertUnwindSafe(|| component.health()))
+            .map_or(HealthStatus::Down, |h| h.unwrap_or(HealthStatus::Up));
+        Some((status, instance))
     }
 
     /// The background half of [`ComponentManager::report_failure`]: stop (best
@@ -1520,6 +1657,38 @@ mod tests {
                 vec!["gateway".to_string()],
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_liveness_report_for_a_previous_instance_is_ignored() {
+        let mgr = ComponentManager::new();
+        let svc = crate::lifecycle::SimpleComponent::new(
+            "svc",
+            || Box::pin(async { Ok(()) }),
+            || Box::pin(async { Ok(()) }),
+        );
+        mgr.register_with(
+            Arc::new(svc),
+            ComponentOptions::new().restart(crate::lifecycle::RestartPolicy::new(3)),
+        )
+        .unwrap();
+        mgr.start_all().await.unwrap();
+        // The watchdog samples `Down` from this instance…
+        let (_, sampled) = mgr.shared.running_health("svc").unwrap();
+        // …then the component is stopped and started again before it reports.
+        mgr.stop_all().await.unwrap();
+        mgr.start_all().await.unwrap();
+        mgr.shared
+            .report_failure("svc", "stale".into(), Some(sampled))
+            .unwrap();
+        assert_eq!(mgr.get_state("svc"), Some(ComponentState::Running));
+        // A report for the current instance still counts.
+        let (_, current) = mgr.shared.running_health("svc").unwrap();
+        assert_ne!(current, sampled);
+        mgr.shared
+            .report_failure("svc", "fresh".into(), Some(current))
+            .unwrap();
+        assert_eq!(mgr.get_state("svc"), Some(ComponentState::Error));
     }
 
     #[test]

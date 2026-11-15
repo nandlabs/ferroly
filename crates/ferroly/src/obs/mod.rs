@@ -58,9 +58,11 @@
 //! cheaply. A [`Sampler`] decides per trace whether spans are recorded; the
 //! decision propagates through [`Context::is_sampled`] and the `traceparent`
 //! flags. When a recorded span finishes it is assembled into a
-//! [`FinishedSpan`] and handed to the installed [`Exporter`]s — a built-in
-//! [`JsonExporter`], the OTLP/HTTP exporter (with the `http` feature), or your
-//! own. With no exporter installed, finishing a span is a near-free no-op.
+//! [`FinishedSpan`] and handed to the installed [`Exporter`]s — the built-in
+//! [`JsonExporter`] (one JSON object per span) or [`PlainExporter`]
+//! (human-readable lines in `log`'s plain style), the OTLP/HTTP exporter
+//! (with the `http` feature), or your own. With no exporter installed,
+//! finishing a span is a near-free no-op.
 //!
 //! ```
 //! use std::sync::{Arc, Mutex};
@@ -98,22 +100,30 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use ferroly::codec::{json, Value};
 
+#[cfg(feature = "http")]
+mod client_trace;
 mod context;
 mod id;
 #[cfg(feature = "http")]
 mod otlp;
+#[cfg(all(feature = "http", feature = "protobuf"))]
+mod otlp_proto;
+mod plain;
 mod resource;
 mod sampler;
 mod semconv;
 mod span;
 
+#[cfg(feature = "http")]
+pub use client_trace::{TraceInterceptor, EVICTED_ATTRIBUTE};
 pub use context::{
     current, extract, inject, inject_current, suppress, with_context, with_current_context,
     Context, ContextGuard, TraceParentError, WithContext, TRACEPARENT_HEADER, TRACESTATE_HEADER,
 };
 pub use id::{SpanId, TraceId};
 #[cfg(feature = "http")]
-pub use otlp::{OtlpBuilder, OtlpHttpExporter, OtlpStats};
+pub use otlp::{OtlpBuilder, OtlpHttpExporter, OtlpProtocol, OtlpStats};
+pub use plain::{PlainExporter, Precision};
 pub use resource::Resource;
 pub use sampler::{sampler, set_sampler, Sampler};
 pub use semconv::{genai, http, messaging};
@@ -652,6 +662,112 @@ mod tests {
         assert!(rendered.contains(r#""links":[{"trace_id":"aaaa"#));
         assert!(rendered.contains(r#""trace_state":"k=v""#));
         assert!(rendered.contains(r#""parent_remote":true"#));
+    }
+
+    #[test]
+    fn plain_exporter_through_real_spans_on_many_threads() {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                // Half a buffer per call, so `write_all` loops.
+                let n = data.len().div_ceil(2);
+                self.0.lock().unwrap().extend_from_slice(&data[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _g = lock_globals();
+        set_level(Level::Trace);
+        set_sampler(Sampler::default());
+        let buf = Buf::default();
+        set_exporter(Box::new(PlainExporter::new(buf.clone()).with_parent(true)));
+        let threads: Vec<_> = (0..6)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        let outer = Span::new("outer").field("t", t).field("i", i).enter();
+                        outer.event(Level::Info, "step", vec![("n".to_string(), Value::Int(i))]);
+                        let _inner = Span::new("inner").field("t", t).enter();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        flush();
+        clear_exporters();
+
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        // Per iteration: the inner span line, the outer span line, its event.
+        assert_eq!(lines.len(), 6 * 25 * 3, "{text}");
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if line.contains(" span inner ") {
+                assert!(line.contains(" parent="), "{line}");
+                assert!(line.contains(" trace=") && line.contains(" t="), "{line}");
+                i += 1;
+            } else {
+                assert!(line.contains(" span outer "), "{line}");
+                assert!(!line.contains(" parent="), "{line}");
+                let next = lines[i + 1];
+                assert!(next.starts_with("  event step +"), "{next}");
+                let n = line.rsplit(" i=").next().unwrap();
+                assert!(next.ends_with(&format!(" n={n}")), "{line} / {next}");
+                i += 2;
+            }
+        }
+    }
+
+    /// `obs::event` with no current span reaches `PlainExporter` as one
+    /// standalone-event line; a real span named `event` stays a span.
+    #[test]
+    fn plain_exporter_tells_obs_event_from_a_span_named_event() {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _g = lock_globals();
+        set_level(Level::Trace);
+        set_sampler(Sampler::default());
+        let buf = Buf::default();
+        set_exporter(Box::new(PlainExporter::new(buf.clone())));
+        event(
+            Level::Warn,
+            "disk almost full",
+            vec![("free".into(), 1.into())],
+        );
+        {
+            let span = Span::new("event").enter();
+            span.event(Level::Info, "tick", vec![]);
+        }
+        flush();
+        clear_exporters();
+
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            lines[0].contains(" WARN  event \"disk almost full\" trace=")
+                && lines[0].ends_with(" free=1"),
+            "{text}"
+        );
+        assert!(lines[1].contains(" INFO  span event "), "{text}");
+        assert!(lines[2].starts_with("  event tick +"), "{text}");
     }
 
     #[test]

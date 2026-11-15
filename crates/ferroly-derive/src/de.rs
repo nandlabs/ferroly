@@ -9,6 +9,13 @@
 //! The content generators return an expression that evaluates to the built
 //! value and reports failure with `?` / `return Err(..)`, so they must be
 //! placed in a function or closure whose error type is `CodecError`.
+//!
+//! Errors are located as they propagate: a named field's error gains the key
+//! it was read under (`CodecError::in_field`), a tuple field's its position
+//! (`in_index`), and an externally tagged variant's content the variant key.
+//! Newtypes, `flatten` and internally tagged / untagged variants add nothing,
+//! since they have no key of their own on the wire. `map_err` runs only on
+//! failure, so a successful decode pays nothing for this.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -78,9 +85,9 @@ fn expand_enum(c: &Container, variants: &[Variant], repr: &Repr) -> (TokenStream
                 .collect();
             (
                 quote! {
-                    let __s = __value
-                        .as_str()
-                        .ok_or_else(|| ::ferroly::codec::CodecError::expected("string"))?;
+                    let __s = __value.as_str().ok_or_else(|| {
+                        ::ferroly::codec::CodecError::type_mismatch("string", __value)
+                    })?;
                     match __s {
                         #(#arms)*
                         __other => ::core::result::Result::Err(
@@ -123,12 +130,27 @@ fn expand_enum(c: &Container, variants: &[Variant], repr: &Repr) -> (TokenStream
                         #(#names)|* => match __v {
                             ::ferroly::codec::Value::Null => ::core::result::Result::Ok(#path),
                             _ => ::core::result::Result::Err(
-                                ::ferroly::codec::CodecError::expected("null for a unit variant")),
+                                ::ferroly::codec::CodecError::in_field(
+                                    ::ferroly::codec::CodecError::type_mismatch(
+                                        "null for a unit variant", __v),
+                                    __k,
+                                )),
                         },
                     }
                 } else {
+                    // The content's errors are reported under the variant key.
                     let content = value_content(&v.fields, &path, &quote! { __v }, deny, None);
-                    quote! { #(#names)|* => ::core::result::Result::Ok(#content), }
+                    quote! {
+                        #(#names)|* => {
+                            let __attempt =
+                                || -> ::core::result::Result<Self, ::ferroly::codec::CodecError> {
+                                    ::core::result::Result::Ok(#content)
+                                };
+                            ::core::result::Result::map_err(__attempt(), |__e| {
+                                ::ferroly::codec::CodecError::in_field(__e, __k)
+                            })
+                        }
+                    }
                 }
             });
             let decode = quote! {
@@ -146,8 +168,11 @@ fn expand_enum(c: &Container, variants: &[Variant], repr: &Repr) -> (TokenStream
                                 ::ferroly::codec::CodecError::unknown_variant(__other)),
                         }
                     }
-                    _ => ::core::result::Result::Err(
+                    // An object, but not with exactly one key.
+                    ::ferroly::codec::Value::Object(_) => ::core::result::Result::Err(
                         ::ferroly::codec::CodecError::expected(#shape)),
+                    __other => ::core::result::Result::Err(
+                        ::ferroly::codec::CodecError::type_mismatch(#shape, __other)),
                 }
             };
             let decode_from = if all_data {
@@ -158,7 +183,16 @@ fn expand_enum(c: &Container, variants: &[Variant], repr: &Repr) -> (TokenStream
                     let content = stream_content(&v.fields, &path(v), deny);
                     quote! {
                         #(#names)|* => {
-                            __out = ::core::option::Option::Some(#content);
+                            #[allow(unused_mut)]
+                            let mut __attempt =
+                                || -> ::core::result::Result<Self, ::ferroly::codec::CodecError> {
+                                    ::core::result::Result::Ok(#content)
+                                };
+                            __out = ::core::option::Option::Some(
+                                ::core::result::Result::map_err(__attempt(), |__e| {
+                                    ::ferroly::codec::CodecError::in_field(__e, __k)
+                                })?,
+                            );
                         }
                     }
                 });
@@ -197,9 +231,9 @@ fn expand_enum(c: &Container, variants: &[Variant], repr: &Repr) -> (TokenStream
                 quote! { #(#names)|* => ::core::result::Result::Ok(#content), }
             });
             let decode = quote! {
-                let __obj = __value
-                    .as_object()
-                    .ok_or_else(|| ::ferroly::codec::CodecError::expected("object"))?;
+                let __obj = __value.as_object().ok_or_else(|| {
+                    ::ferroly::codec::CodecError::type_mismatch("object", __value)
+                })?;
                 // Last occurrence wins, as for every other key.
                 let mut __found: ::core::option::Option<&::ferroly::codec::Value> =
                     ::core::option::Option::None;
@@ -212,9 +246,9 @@ fn expand_enum(c: &Container, variants: &[Variant], repr: &Repr) -> (TokenStream
                     ::core::option::Option::Some(::ferroly::codec::Value::Str(__s)) => {
                         __s.as_str()
                     }
-                    ::core::option::Option::Some(_) => {
+                    ::core::option::Option::Some(__other) => {
                         return ::core::result::Result::Err(
-                            ::ferroly::codec::CodecError::expected("string tag"));
+                            ::ferroly::codec::CodecError::type_mismatch("string tag", __other));
                     }
                     ::core::option::Option::None => {
                         return ::core::result::Result::Err(
@@ -259,6 +293,14 @@ fn expand_enum(c: &Container, variants: &[Variant], repr: &Repr) -> (TokenStream
 fn err_expected(what: &str) -> TokenStream {
     quote! {
         return ::core::result::Result::Err(::ferroly::codec::CodecError::expected(#what))
+    }
+}
+
+/// `return Err(type_mismatch(what, src))`, for a value of the wrong kind.
+fn err_mismatch(what: &str, src: &TokenStream) -> TokenStream {
+    quote! {
+        return ::core::result::Result::Err(
+            ::ferroly::codec::CodecError::type_mismatch(#what, #src))
     }
 }
 
@@ -334,7 +376,7 @@ fn value_content(
     if tag.is_none() {
         match fs.style {
             Style::Unit => {
-                let bad = err_expected("null");
+                let bad = err_mismatch("null", src);
                 return quote! {
                     match #src {
                         ::ferroly::codec::Value::Null => #path,
@@ -353,7 +395,7 @@ fn value_content(
                     });
                 }
                 let len = fs.active().count();
-                let not_array = err_expected("array");
+                let not_array = err_mismatch("array", src);
                 let wrong_len = err_expected(&array_of(len));
                 let mut next = 0usize;
                 let built = fs.construct(path, |f| {
@@ -362,7 +404,12 @@ fn value_content(
                     }
                     let i = next;
                     next += 1;
-                    quote! { ::ferroly::codec::Decode::decode(&__arr[#i])? }
+                    quote! {
+                        ::core::result::Result::map_err(
+                            ::ferroly::codec::Decode::decode(&__arr[#i]),
+                            |__e| ::ferroly::codec::CodecError::in_index(__e, #i),
+                        )?
+                    }
                 });
                 return quote! {{
                     let __arr = match #src {
@@ -386,7 +433,10 @@ fn value_content(
         let (names, slot) = (f.names(), &f.slot);
         quote! {
             #(#names)|* => #slot = ::core::option::Option::Some(
-                ::ferroly::codec::Decode::decode(__v)?),
+                ::core::result::Result::map_err(
+                    ::ferroly::codec::Decode::decode(__v),
+                    |__e| ::ferroly::codec::CodecError::in_field(__e, __k),
+                )?),
         }
     });
     let tag_arm = tag.map(|tag| quote! { #tag => {} });
@@ -417,7 +467,7 @@ fn value_content(
     quote! {{
         let __obj = #src
             .as_object()
-            .ok_or_else(|| ::ferroly::codec::CodecError::expected("object"))?;
+            .ok_or_else(|| ::ferroly::codec::CodecError::type_mismatch("object", #src))?;
         #(#decls)*
         #rest_decl
         #scan
@@ -471,7 +521,10 @@ fn stream_content(fs: &FieldSet, path: &TokenStream, deny: bool) -> TokenStream 
                 let slot = &f.slot;
                 quote! {
                     #i => #slot = ::core::option::Option::Some(
-                        ::ferroly::codec::Decode::decode_from(__d)?),
+                        ::core::result::Result::map_err(
+                            ::ferroly::codec::Decode::decode_from(__d),
+                            |__e| ::ferroly::codec::CodecError::in_index(__e, #i),
+                        )?),
                 }
             });
             return quote! {{
@@ -498,7 +551,10 @@ fn stream_content(fs: &FieldSet, path: &TokenStream, deny: bool) -> TokenStream 
         let (names, slot) = (f.names(), &f.slot);
         quote! {
             #(#names)|* => #slot = ::core::option::Option::Some(
-                ::ferroly::codec::Decode::decode_from(__d)?),
+                ::core::result::Result::map_err(
+                    ::ferroly::codec::Decode::decode_from(__d),
+                    |__e| ::ferroly::codec::CodecError::in_field(__e, __k),
+                )?),
         }
     });
     let unknown = if flatten {
@@ -619,6 +675,22 @@ mod tests {
         assert!(mixed.contains("decode_value"));
         let unit = generated(parse_quote! { enum E { A, B } });
         assert!(unit.contains("decode_string") && !unit.contains("decode_value"));
+    }
+
+    #[test]
+    fn field_errors_are_located_only_where_the_wire_has_a_key_or_index() {
+        let named = generated(parse_quote! { struct S { a: u8 } });
+        assert_eq!(named.matches("in_field (__e , __k)").count(), 2, "{named}");
+        let tuple = generated(parse_quote! { struct P(u8, u8); });
+        assert!(tuple.contains("in_index (__e , 1usize)"), "{tuple}");
+        assert_eq!(tuple.matches("in_index").count(), 4, "{tuple}");
+        let newtype = generated(parse_quote! { struct N(u8); });
+        assert!(!newtype.contains("in_index") && !newtype.contains("in_field"));
+        let external = generated(parse_quote! { enum E { A(u8), B { x: u8 } } });
+        // The variant key on both paths, plus `x` on both paths.
+        assert_eq!(external.matches("in_field").count(), 6, "{external}");
+        let internal = generated(parse_quote! { #[ferroly(tag = "t")] enum E { A { x: u8 } } });
+        assert_eq!(internal.matches("in_field").count(), 1, "{internal}");
     }
 
     #[test]

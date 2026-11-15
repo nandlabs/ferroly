@@ -330,3 +330,81 @@ fn yaml_value_encode_decode_round_trips() {
         assert_eq!(back, v, "round-trip mismatch via {s:?}");
     }
 }
+
+/// Regex-structural characters for the schema `pattern` fuzzer.
+const REGEX_POOL: &[char] = &[
+    'a', 'b', 'é', '😀', '0', '9', '-', '_', ' ', '\n', '.', '^', '$', '|', '*', '+', '?', '(',
+    ')', '[', ']', '{', '}', ',', '\\', ':', '=', '!', '<', '>', 'd', 'w', 's', 'B', 'u', 'x', 'k',
+    'p', 'c', '1', '3',
+];
+
+const REGEX_SEEDS: &[&str] = &[
+    r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$",
+    r"^(\([0-9]{3}\))?[0-9]{3}-[0-9]{4}$",
+    r"(a+)+$",
+    r"^(?:a|b){2,3}?\b\d*\s+\W$",
+    r"(?<y>\d{4})-[^\u{1F600}\x41-\x5A]😀",
+    r"[\s\S]{0,8}é|😀.\B",
+];
+
+fn random_pattern(rng: &mut Rng) -> String {
+    if rng.below(2) == 0 {
+        let len = rng.below(24);
+        (0..len)
+            .map(|_| REGEX_POOL[rng.below(REGEX_POOL.len())])
+            .collect()
+    } else {
+        let seed = REGEX_SEEDS[rng.below(REGEX_SEEDS.len())];
+        String::from_utf8_lossy(&mutate(rng, seed.as_bytes())).into_owned()
+    }
+}
+
+fn random_subject(rng: &mut Rng) -> String {
+    let len = rng.below(32);
+    (0..len)
+        .map(|_| REGEX_POOL[rng.below(REGEX_POOL.len())])
+        .collect()
+}
+
+fn pattern_schema(pattern: &str) -> Value {
+    Value::Object(vec![("pattern".into(), Value::Str(pattern.into()))])
+}
+
+#[test]
+fn schema_pattern_never_panics_and_is_self_consistent() {
+    use ferroly::codec::schema::{self, Schema};
+    let mut rng = Rng::new(0x5EA2_C4ED);
+    let mut compiled = 0;
+    for _ in 0..iterations(6000) {
+        let pattern = random_pattern(&mut rng);
+        let Ok(schema) = Schema::compile(&pattern_schema(&pattern)) else {
+            // The one-shot form fails closed on the same pattern.
+            let errs = schema::validate(&pattern_schema(&pattern), &Value::Str("a".into()));
+            assert!(errs.is_err(), "{pattern:?}");
+            continue;
+        };
+        compiled += 1;
+        // Wrapping in a group, or alternating with itself, cannot change the
+        // result; a full-string match implies a match somewhere.
+        let grouped = Schema::compile(&pattern_schema(&format!("(?:{pattern})"))).ok();
+        let doubled = Schema::compile(&pattern_schema(&format!("{pattern}|{pattern}"))).ok();
+        let full = Schema::compile(&pattern_schema(&format!("^(?:{pattern})$"))).ok();
+        for _ in 0..4 {
+            let subject = Value::Str(random_subject(&mut rng));
+            let hit = schema.validate(&subject).is_ok();
+            if let Some(g) = &grouped {
+                assert_eq!(g.validate(&subject).is_ok(), hit, "{pattern:?} {subject:?}");
+            }
+            if let Some(d) = &doubled {
+                assert_eq!(d.validate(&subject).is_ok(), hit, "{pattern:?} {subject:?}");
+            }
+            if let Some(f) = &full {
+                if f.validate(&subject).is_ok() {
+                    assert!(hit, "{pattern:?} {subject:?}");
+                }
+            }
+        }
+    }
+    // The generator must reach the matcher, not only the parser's error paths.
+    assert!(compiled > 500, "only {compiled} patterns compiled");
+}

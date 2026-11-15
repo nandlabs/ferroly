@@ -17,6 +17,11 @@ use super::{
 /// The namespace a [`MemoryStore::new`] handle is bound to.
 const DEFAULT_NAMESPACE: &str = "default";
 
+/// The default [`MemoryStore::offload_threshold`]: about a million vector
+/// components (e.g. 1 000 documents of dimension 1 024), roughly a
+/// millisecond of scanning.
+pub const DEFAULT_OFFLOAD_THRESHOLD: usize = 1 << 20;
+
 /// Identifies the snapshot file format.
 const SNAPSHOT_FORMAT: &str = "ferroly.vectorstore.memory";
 /// The snapshot layout version this build reads and writes.
@@ -40,11 +45,16 @@ const SNAPSHOT_VERSION: u32 = 1;
 ///
 /// # Blocking work
 ///
-/// The async trait methods do their work inside the future's first poll, with
-/// no `.await` inside. That is fine for small collections; for a large one a
-/// search would hold an executor thread for the whole scan. Each operation
-/// therefore also exists as a plain function (`search_sync`, `upsert_sync`,
-/// …) to run on a blocking thread — the handle is `Clone + Send + 'static`:
+/// The async [`search`](VectorStore::search) scans on a worker thread of a
+/// small built-in pool (no async runtime needed) once the namespace holds at
+/// least [`offload_threshold`](MemoryStore::offload_threshold) vector
+/// components (documents × dimension, default
+/// [`DEFAULT_OFFLOAD_THRESHOLD`]); a smaller namespace is scanned inline,
+/// where a thread hand-off would cost more than the scan. The other async
+/// methods (upserts, deletes, filtered counts) run inline in the future's
+/// first poll. Each operation also exists as a plain function
+/// (`search_sync`, `upsert_sync`, …) to run on a blocking pool of your own —
+/// the handle is `Clone + Send + 'static`:
 ///
 /// ```no_run
 /// # use ferroly::vectorstore::{MemoryStore, Query};
@@ -72,6 +82,7 @@ const SNAPSHOT_VERSION: u32 = 1;
 pub struct MemoryStore {
     shared: Arc<RwLock<Collections>>,
     namespace: Arc<str>,
+    offload_threshold: Option<usize>,
 }
 
 type Collections = HashMap<String, Collection>;
@@ -138,7 +149,39 @@ impl MemoryStore {
         Self {
             shared: Arc::new(RwLock::new(HashMap::new())),
             namespace: Arc::from(DEFAULT_NAMESPACE),
+            offload_threshold: Some(DEFAULT_OFFLOAD_THRESHOLD),
         }
+    }
+
+    /// Sets how large this handle's namespace must be — in vector components,
+    /// documents × dimension — before the async
+    /// [`search`](VectorStore::search) moves its scan to a worker thread
+    /// instead of running it on the executor. `Some(0)` always offloads,
+    /// `None` never does. Handles from [`namespace`](MemoryStore::namespace)
+    /// inherit the setting.
+    ///
+    /// The scan still holds the store's read lock, so writers wait for it
+    /// either way; offloading only keeps the executor thread free.
+    pub fn offload_threshold(mut self, components: Option<usize>) -> Self {
+        self.offload_threshold = components;
+        self
+    }
+
+    /// Whether a search of this namespace is large enough to offload. Never
+    /// waits for the lock: while a writer holds it, the search would block,
+    /// so it is offloaded.
+    fn should_offload(&self) -> bool {
+        let Some(limit) = self.offload_threshold else {
+            return false;
+        };
+        let guard = match self.shared.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return true,
+        };
+        guard
+            .get(&*self.namespace)
+            .is_some_and(|c| c.docs.len().saturating_mul(c.dim.unwrap_or(0)) >= limit)
     }
 
     /// Returns a handle on the same store bound to namespace `name`.
@@ -163,6 +206,7 @@ impl MemoryStore {
         MemoryStore {
             shared: self.shared.clone(),
             namespace: Arc::from(name),
+            offload_threshold: self.offload_threshold,
         }
     }
 
@@ -525,6 +569,7 @@ impl MemoryStore {
         }
         Ok(MemoryStore {
             shared: Arc::new(RwLock::new(collections)),
+            offload_threshold: Some(DEFAULT_OFFLOAD_THRESHOLD),
             namespace: Arc::from(DEFAULT_NAMESPACE),
         })
     }
@@ -645,7 +690,20 @@ impl VectorStore for MemoryStore {
     }
 
     fn search(&self, query: Query) -> BoxFuture<'_, Result<Vec<Hit>, VectorStoreError>> {
-        Box::pin(async move { self.search_sync(&query) })
+        Box::pin(async move {
+            if self.should_offload() {
+                let handle = self.clone();
+                match super::offload::run(move || handle.search_sync(&query)) {
+                    Ok(scan) => scan.await,
+                    Err(super::offload::Saturated) => Err(VectorStoreError::Backend(format!(
+                        "the search pool is saturated: {} large searches are queued or running",
+                        super::offload::MAX_PENDING
+                    ))),
+                }
+            } else {
+                self.search_sync(&query)
+            }
+        })
     }
 
     fn delete(&self, ids: Vec<String>) -> BoxFuture<'_, Result<(), VectorStoreError>> {

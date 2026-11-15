@@ -320,6 +320,46 @@ impl fmt::Debug for Validator {
     }
 }
 
+/// How a [dynamic flag](Command::dynamic_flags_with) reads the token after
+/// it, when it is written `--name` without `=value`.
+///
+/// `--name=value` is always accepted; what differs is `--name next`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DynamicArity {
+    /// A boolean switch: never takes the next token, so `--name file.txt`
+    /// leaves `file.txt` a positional (or a subcommand name). `--name=value`
+    /// must be a boolean word (`true`/`false`, `1`/`0`, `yes`/`no`,
+    /// `on`/`off`, as for a declared [`boolean`](Arg::boolean) switch) and is
+    /// reported as `"true"` or `"false"`; anything else is
+    /// [`CliError::InvalidValue`].
+    Switch,
+    /// Always takes a value: the next token, even one that starts with a
+    /// single `-` (`--model.context -1`, `--model.stop -x`) or names a
+    /// subcommand, but never one that starts with `--`. With no such token
+    /// the parse fails with [`CliError::MissingValue`]; write `--name=--x`
+    /// for a value that starts with `--`.
+    Value,
+    /// The value is optional (what [`Command::dynamic_flags`] uses): the next
+    /// token is the value when it does not look like a flag (a negative
+    /// number such as `-1`, and `-` alone, do not) and does not select a
+    /// subcommand; otherwise the flag is a switch with no value.
+    Optional,
+}
+
+type PredicateFn = dyn Fn(&str) -> Option<DynamicArity> + Send + Sync;
+
+/// The shared name test of [`Command::dynamic_flags_with`] (opaque in `Debug`
+/// output).
+#[derive(Clone)]
+struct Predicate(Arc<PredicateFn>);
+
+impl fmt::Debug for Predicate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Predicate(..)")
+    }
+}
+
 /// A single argument declaration: an option, a boolean switch, a counter, or a
 /// positional.
 ///
@@ -602,6 +642,7 @@ impl Arg {
                 return Ok(Some(Entry {
                     data: self.data_from_str(&raw)?,
                     source: ValueSource::Env,
+                    indices: Vec::new(),
                 }));
             }
         }
@@ -609,6 +650,7 @@ impl Arg {
             Some(raw) => Ok(Some(Entry {
                 data: self.data_from_str(raw)?,
                 source: ValueSource::Default,
+                indices: Vec::new(),
             })),
             None => Ok(None),
         }
@@ -695,6 +737,7 @@ pub struct Command {
     subcommands: Vec<Command>,
     groups: Vec<Group>,
     subcommand_required: bool,
+    dynamic: Option<Predicate>,
 }
 
 impl Command {
@@ -710,6 +753,7 @@ impl Command {
             subcommands: Vec::new(),
             groups: Vec::new(),
             subcommand_required: false,
+            dynamic: None,
         }
     }
 
@@ -765,14 +809,117 @@ impl Command {
         self
     }
 
+    /// Accepts undeclared long flags whose name (without the leading `--`)
+    /// satisfies `predicate`, instead of refusing them with
+    /// [`CliError::UnknownFlag`]. They are collected in command-line order and
+    /// read back with [`Matches::dynamic`]; the usual use is "any
+    /// configuration key may be overridden as `--<section>.<key> <value>`".
+    ///
+    /// This is [`dynamic_flags_with`](Command::dynamic_flags_with) with every
+    /// accepted name [`DynamicArity::Optional`]:
+    ///
+    /// - A dynamic flag has an optional value: `--name=value`, or
+    ///   `--name value` when the next token does not start with `-` (a
+    ///   negative number such as `-1`, and `-` alone, count as values);
+    ///   otherwise it is a switch with no value. A token that would select one
+    ///   of this command's subcommands is not taken as a value either, so
+    ///   `app --engine.verbose serve` still runs `serve`. Write
+    ///   `--name=value` for a value that looks like a flag or a subcommand.
+    /// - **Limitation:** the parser cannot tell a switch from a value here, so
+    ///   a dynamic switch written directly before a positional takes it as its
+    ///   value: `app --engine.deterministic file.txt` gives
+    ///   `("engine.deterministic", Some("file.txt"))` and no positional. Write
+    ///   `--name=true`, put the switch last, or declare the arity with
+    ///   [`dynamic_flags_with`](Command::dynamic_flags_with).
+    /// - Declared flags, `--help` and `--version` always win; a flag for which
+    ///   the predicate is false is still [`CliError::UnknownFlag`], with its
+    ///   suggestion. Short flags are never dynamic, and neither is a name with
+    ///   an empty `.`-separated segment (`--engine.`, `--a..b`, `--.x`), which
+    ///   is refused before the predicate is asked.
+    /// - Subcommands inherit the predicate unless they set their own, so the
+    ///   flags may be written before or after a subcommand name.
+    /// - Dynamic flags are not listed in the help text.
+    ///
+    /// ```
+    /// use ferroly::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("app")
+    ///     .flag(Arg::new("config").long("config"))
+    ///     .dynamic_flags(|name| name.split_once('.').is_some_and(|(s, _)| s == "engine"))
+    ///     .subcommand(Command::new("serve"));
+    ///
+    /// let m = cmd
+    ///     .parse(["--engine.threads", "4", "serve", "--engine.deterministic"].map(String::from))
+    ///     .unwrap();
+    /// assert_eq!(
+    ///     m.dynamic(),
+    ///     [
+    ///         ("engine.threads".to_string(), Some("4".to_string())),
+    ///         ("engine.deterministic".to_string(), None),
+    ///     ]
+    /// );
+    /// assert!(cmd.parse(["--server.port=1".to_string()]).is_err());
+    /// ```
+    pub fn dynamic_flags(self, predicate: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.dynamic_flags_with(move |name| predicate(name).then_some(DynamicArity::Optional))
+    }
+
+    /// Accepts undeclared long flags like
+    /// [`dynamic_flags`](Command::dynamic_flags), with `arity` both choosing
+    /// the names and saying how each reads the next token: `None` refuses the
+    /// name ([`CliError::UnknownFlag`]); `Some(arity)` accepts it as a
+    /// [`Switch`](DynamicArity::Switch), [`Value`](DynamicArity::Value) or
+    /// [`Optional`](DynamicArity::Optional) flag. Everything else (precedence,
+    /// inheritance, help, [`Matches::dynamic`]) is as for `dynamic_flags`.
+    ///
+    /// With the `config` feature, `ferroly::config::dynamic_arity(&schema)`
+    /// builds this function from an encoded default configuration.
+    ///
+    /// ```
+    /// use ferroly::cli::{Arg, Command, DynamicArity};
+    ///
+    /// let cmd = Command::new("app")
+    ///     .dynamic_flags_with(|name| match name {
+    ///         "engine.deterministic" => Some(DynamicArity::Switch),
+    ///         "engine.threads" | "model.context" => Some(DynamicArity::Value),
+    ///         _ => None,
+    ///     })
+    ///     .subcommand(Command::new("serve").positional(Arg::new("file")));
+    ///
+    /// let m = cmd
+    ///     .parse(
+    ///         ["serve", "--engine.deterministic", "a.txt", "--model.context", "-1"]
+    ///             .map(String::from),
+    ///     )
+    ///     .unwrap();
+    /// assert_eq!(
+    ///     m.dynamic(),
+    ///     [
+    ///         ("engine.deterministic".to_string(), None),
+    ///         ("model.context".to_string(), Some("-1".to_string())),
+    ///     ]
+    /// );
+    /// assert_eq!(m.subcommand().unwrap().1.get("file"), Some("a.txt"));
+    /// ```
+    pub fn dynamic_flags_with(
+        mut self,
+        arity: impl Fn(&str) -> Option<DynamicArity> + Send + Sync + 'static,
+    ) -> Self {
+        self.dynamic = Some(Predicate(Arc::new(arity)));
+        self
+    }
+
     /// Parses `args` (the argument list, excluding the program name) into a
     /// [`Matches`].
+    ///
+    /// Positions reported by [`Matches::indices_of`] and
+    /// [`Matches::subcommand_index`] are indices into this list.
     pub fn parse<I>(&self, args: I) -> Result<Matches, CliError>
     where
         I: IntoIterator<Item = String>,
     {
         let argv: Vec<String> = args.into_iter().collect();
-        self.parse_slice(&argv, &[], &[])
+        self.parse_slice(&argv, 0, &[], None, &[])
     }
 
     /// Parses the current process arguments, skipping the program name.
@@ -889,15 +1036,20 @@ impl Command {
         all
     }
 
-    /// Parses one command level. `inherited` holds the global flags of the
-    /// ancestors and `path` their names (for usage lines).
+    /// Parses one command level. `argv` starts at index `offset` of the
+    /// original argument list; `inherited` holds the global flags of the
+    /// ancestors, `inherited_dynamic` their dynamic-flag predicate and `path`
+    /// their names (for usage lines).
     fn parse_slice(
         &self,
         argv: &[String],
+        offset: usize,
         inherited: &[&Arg],
+        inherited_dynamic: Option<&Predicate>,
         path: &[&str],
     ) -> Result<Matches, CliError> {
         let effective = self.effective(inherited);
+        let dynamic = self.dynamic.as_ref().or(inherited_dynamic);
         let own = self.flags.len();
         let find_long = |key: &str| effective.iter().copied().find(|a| a.matches_long(key));
         let find_short = |c: char| effective.iter().copied().find(|a| a.matches_short(c));
@@ -911,7 +1063,12 @@ impl Command {
         let last_variadic = self.positionals.last().is_some_and(|p| p.variadic);
         let mut raw: HashMap<&str, Raw> = HashMap::new();
         let mut positionals: Vec<String> = Vec::new();
+        let mut positional_at: Vec<usize> = Vec::new();
+        let mut occurrences: Vec<(String, String)> = Vec::new();
+        let mut dynamic_flags: Vec<(String, Option<String>)> = Vec::new();
+        let mut dynamic_at: Vec<usize> = Vec::new();
         let mut subcommand: Option<(&Command, Matches)> = None;
+        let mut subcommand_index = None;
         let mut no_more_flags = false;
         let mut i = 0;
 
@@ -942,6 +1099,53 @@ impl Command {
                             return Err(v);
                         }
                     }
+                    let arity = dynamic
+                        .filter(|_| !key.split('.').any(str::is_empty))
+                        .and_then(|p| (p.0)(key));
+                    if let Some(arity) = arity {
+                        let value = match (arity, inline) {
+                            (DynamicArity::Switch, Some(v)) => Some(
+                                parse_bool(v)
+                                    .ok_or_else(|| CliError::InvalidValue {
+                                        name: key.to_string(),
+                                        value: v.to_string(),
+                                    })?
+                                    .to_string(),
+                            ),
+                            (_, Some(v)) => Some(v.to_string()),
+                            (DynamicArity::Switch, None) => None,
+                            (DynamicArity::Value, None) => match argv.get(i + 1) {
+                                Some(next) if !next.starts_with("--") => {
+                                    i += 1;
+                                    Some(next.clone())
+                                }
+                                _ => {
+                                    return Err(CliError::MissingValue {
+                                        flag: format!("--{key}"),
+                                    })
+                                }
+                            },
+                            (DynamicArity::Optional, None) => match argv.get(i + 1) {
+                                Some(next)
+                                    if self.dynamic_value(
+                                        next,
+                                        positionals.is_empty(),
+                                        &find_short,
+                                    ) =>
+                                {
+                                    i += 1;
+                                    Some(next.clone())
+                                }
+                                _ => None,
+                            },
+                        };
+                        dynamic_flags.push((key.to_string(), value));
+                        // The value's token, or the flag's own for a switch
+                        // or `--name=value`.
+                        dynamic_at.push(offset + i);
+                        i += 1;
+                        continue;
+                    }
                     let known = effective
                         .iter()
                         .flat_map(|a| a.long.iter().chain(a.aliases.iter()))
@@ -964,9 +1168,11 @@ impl Command {
                             })?
                         }
                     };
-                    slot.push(arg, &val);
+                    slot.push(arg, &val, offset + i);
+                    occurrences.push((arg.name.clone(), val));
                 } else {
-                    slot.switch(arg, inline)?;
+                    slot.switch(arg, inline, offset + i)?;
+                    occurrences.push((arg.name.clone(), inline.unwrap_or_default().to_string()));
                 }
                 i += 1;
                 continue;
@@ -1007,14 +1213,17 @@ impl Command {
                                 // `-n=5` means the same as `-n5`.
                                 rest.strip_prefix('=').unwrap_or(&rest).to_string()
                             };
-                            slot.push(arg, &val);
+                            slot.push(arg, &val, offset + i);
+                            occurrences.push((arg.name.clone(), val));
                             break;
                         }
                         if let Some(inline) = rest.strip_prefix('=') {
-                            slot.switch(arg, Some(inline))?;
+                            slot.switch(arg, Some(inline), offset + i)?;
+                            occurrences.push((arg.name.clone(), inline.to_string()));
                             break;
                         }
-                        slot.switch(arg, None)?;
+                        slot.switch(arg, None, offset + i)?;
+                        occurrences.push((arg.name.clone(), String::new()));
                         j += 1;
                     }
                     i += 1;
@@ -1033,8 +1242,17 @@ impl Command {
                         .collect();
                     let mut child_path = path.to_vec();
                     child_path.push(self.name.as_str());
-                    let child = sub.parse_slice(&argv[i + 1..], &globals, &child_path)?;
+                    let child = sub.parse_slice(
+                        &argv[i + 1..],
+                        offset + i + 1,
+                        &globals,
+                        dynamic,
+                        &child_path,
+                    )?;
+                    dynamic_flags.extend(child.dynamic.iter().cloned());
+                    dynamic_at.extend(child.dynamic_at.iter().copied());
                     subcommand = Some((sub, child));
+                    subcommand_index = Some(offset + i);
                     break;
                 }
                 if self.positionals.is_empty() {
@@ -1053,6 +1271,7 @@ impl Command {
                 return Err(CliError::UnexpectedArgument { arg: tok.clone() });
             }
             positionals.push(tok.clone());
+            positional_at.push(offset + i);
             i += 1;
         }
 
@@ -1068,19 +1287,14 @@ impl Command {
                     if !sub.defines(&arg.name) {
                         if let Some(entry) = child.args.get(&arg.name) {
                             if entry.source == ValueSource::CommandLine {
-                                explicit
-                                    .get_or_insert_with(Raw::default)
-                                    .absorb(&entry.data);
+                                explicit.get_or_insert_with(Raw::default).absorb(entry);
                             }
                         }
                     }
                 }
             }
             let entry = match explicit {
-                Some(raw) => Some(Entry {
-                    data: raw.into_data(arg),
-                    source: ValueSource::CommandLine,
-                }),
+                Some(raw) => Some(raw.into_entry(arg)),
                 None => arg.fallback()?,
             };
             match entry {
@@ -1105,14 +1319,21 @@ impl Command {
             for (idx, p) in self.positionals.iter().enumerate() {
                 let last = idx + 1 == self.positionals.len();
                 let entry = if idx < supplied {
-                    let data = if p.variadic && last {
-                        Data::Many(positionals[idx..supplied].to_vec())
+                    let (data, indices) = if p.variadic && last {
+                        (
+                            Data::Many(positionals[idx..supplied].to_vec()),
+                            positional_at[idx..supplied].to_vec(),
+                        )
                     } else {
-                        Data::One(positionals[idx].clone())
+                        (
+                            Data::One(positionals[idx].clone()),
+                            vec![positional_at[idx]],
+                        )
                     };
                     Some(Entry {
                         data,
                         source: ValueSource::CommandLine,
+                        indices,
                     })
                 } else {
                     let fallback = p.fallback()?;
@@ -1168,7 +1389,30 @@ impl Command {
             args,
             positionals,
             subcommand,
+            subcommand_index,
+            occurrences,
+            dynamic: dynamic_flags,
+            dynamic_at,
         })
+    }
+
+    /// Whether the token after an [optional-value](DynamicArity::Optional)
+    /// dynamic flag is that flag's value: it must not look like a flag (a
+    /// negative number does not, unless a short flag claims its digit, and
+    /// neither does `-` alone, the usual "stdin") and must not select a
+    /// subcommand.
+    fn dynamic_value<'a>(
+        &self,
+        next: &str,
+        may_dispatch: bool,
+        find_short: &dyn Fn(char) -> Option<&'a Arg>,
+    ) -> bool {
+        let flag_like = next.starts_with('-')
+            && next != "-"
+            && !(is_negative_number(next)
+                && next[1..].chars().next().and_then(find_short).is_none());
+        let dispatches = may_dispatch && self.find_subcommand(next).is_some();
+        !flag_like && !dispatches
     }
 
     fn check_groups(
@@ -1244,7 +1488,8 @@ impl Command {
         self.render_help(&[], &[])
     }
 
-    /// Generates a shell completion script for this command tree. Source the
+    /// Generates a shell completion script (bash, zsh, fish or PowerShell)
+    /// for this command tree. Source the
     /// output from the shell's start-up file, or install it where the shell
     /// looks for completions.
     pub fn completions(&self, shell: Shell) -> String {
@@ -1341,21 +1586,29 @@ struct Raw {
     values: Vec<String>,
     count: usize,
     flag: Option<bool>,
+    /// For a value option, the `argv` index of each entry of `values`; for a
+    /// switch or counter, of each occurrence.
+    indices: Vec<usize>,
 }
 
 impl Raw {
-    /// Records a value for a value option.
-    fn push(&mut self, arg: &Arg, value: &str) {
+    /// Records a value for a value option, carried by `argv[index]`.
+    fn push(&mut self, arg: &Arg, value: &str, index: usize) {
         if arg.multiple {
+            let before = self.values.len();
             arg.split(value, &mut self.values);
+            let added = self.values.len() - before;
+            self.indices.extend(std::iter::repeat(index).take(added));
         } else {
             self.values = vec![value.to_string()];
+            self.indices = vec![index];
         }
     }
 
-    /// Records an occurrence of a switch or counter, with its optional
-    /// `=value`.
-    fn switch(&mut self, arg: &Arg, inline: Option<&str>) -> Result<(), CliError> {
+    /// Records an occurrence of a switch or counter at `argv[index]`, with
+    /// its optional `=value`.
+    fn switch(&mut self, arg: &Arg, inline: Option<&str>, index: usize) -> Result<(), CliError> {
+        self.indices.push(index);
         let invalid = |value: &str| CliError::InvalidValue {
             name: arg.name.clone(),
             value: value.to_string(),
@@ -1375,17 +1628,22 @@ impl Raw {
     }
 
     /// Folds in occurrences that a subcommand level already resolved.
-    fn absorb(&mut self, data: &Data) {
-        match data {
+    fn absorb(&mut self, entry: &Entry) {
+        match &entry.data {
             Data::Bool(b) => self.flag = Some(*b),
             Data::Count(n) => self.count += n,
-            Data::One(v) => self.values = vec![v.clone()],
+            Data::One(v) => {
+                self.values = vec![v.clone()];
+                self.indices.clear();
+            }
             Data::Many(vs) => self.values.extend(vs.iter().cloned()),
         }
+        self.indices.extend(entry.indices.iter().copied());
     }
 
-    fn into_data(mut self, arg: &Arg) -> Data {
-        if arg.count {
+    /// The resolved command-line entry for `arg`.
+    fn into_entry(mut self, arg: &Arg) -> Entry {
+        let data = if arg.count {
             Data::Count(self.count)
         } else if arg.boolean {
             Data::Bool(self.flag.unwrap_or(true))
@@ -1393,6 +1651,11 @@ impl Raw {
             Data::Many(self.values)
         } else {
             Data::One(self.values.pop().unwrap_or_default())
+        };
+        Entry {
+            data,
+            source: ValueSource::CommandLine,
+            indices: self.indices,
         }
     }
 }
@@ -1409,6 +1672,8 @@ enum Data {
 struct Entry {
     data: Data,
     source: ValueSource,
+    /// `argv` positions of command-line values; empty for fallbacks.
+    indices: Vec<usize>,
 }
 
 /// The outcome of a successful parse: resolved options, switches, counters,
@@ -1418,6 +1683,11 @@ pub struct Matches {
     args: HashMap<String, Entry>,
     positionals: Vec<String>,
     subcommand: Option<(String, Box<Matches>)>,
+    subcommand_index: Option<usize>,
+    occurrences: Vec<(String, String)>,
+    dynamic: Vec<(String, Option<String>)>,
+    /// `argv` positions, parallel to `dynamic`.
+    dynamic_at: Vec<usize>,
 }
 
 impl Matches {
@@ -1543,6 +1813,122 @@ impl Matches {
     /// The dispatched subcommand's name, if any.
     pub fn subcommand_name(&self) -> Option<&str> {
         self.subcommand.as_ref().map(|(name, _)| name.as_str())
+    }
+
+    /// The index, in the list given to [`Command::parse`], of the token that
+    /// selected the subcommand, so `&argv[i + 1..]` is the subcommand's raw
+    /// tail. `None` when no subcommand was dispatched.
+    ///
+    /// A flag's value that happens to equal the subcommand's name is a value,
+    /// not the subcommand: in `tool --config embed embed` the index is `2`.
+    pub fn subcommand_index(&self) -> Option<usize> {
+        self.subcommand_index
+    }
+
+    /// The `argv` positions of an argument's command-line values, in the
+    /// order of [`get_all`](Matches::get_all): `indices_of(n)[i]` is where
+    /// `get_all(n)[i]` came from. Indices are into the list given to
+    /// [`Command::parse`].
+    ///
+    /// - `--flag value` and `-f value` report the index of `value`;
+    ///   `--flag=value`, `-fvalue` and `-f=value` the index of that token.
+    /// - A [`delimiter`](Arg::delimiter) splits one token into several
+    ///   values; each reports that token's index.
+    /// - A repeated single-valued option keeps only its last value, and so
+    ///   only its last index.
+    /// - Positionals report each token's index; a variadic one, one per value.
+    /// - A switch or counter (which has no values) reports one index per
+    ///   occurrence: `-vv` gives the cluster's index twice.
+    /// - The slice is empty when the argument is absent or its value came
+    ///   from the environment or a default.
+    ///
+    /// ```
+    /// use ferroly::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("t")
+    ///     .flag(Arg::new("input").long("input").multiple())
+    ///     .positional(Arg::new("rest").variadic());
+    /// let m = cmd
+    ///     .parse(["--input", "a", "x", "--input=b", "y"].map(String::from))
+    ///     .unwrap();
+    /// assert_eq!(m.get_all("input"), ["a", "b"]);
+    /// assert_eq!(m.indices_of("input"), [1, 3]);
+    /// assert_eq!(m.indices_of("rest"), [2, 4]);
+    /// ```
+    pub fn indices_of(&self, name: &str) -> &[usize] {
+        match self.args.get(name) {
+            Some(e) if e.source == ValueSource::CommandLine => &e.indices,
+            _ => &[],
+        }
+    }
+
+    /// Every flag occurrence parsed at this command level, in command-line
+    /// order, as `(name, value)`: the declared [`Arg::new`] name and the
+    /// value exactly as written (not split by a delimiter). Switches and
+    /// counters yield `""` (or their `=value` when given one), one entry per
+    /// occurrence, so `-vv` yields two.
+    ///
+    /// Only flags written at this level are listed: a global flag written
+    /// after the subcommand name is an occurrence of the subcommand's
+    /// matches. Positionals, everything after `--`, environment and default
+    /// values, and [dynamic flags](Matches::dynamic) are not occurrences.
+    ///
+    /// ```
+    /// use ferroly::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("embed")
+    ///     .flag(Arg::new("input").long("input").multiple())
+    ///     .flag(Arg::new("tokens").long("tokens").multiple());
+    /// let m = cmd
+    ///     .parse(["--input", "first", "--tokens=1,2", "--input", "second"].map(String::from))
+    ///     .unwrap();
+    /// let ordered: Vec<(&str, &str)> = m.occurrences().collect();
+    /// assert_eq!(ordered, [("input", "first"), ("tokens", "1,2"), ("input", "second")]);
+    /// ```
+    pub fn occurrences(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.occurrences
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    /// The flags accepted through [`Command::dynamic_flags`] (or
+    /// [`dynamic_flags_with`](Command::dynamic_flags_with)), in command-line
+    /// order, as `(name, value)` with the name spelled without `--`; the value
+    /// is `None` for a switch. Covers this command and every subcommand below
+    /// it, so the top-level matches hold all of them. Their positions are
+    /// [`dynamic_indices`](Matches::dynamic_indices).
+    pub fn dynamic(&self) -> &[(String, Option<String>)] {
+        &self.dynamic
+    }
+
+    /// The `argv` positions of the [dynamic flags](Matches::dynamic), parallel
+    /// to it: `dynamic_indices()[i]` is where `dynamic()[i]` came from, as an
+    /// index into the list given to [`Command::parse`] (the numbering of
+    /// [`indices_of`](Matches::indices_of)).
+    ///
+    /// `--name value` reports the index of `value`; `--name=value` and a
+    /// switch the index of the flag's token. Comparing them with
+    /// [`indices_of`](Matches::indices_of) and
+    /// [`subcommand_index`](Matches::subcommand_index) places a dynamic flag
+    /// among the declared ones and tells which command level it was written
+    /// at.
+    ///
+    /// ```
+    /// use ferroly::cli::{Arg, Command};
+    ///
+    /// let cmd = Command::new("app")
+    ///     .flag(Arg::new("config").long("config"))
+    ///     .dynamic_flags(|name| name.starts_with("engine."))
+    ///     .subcommand(Command::new("serve"));
+    /// let m = cmd
+    ///     .parse(["--engine.threads", "4", "--config=c", "serve", "--engine.fast"].map(String::from))
+    ///     .unwrap();
+    /// assert_eq!(m.dynamic_indices(), [1, 4]);
+    /// assert_eq!(m.indices_of("config"), [2]);
+    /// assert_eq!(m.subcommand_index(), Some(3));
+    /// ```
+    pub fn dynamic_indices(&self) -> &[usize] {
+        &self.dynamic_at
     }
 }
 

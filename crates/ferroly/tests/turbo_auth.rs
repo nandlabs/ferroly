@@ -1,4 +1,5 @@
 #![cfg(all(feature = "turbo", feature = "auth"))]
+#![allow(deprecated)] // deliberately exercises the legacy JWT API alongside the new one
 //! JWT authentication in the router: the legacy and the validating HS256
 //! authenticators, other HMAC algorithms, JWKS (fixed and remote) key sets,
 //! claims handed to handlers, and scope / role guards.
@@ -222,7 +223,8 @@ async fn jwt_auth_with_requires_exp_and_validates_claims() {
                     ("aud", "orders-api".into()),
                     ("exp", Value::Int(FAR_FUTURE)),
                 ]),
-                SECRET,
+                // HS512 needs a 64-byte secret.
+                &[SECRET, SECRET].concat(),
             )
             .unwrap(),
         ),
@@ -249,7 +251,16 @@ async fn weak_jwt_configuration_fails_closed_and_is_reported() {
         .jwt_auth_with("short", Validation::new())
         .get("/me", whoami);
     assert!(matches!(router.validate(), Err(RouteError::Config(_))));
-    let addr = spawn(router).await;
+    // `serve*` refuses to start such a router; finalized anyway with
+    // `into_handler`, it fails closed.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(ferroly::http::serve_with_config(
+        listener,
+        router.into_handler(),
+        std::future::pending(),
+        ServerConfig::default(),
+    ));
     // Even a token signed with that very secret is refused.
     let token = encode_hs256(
         &claims(&[("sub", "u".into()), ("exp", Value::Int(FAR_FUTURE))]),
@@ -368,9 +379,10 @@ async fn remote_jwks_authenticator_is_asynchronous() {
     });
     let issuer_addr = spawn(issuer).await;
 
-    let keys = Arc::new(RemoteJwks::new(format!(
-        "http://{issuer_addr}/.well-known/jwks.json"
-    )));
+    let keys = Arc::new(
+        RemoteJwks::new(format!("http://{issuer_addr}/.well-known/jwks.json"))
+            .allow_insecure_http(true),
+    );
     let router = Router::new()
         .jwt_auth_jwks(keys, Validation::new().audience("orders-api"))
         .get("/me", whoami);
@@ -467,4 +479,71 @@ async fn group_scoped_optional_auth_and_role_guards() {
     assert_eq!(request(addr, "/app/../strict/x", None).await.status, 401);
     assert_eq!(request(addr, "//strict/x", None).await.status, 400);
     assert_eq!(with_token(addr, "/strict/x", &token(&[])).await.body, "u");
+}
+
+/// SEC-7: a token that cannot be checked because the key set is out of
+/// reach is an outage (`503`), not an invalid token (`401`).
+#[tokio::test]
+async fn an_unreachable_key_set_answers_503() {
+    let keys = Arc::new(
+        RemoteJwks::new("http://127.0.0.1:1/.well-known/jwks.json")
+            .allow_insecure_http(true)
+            .with_client(
+                ferroly::http::Client::new().with_timeout(Some(std::time::Duration::from_secs(5))),
+            ),
+    );
+    let router = Router::new()
+        .jwt_auth_jwks(keys, Validation::new())
+        .get("/me", whoami);
+    let addr = spawn(router).await;
+    let resp = with_token(addr, "/me", OPENSSL_RSA_TOKEN).await;
+    assert_eq!(resp.status, 503, "{}", resp.head);
+    assert!(!resp.body.contains("127.0.0.1"), "{}", resp.body);
+    // A malformed token is still the client's problem.
+    assert_eq!(with_token(addr, "/me", "not-a-jwt").await.status, 401);
+    // A key set refused for its plain-http URL (no opt-in) is a
+    // configuration problem, not the client's: 503 as well.
+    let refused = Router::new()
+        .jwt_auth_jwks(
+            Arc::new(RemoteJwks::new("http://127.0.0.1:1/jwks.json")),
+            Validation::new(),
+        )
+        .get("/me", whoami);
+    let addr = spawn(refused).await;
+    assert_eq!(with_token(addr, "/me", OPENSSL_RSA_TOKEN).await.status, 503);
+}
+
+/// A request with two `Authorization` headers is refused, even by an
+/// optional authenticator: which one counts would be ambiguous.
+#[tokio::test]
+async fn a_repeated_authorization_header_is_refused() {
+    let good = encode_hmac(
+        Algorithm::Hs256,
+        &claims(&[("sub", "u".into()), ("exp", Value::Int(FAR_FUTURE))]),
+        SECRET,
+    )
+    .unwrap();
+    let router = Router::new()
+        .group("/strict", |g| {
+            g.jwt(JwtAuth::hs256(SECRET, Validation::new()))
+                .get("/", whoami)
+        })
+        .group("/optional", |g| {
+            g.jwt(JwtAuth::hs256(SECRET, Validation::new()).optional(true))
+                .get("/", whoami)
+        });
+    let addr = spawn(router).await;
+    assert_eq!(with_token(addr, "/strict/", &good).await.body, "u");
+    for path in ["/strict/", "/optional/"] {
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\
+             Authorization: Bearer {good}\r\nAuthorization: Bearer other\r\n\r\n"
+        );
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("HTTP/1.1 401"), "{path}: {text}");
+    }
 }

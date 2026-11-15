@@ -13,6 +13,7 @@ use ferroly::lifecycle::{
     LifecycleError, ProbeKind,
 };
 use ferroly::rest::{Client, ClientOptions, Cors, SecurityHeaders, Server, ServerOptions};
+use ferroly::turbo::RouteError;
 
 fn local() -> ServerOptions {
     ServerOptions {
@@ -606,14 +607,42 @@ async fn builder_wrappers_prefix_consistently_and_expose_middleware() {
     );
     server.stop().await.unwrap();
 
-    // `try_build` reports routing mistakes; `build` does not fail.
+    // `try_build` reports routing mistakes; `build` does not fail, but its
+    // `start` does, before binding; `build_lenient` serves the router as is.
     let conflicting = || {
         Server::builder(local())
             .get("/a/:x", |_| async { ok("1") })
             .get("/a/:y", |_| async { ok("2") })
     };
     assert!(conflicting().try_build().is_err());
-    let lenient = conflicting().build();
+    let checked = conflicting().build();
+    match checked.start().await {
+        Err(LifecycleError::ComponentFailure { source, .. }) => assert!(
+            matches!(
+                source.downcast_ref::<RouteError>(),
+                Some(RouteError::Conflict { .. })
+            ),
+            "{source}"
+        ),
+        other => panic!("expected the route conflict, got {other:?}"),
+    }
+    assert_eq!(checked.local_addr(), None);
+    // Also with the configured port already taken: the routing mistake wins.
+    let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy = Server::builder(ServerOptions {
+        listen_port: taken.local_addr().unwrap().port(),
+        ..local()
+    })
+    .get("/a/:x", |_| async { ok("1") })
+    .get("/a/:y", |_| async { ok("2") })
+    .build();
+    assert!(matches!(
+        busy.start().await,
+        Err(LifecycleError::ComponentFailure { source, .. })
+            if source.downcast_ref::<RouteError>().is_some()
+    ));
+    drop(taken);
+    let lenient = conflicting().build_lenient();
     lenient.start().await.unwrap();
     let addr = lenient.local_addr().unwrap();
     assert_eq!(

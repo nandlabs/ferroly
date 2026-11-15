@@ -45,6 +45,7 @@ use ferroly::ws::{
     Hub, HubMember, SlowConsumerPolicy,
     // metrics
     WsObserver, WsEvent, TimeoutKind,
+    MetricsObserver, // feature `metrics`
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_MESSAGE_SIZE,
 };
 ```
@@ -389,7 +390,7 @@ All fields are public; always end a struct literal with `..WsServerConfig::defau
 | `origin_policy: OriginPolicy` | `SameOrigin` | See [Origin policy](#origin-policy). |
 | `subprotocols: Vec<String>` | empty | Supported subprotocols in order of preference. |
 | `max_header_bytes` / `max_headers` / `max_line_bytes` | 64 KiB / 128 / 16 KiB | Limits on the upgrade request head (`431`, `431`, `414`/`431`). |
-| `tls: Option<TlsConfig>` | `None` | Serve `wss` (see [TLS](#tls-wss-and-mutual-tls)). |
+| `tls: Option<ReloadableTlsConfig>` | `None` | Serve `wss` (see [TLS](#tls-wss-and-mutual-tls)); read once per accepted connection, so a reload rotates the certificate. Set it with `.tls(..)`, which takes a `TlsConfig` or a `ReloadableTlsConfig`. |
 | `upgrade_hook: Option<Arc<dyn UpgradeHook>>` | `None` | See [Authentication](#authentication-the-upgrade-hook). |
 | `observer: Option<Arc<dyn WsObserver>>` | `None` | Receives [events](#observer-metrics). |
 
@@ -423,8 +424,9 @@ offer.
 
 ### TLS (`wss`) and mutual TLS
 
-Set `WsServerConfig::tls` to an [`http::TlsConfig`](http.md): every accepted connection then
-performs a TLS handshake first, inside the handshake timeout. If the config requires or
+Set `WsServerConfig::tls` with `.tls(..)`, from an [`http::TlsConfig`](http.md) or an
+`http::ReloadableTlsConfig`: every accepted connection then performs a TLS handshake first,
+inside the handshake timeout. If the config requires or
 requests client certificates, the verified chain is available to the upgrade hook and the
 handler through `UpgradeRequest::peer_certificates()`.
 
@@ -443,6 +445,28 @@ let config = WsServerConfig::default().tls(tls);
 # Ok(())
 # }
 ```
+
+**Certificate rotation.** The field holds an `http::ReloadableTlsConfig` (a plain
+`TlsConfig` is converted to one). The server reads its current value once for each accepted
+connection, so keeping a clone and calling `reload` swaps the certificate — or any other TLS
+setting, mutual TLS included — for every connection accepted afterwards, with no restart.
+Established connections keep the configuration they were accepted with.
+
+```rust
+use ferroly::http::TlsConfig;
+use ferroly::ws::WsServerConfig;
+
+# fn ex(cert: &[u8], key: &[u8], renewed_cert: &[u8], renewed_key: &[u8]) -> Result<(), ferroly::http::HttpError> {
+let tls = TlsConfig::from_pem(cert, key)?.reloadable();
+let config = WsServerConfig::default().tls(tls.clone());
+// ... serve with `config`; later, when the certificate is renewed:
+tls.reload(TlsConfig::from_pem(renewed_cert, renewed_key)?);
+# let _ = config;
+# Ok(())
+# }
+```
+
+A struct literal sets the field as `tls: Some(TlsConfig::from_pem(cert, key)?.into())`.
 
 ### `WsServer` — a lifecycle component
 
@@ -655,19 +679,21 @@ What this module guarantees:
 - **Nothing is shared between connections.** Each connection has its own key generator with
   its own seed, so the keys one server observes say nothing about the keys used toward
   another.
-- **On Unix** (where [`ferroly::hash::random`](hash.md) is supported) the generator is seeded
-  with 256 bits from the operating system, and the nonce is 16 separate OS-random bytes.
+- **On Unix and Windows** (where [`ferroly::hash::random`](hash.md) is supported:
+  `/dev/urandom`, `BCryptGenRandom`) the generator is seeded with 256 bits from the operating
+  system's CSPRNG, and the nonce is 16 separate OS-random bytes.
 - **Keys are one-way outputs.** Each block of keys is `SHA-256(tag ‖ seed ‖ counter)`, so
   observing any number of keys does not reveal the seed or other keys.
 - **The nonce never exposes the key stream.** It is never taken from a key generator; in the
   fallback below it is derived from a different seed under a different tag.
-- **On platforms without an OS randomness source reachable from safe, dependency-free code
-  (anything that is not Unix), or if the OS source fails,** the seed is a SHA-256 digest over
+- **On platforms without an OS randomness source ferroly can reach (wasm), or if the OS
+  source fails at runtime (a sandbox without `/dev/urandom`),** the seed is a SHA-256 digest over
   mixed process entropy: wall-clock and monotonic time, stack, heap and static addresses,
   the process id, a counter and several `RandomState` outputs (which the standard library
   keys from OS randomness). This is unpredictable to a remote peer and distinct per
   connection, but it is **not a certified cryptographic source**; do not treat mask keys or
-  nonces from such a platform as secrets.
+  nonces produced that way as secrets. On Linux, the BSDs, macOS and Windows this path is
+  not taken in normal operation.
 
 ## Backpressure and the slow-consumer policy
 
@@ -755,8 +781,44 @@ once per recipient.
 
 ## Observer (metrics)
 
-`ws` does not depend on `ferroly::metrics`. Implement `WsObserver` and bridge the events to
-whatever backend you use; set it on `WsOptions::observer` or `WsServerConfig::observer`.
+Set an observer on `WsOptions::observer` or `WsServerConfig::observer`. With the `metrics`
+feature, the built-in `MetricsObserver` records the events in a
+[`metrics::Registry`](metrics.md); without it, `ws` does not depend on `ferroly::metrics`, and
+you implement `WsObserver` to bridge the events to whatever backend you use.
+
+### `MetricsObserver` (feature `metrics`)
+
+```rust
+use std::sync::Arc;
+use ferroly::metrics::Registry;
+use ferroly::ws::{MetricsObserver, WsOptions, WsServerConfig};
+
+let registry = Registry::new(); // or MetricsObserver::global() for metrics::global()
+let server = WsServerConfig::default().observer(Arc::new(MetricsObserver::new(&registry)));
+// A second prefix keeps client connections apart in the same registry.
+let client = WsOptions::default()
+    .observer(Arc::new(MetricsObserver::with_prefix(&registry, "ws_client")));
+# let _ = (server, client);
+```
+
+| Metric (`ws_` prefix by default) | Kind | Labels |
+| --- | --- | --- |
+| `ws_connections_opened_total` | counter | |
+| `ws_connections_active` | gauge | |
+| `ws_connections_closed_total` | counter | `code` |
+| `ws_messages_received_total`, `ws_messages_sent_total` | counter | |
+| `ws_received_bytes_total`, `ws_sent_bytes_total` | counter | |
+| `ws_protocol_errors_total` | counter | `code` |
+| `ws_timeouts_total` | counter | `kind`: `idle`, `pong`, `write` |
+| `ws_handshakes_rejected_total` | counter | `status`: `400`, `401`, `403`, `404`, `405`, `408`, `426`, `429`, `500`, `503` as themselves, any other status as its class (`1xx` … `5xx`), else `other` |
+| `ws_queue_full_total` | counter | |
+
+Bytes are message payload sizes; frame headers are not counted. The `code` label is the close
+code itself for the codes RFC 6455 defines (`1000`–`1015`); application codes are folded into
+`3xxx` and `4xxx` and anything else into `other`, so peers cannot grow the number of series.
+Pings and pongs are not recorded.
+
+### A custom observer
 
 ```rust
 use std::sync::atomic::{AtomicU64, Ordering};

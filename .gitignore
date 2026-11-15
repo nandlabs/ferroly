@@ -2,6 +2,9 @@
 # Build artifacts
 /target/
 **/target/
+# per-toolchain or per-tool target dirs (target-1100/, target-doc/, …)
+/target-*/
+**/target-*/
 # rustc/rustfmt backups
 **/*.rs.bk
 # MSVC debug info
@@ -65,3 +68,6 @@ rust-project.json
 ehthumbs.db
 Thumbs.db
 desktop.ini
+
+# The CI consumer crate builds against a copy of the root Cargo.lock.
+/ci/rt-consumer/Cargo.lock

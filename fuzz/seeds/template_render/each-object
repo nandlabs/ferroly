@@ -1,0 +1,1 @@
+{{#each m}}{{ @key }}:{{ . }}{{/each}}{{#each xs}}{{ this.k }}{{/each}}

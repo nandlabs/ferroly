@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use ferroly::clients::{authorize, parse_retry_after, AuthError, AuthProvider, Retry, Secret};
 use ferroly::codec::{json, Value};
+pub(crate) use ferroly::genai::message::{is_image_mime, mime_essence};
 use ferroly::genai::observe::{
     GenAiObserver, Operation, PayloadDirection, RequestInfo, RequestOutcome,
 };
@@ -24,8 +25,17 @@ use super::{ProviderOptions, Timeouts};
 /// How much of an error response is read off the wire before giving up on it.
 const ERROR_BODY_READ_LIMIT: u64 = 64 * 1024;
 
-/// Maps a transport error. `phase` names the timeout a plain
+/// Maps a failure of `Client::send` (opening the connection, writing the
+/// request, reading the response head). `phase` names the timeout a plain
 /// [`HttpError::Timeout`] stands for at the call site.
+///
+/// Only a failure the HTTP client raised while opening the connection
+/// ([`HttpError::is_connect_failure`]: resolving the host, the TCP connect),
+/// the TLS handshake or a proxy `CONNECT` becomes [`GenAiError::Connect`],
+/// which is safe to retry. The decision is by phase, never by message text:
+/// a "no route to host" raised after the request was written may still have
+/// been processed. Every other transport failure becomes
+/// [`GenAiError::Transport`], which is not retried.
 pub(crate) fn map_http_error(err: HttpError, phase: TimeoutPhase) -> GenAiError {
     match err {
         HttpError::ConnectTimeout => GenAiError::Timeout {
@@ -33,6 +43,20 @@ pub(crate) fn map_http_error(err: HttpError, phase: TimeoutPhase) -> GenAiError 
         },
         HttpError::Timeout => GenAiError::Timeout { phase },
         HttpError::InvalidUrl(e) => GenAiError::Config(format!("invalid url: {e}")),
+        // The handshake runs before the request is written; a proxy failure
+        // is the CONNECT tunnel (or the proxy settings) failing.
+        other @ (HttpError::Tls(_) | HttpError::Proxy(_)) => GenAiError::Connect(other.to_string()),
+        other if other.is_connect_failure() => GenAiError::Connect(other.to_string()),
+        other => GenAiError::Transport(other.to_string()),
+    }
+}
+
+/// Maps a failure reading the body of a response whose head has arrived.
+/// The request was certainly delivered, so apart from a timeout every
+/// failure is a non-retryable [`GenAiError::Transport`].
+pub(crate) fn map_body_error(err: HttpError, phase: TimeoutPhase) -> GenAiError {
+    match err {
+        HttpError::Timeout | HttpError::ConnectTimeout => GenAiError::Timeout { phase },
         other => GenAiError::Transport(other.to_string()),
     }
 }
@@ -88,8 +112,9 @@ pub(crate) fn failure_to_error(
         error_type,
         message,
     } = failure;
-    let message = match error_type {
-        Some(t) if !t.is_empty() && !message.starts_with(&t) => format!("{t}: {message}"),
+    let error_type = error_type.filter(|t| !t.is_empty());
+    let message = match &error_type {
+        Some(t) if !message.starts_with(t.as_str()) => format!("{t}: {message}"),
         _ => message,
     };
     match hint {
@@ -118,9 +143,39 @@ pub(crate) fn failure_to_error(
                 message,
                 retry_after,
             },
-            _ => GenAiError::Api { status, message },
+            _ => GenAiError::Api {
+                status,
+                message,
+                error_type,
+                retry_after,
+            },
         },
     }
+}
+
+/// Refuses an image part whose MIME type is not `image/*` (a PDF sent as an
+/// image is rejected by every provider API, after the upload).
+pub(crate) fn check_image_mime(mime_type: &str) -> Result<(), GenAiError> {
+    if is_image_mime(mime_type) {
+        return Ok(());
+    }
+    Err(GenAiError::Config(format!(
+        "an image part has the non-image MIME type '{mime_type}'; send documents as \
+         MessagePart::Document"
+    )))
+}
+
+/// The error for a document type the provider cannot read.
+pub(crate) fn unsupported_document(provider: &str, mime_type: &str) -> GenAiError {
+    GenAiError::Config(format!(
+        "the {provider} provider cannot read '{mime_type}' documents"
+    ))
+}
+
+/// A text document's bytes as UTF-8.
+pub(crate) fn document_text<'a>(data: &'a [u8], mime_type: &str) -> Result<&'a str, GenAiError> {
+    std::str::from_utf8(data)
+        .map_err(|_| GenAiError::Config(format!("a '{mime_type}' document is not valid UTF-8")))
 }
 
 /// Truncates `text` to at most `max` bytes on a character boundary.
@@ -373,7 +428,7 @@ impl HttpCore {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| map_http_error(e, TimeoutPhase::Response))?;
+            .map_err(|e| map_body_error(e, TimeoutPhase::Response))?;
         let value = json::from_slice(&bytes)
             .map_err(|e| GenAiError::ResponseParse(format!("response body is not JSON: {e}")))?;
         call.payload(PayloadDirection::Response, &value);
@@ -670,5 +725,90 @@ mod tests {
         ));
         assert!(matches!(classify(400), GenAiError::Api { status: 400, .. }));
         assert!(matches!(classify(500), GenAiError::Api { status: 500, .. }));
+    }
+
+    #[test]
+    fn api_error_keeps_type_and_retry_after() {
+        let failure = ProviderFailure {
+            status: 500,
+            hint: ErrorHint::None,
+            error_type: Some("api_error".into()),
+            message: "Internal server error".into(),
+        };
+        let err = failure_to_error(
+            failure,
+            Some(Duration::from_secs(4)),
+            RateLimitInfo::default(),
+        );
+        assert_eq!(err.error_type(), Some("api_error"));
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(4)));
+        assert!(err.to_string().contains("api_error: Internal server error"));
+    }
+
+    #[test]
+    fn connect_failures_are_told_apart_from_sent_ones() {
+        use std::io::{Error, ErrorKind};
+        let map = |e: HttpError| map_http_error(e, TimeoutPhase::Response);
+        for unsent in [
+            HttpError::Tls("invalid peer certificate".into()),
+            HttpError::Proxy("proxy CONNECT answered 407".into()),
+        ] {
+            assert!(matches!(map(unsent), GenAiError::Connect(_)));
+        }
+        // An I/O error counts as "nothing sent" only when the HTTP client
+        // raised it while opening the connection, never by its kind or
+        // text: the same error on an open socket may follow a delivered
+        // request.
+        for sent in [
+            HttpError::Io(Error::from(ErrorKind::ConnectionRefused)),
+            HttpError::Io(Error::other("No route to host (os error 65)")),
+            HttpError::Io(Error::other("Network is unreachable (os error 51)")),
+            HttpError::Io(Error::other(
+                "failed to lookup address information: nodename nor servname provided",
+            )),
+            HttpError::Io(Error::from(ErrorKind::ConnectionReset)),
+            HttpError::Io(Error::from(ErrorKind::UnexpectedEof)),
+            HttpError::Protocol("bad status line".into()),
+            HttpError::BodyTooLarge(10),
+        ] {
+            let err = map(sent);
+            assert!(matches!(err, GenAiError::Transport(_)), "{err:?}");
+            assert!(!err.is_transient());
+        }
+    }
+
+    #[test]
+    fn body_read_failures_are_never_connect_failures() {
+        use std::io::Error;
+        let map = |e: HttpError| map_body_error(e, TimeoutPhase::StreamIdle);
+        for err in [
+            HttpError::Io(Error::other("No route to host (os error 65)")),
+            HttpError::Tls("close_notify missing".into()),
+            HttpError::Proxy("tunnel closed".into()),
+        ] {
+            let err = map(err);
+            assert!(matches!(err, GenAiError::Transport(_)), "{err:?}");
+            assert!(!err.is_transient());
+        }
+        assert!(matches!(
+            map(HttpError::Timeout),
+            GenAiError::Timeout {
+                phase: TimeoutPhase::StreamIdle
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_refused_tcp_connect_is_a_connect_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let req = Request::builder(Method::Post, &format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .build();
+        let err = Client::new().send(req).await.unwrap_err();
+        let err = map_http_error(err, TimeoutPhase::Response);
+        assert!(matches!(err, GenAiError::Connect(_)), "{err:?}");
+        assert!(err.is_transient());
     }
 }

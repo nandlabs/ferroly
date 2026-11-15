@@ -921,3 +921,63 @@ async fn sync_methods_run_on_a_blocking_thread() {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
     assert_send_sync_static::<MemoryStore>();
 }
+
+/// A search over a namespace at or above the offload threshold scans on a
+/// worker thread, so the executor keeps running other tasks while the scan
+/// waits (here, for a writer holding the lock).
+#[tokio::test(flavor = "current_thread")]
+async fn large_search_does_not_block_the_executor() {
+    use std::time::{Duration, Instant};
+    let store = MemoryStore::new().offload_threshold(Some(0));
+    store
+        .upsert_sync(vec![Doc::new("a", vec![1.0, 0.0])])
+        .unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let writer = store.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = writer.write();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+    });
+    locked_rx.recv().unwrap();
+
+    let search = async {
+        let hits = store.search(Query::new(vec![1.0, 0.0], 1)).await;
+        (hits, Instant::now())
+    };
+    let ticker = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Instant::now()
+    };
+    let ((hits, searched_at), ticked_at) = tokio::join!(search, ticker);
+    holder.join().unwrap();
+    assert_eq!(ids(&hits.unwrap()), ["a"]);
+    assert!(
+        ticked_at + Duration::from_millis(100) < searched_at,
+        "the executor was blocked by the scan"
+    );
+}
+
+/// Below the threshold (and with offloading off) the search runs inline and
+/// gives the same answer; the setting is inherited by namespace handles.
+#[tokio::test]
+async fn offload_threshold_is_inherited_and_optional() {
+    let store = MemoryStore::new().offload_threshold(None);
+    assert!(!store.should_offload());
+    let other = store.namespace("other");
+    other
+        .upsert_sync(vec![Doc::new("x", vec![0.0, 1.0])])
+        .unwrap();
+    assert!(!other.should_offload());
+    let always = other.clone().offload_threshold(Some(0));
+    assert!(always.should_offload());
+    let inline = other.search(Query::new(vec![0.0, 1.0], 1)).await.unwrap();
+    let offloaded = always.search(Query::new(vec![0.0, 1.0], 1)).await.unwrap();
+    assert_eq!(ids(&inline), ids(&offloaded));
+    // The default threshold leaves a tiny namespace inline.
+    let small = MemoryStore::new();
+    small
+        .upsert_sync(vec![Doc::new("s", vec![1.0; 8])])
+        .unwrap();
+    assert!(!small.should_offload());
+}

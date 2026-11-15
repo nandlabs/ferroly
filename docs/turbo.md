@@ -36,7 +36,7 @@ served directly with one of the [`serve`](#finalizing-and-serving) methods.
 | Limits | [`body_limit`, `request_timeout`](#body-limits-and-timeouts) |
 | Automatic answers | [`HEAD` and `OPTIONS`](#automatic-head-and-options), `405` + `Allow` |
 | Validation | [`validate` / `problems` / `try_into_handler`](#validating-the-route-table) |
-| Middleware | [`cors`](#cors), [`security_headers`](#security-headers), [`request_id`](#request-ids), [`csrf`](#csrf-hash-feature), [`rate_limit_with`](#rate-limiting) |
+| Middleware | [`cors`](#cors), [`security_headers`](#security-headers), [`request_id`](#request-ids), [`etag`](#conditional-get-etag), [`csrf`](#csrf-hash-feature), [`rate_limit_with`](#rate-limiting) |
 | Bodies | [`form`](#forms-and-multipart), [`multipart`](#forms-and-multipart), [`validate`](#schema-validation), [cookies](#cookies) |
 | Files | [`static_files`](#static-files) |
 | Serving | [`into_handler`, `serve*`](#finalizing-and-serving) — config, shutdown, TLS |
@@ -48,7 +48,7 @@ use ferroly::turbo::{
     Router, Group, Route, Ctx, Next, Extensions,
     IntoResponse, Problem, ParamError, RouteError,
     Cors, SecurityHeaders, FrameOptions, RequestId,
-    RateLimit, TrustedProxies, ForwardedHeader,
+    RateLimit, TrustedProxies, ForwardedHeader, ETag,
     StaticFiles, SetCookie, SameSite, CookieError,
     Form, FormError, Part, MultipartLimits,
 };
@@ -205,8 +205,10 @@ left are client-controlled and never used.
 - **Cookies** built with [`SetCookie::new`](#cookies) are `Secure`, `HttpOnly`, `SameSite=Lax`,
   `Path=/` unless you say otherwise, and `__Host-` / `__Secure-` prefix rules are enforced.
 - **CORS** never sends `Access-Control-Allow-Origin: *` together with credentials.
-- **JWT**: the new authenticators require `exp` and a secret of at least 16 bytes; a `401`
-  never says why a token was rejected.
+- **JWT**: the new authenticators require `exp` and a secret of at least 32 bytes (48 for
+  HS384, 64 for HS512 — RFC 7518); a `401` never says why a token was rejected.
+- **API keys**: stored only as SHA-256 digests and compared in constant time; a `401` never
+  says whether the key was missing, unknown or revoked.
 - **Error bodies** produced by [`Classified`](#classified-errutils-feature) carry the error
   message only for caller errors (4xx).
 - **Static files** are confined to their root; see [Static files](#static-files).
@@ -331,12 +333,30 @@ let _router = Router::new().post("/items", |ctx| async move {
 
 `ctx.validate(&schema)` decodes the body into a [`Value`](codec.md) and checks it against a
 schema ([`codec::schema`](codec.md), a JSON-Schema subset). `ctx.read_valid::<T>(&schema)`
-validates and then decodes into `T`. Both return a [`Problem`](#problem-rfc-9457) on failure:
+validates and then decodes into `T` from the already-parsed `Value` (the body is parsed
+once, with the same strict/lenient rules as `ctx.read`). One difference: in a `Value` a
+JSON integer literal wider than 64 bits is a float, so an `i128` / `u128` field rejects it
+with a `400` (never a rounded number) where `ctx.read` decodes it exactly; send such
+values as decimal strings, which is how they encode. Both return a
+[`Problem`](#problem-rfc-9457) on failure.
+
+`validate` compiles the schema on every call. For a handler that runs on every request,
+compile it once with [`Schema::compile`](schema.md) (which also rejects an invalid schema,
+such as a bad `pattern`, up front) and use `ctx.validate_with(&schema)` /
+`ctx.read_valid_with::<T>(&schema)`; the results and failures are the same.
+[`Schema::of::<T>()`](schema.md#generating-a-schema-from-a-type) builds the schema from a
+type that derives `JsonSchema`.
 
 | Failure | Status | Body |
 |---|---|---|
 | Body cannot be decoded | `400` (`415` for an unknown content type) | problem document |
-| Body decodes but breaks the schema | `422` | problem document with an `errors` array of `{ "path", "message" }`, one per violation |
+| Body decodes but breaks the schema | `422` | problem document with an `errors` array of `{ "path", "message" }`, one per violation, at most 100 (then `"truncated": true`) |
+
+Validation output is bounded, so a hostile body cannot turn into a huge response: the
+validator stops after [`DEFAULT_MAX_VIOLATIONS`](schema.md#bounded-output) (100) violations,
+and the `422` then lists those and adds `"truncated": true`. With a compiled schema the cap is
+the schema's own, set by `Schema::with_max_violations` (use `1` to report only the first
+violation). An 8 MiB body of failing array items yields a 422 of a few kilobytes.
 
 ```rust
 use ferroly::codec::{json, Decode};
@@ -365,6 +385,9 @@ async fn create(ctx: Ctx) -> Result<HttpResponse, Problem> {
 
 Parse the schema once (for example into [application state](#extensions-and-application-state))
 rather than per request.
+
+`path` is a JSON Pointer into the body (`/items/3/name`; `~` and `/` in a key are written
+`~0` and `~1`).
 
 ### Content-negotiated responses: `respond`
 
@@ -761,7 +784,8 @@ let _router = Router::new()
     });
 ```
 
-`filter_async` exists on `Router`, `Group` and `Route`.
+`filter_async` exists on `Router`, `Group` and `Route`. For API keys specifically, use the ready-made [`ApiKeyAuth`](#api-keys-hash-feature)
+(hashed store, constant-time comparison, scopes) rather than a hand-written filter like this one.
 
 ### Authenticator
 
@@ -847,7 +871,9 @@ let _router = Router::new()
 
 ### Validating the route table
 
-Because registration is infallible, call one of these at start-up:
+Registration is infallible. The `serve*` methods validate before they bind (see
+[Finalizing and serving](#finalizing-and-serving)); when you finalize the router yourself, call
+one of these at start-up:
 
 | Method | Returns |
 |---|---|
@@ -859,7 +885,7 @@ Because registration is infallible, call one of these at start-up:
 |---|---|---|
 | `InvalidPattern { pattern, reason }` | `:` without a name, a repeated parameter name, `*name` not last, a `.`/`..` segment, a catch-all in a group/mount prefix | the route (or the whole group/mount) is **not registered** → `404` |
 | `Conflict { method, first, second }` | two routes match exactly the same paths for the same method (`/users/:id` and `/users/:name`) | the first registered wins |
-| `Config(message)` | a middleware that cannot work as configured: a JWT secret under 16 bytes, an empty key set, `allow_any_origin` + `allow_credentials`, a CSRF cookie that cannot be set | the middleware fails closed (rejects, or omits the unsafe header) |
+| `Config(message)` | a middleware that cannot work as configured: a JWT secret under the RFC 7518 minimum (32 / 48 / 64 bytes), an empty key set, `allow_any_origin` + `allow_credentials`, a CSRF cookie that cannot be set | the middleware fails closed (rejects, or omits the unsafe header) |
 
 ```rust
 use ferroly::http::{HttpResponse, StatusCode};
@@ -966,6 +992,46 @@ An inbound `X-Request-Id` is kept **only** if it is 1–128 characters from
 control or non-ASCII characters, over-long values — is discarded and replaced by a generated
 id (32 hex characters), because a request id travels into logs, headers and downstream
 requests. Register it early so later layers can use the id.
+
+### Conditional GET (`ETag`)
+
+`Router::etag(ETag)` (also on `Group` and `Route`) gives dynamic responses a validator and
+answers revalidation without resending the body:
+
+- A `GET` or `HEAD` answered `200` with a fixed (not streamed) body gets an `ETag` computed
+  over the body bytes, unless the handler set one itself.
+- A `HEAD` answer is tagged only when it carries the body `GET` would send (the automatic
+  `HEAD` runs the `GET` handler). An explicit `HEAD` handler that returns an empty body with
+  a non-zero `Content-Length` (or none) gets no computed tag, since it would not match
+  `GET`'s; such a handler can set `ETag` itself.
+- When the request's `If-None-Match` lists that tag (weak comparison, RFC 9110 §13.1.2) or is
+  `*`, the answer becomes `304 Not Modified` with no body. It keeps the response headers
+  (`ETag`, `Cache-Control`, `Vary`, cookies, …) except `Content-Type`, `Content-Length`,
+  `Content-Encoding` and `Content-Range`. The list is parsed as entity-tags, so a quoted
+  tag may itself contain a comma (`"a,b"`).
+- Other methods, other statuses and streamed bodies pass through untouched.
+
+| Constructor | Tag |
+|---|---|
+| `ETag::strong()` (the default) | `"<digest>-<len>"`, for byte-identical bodies |
+| `ETag::weak()` | `W/"<digest>-<len>"`, when a proxy may re-encode the body |
+
+The digest is a 128-bit FNV-1a hash of the body, the same in every process, so replicas agree;
+`ETag::tag_for(body)` returns the tag the middleware would use. It is a change detector, not a
+security token. The handler still runs for every request (the saving is bandwidth); a handler
+that knows its own version can set `ETag` itself and keeps the `304` handling. Register
+`etag` after layers that rewrite the body.
+
+```rust
+use ferroly::http::{HttpResponse, StatusCode};
+use ferroly::turbo::{ETag, Router};
+
+let _router = Router::new()
+    .etag(ETag::strong())
+    .get("/report", |_| async {
+        HttpResponse::text(StatusCode::OK, "{\"total\": 42}").header("Cache-Control", "no-cache")
+    });
+```
 
 ### CSRF (`hash` feature)
 
@@ -1265,8 +1331,53 @@ version), [`ReloadableTlsConfig`](http.md#certificate-reload) and every
 that is a [lifecycle](lifecycle.md) component with health endpoints, use
 [`rest::Server`](rest.md).
 
-The `serve*` methods finalize with `into_handler`; call `validate()` first if you want
-routing mistakes to stop start-up.
+Every `serve*` method validates the router first (`try_into_handler`), before binding
+the address, so a routing mistake never holds the port and an address in use does not hide
+it: a malformed
+pattern, two conflicting routes or an unusable middleware configuration stops start-up
+with `HttpError::Io` of kind `InvalidInput`, whose inner error is the `RouteError`. To serve
+such a router anyway (the first of two conflicting routes wins), finalize it with
+`into_handler` and pass the handler to `ferroly::http::serve_with_config`.
+
+```rust
+use ferroly::http::{HttpResponse, ServerConfig, StatusCode};
+use ferroly::turbo::{RouteError, Router};
+
+# async fn ex() {
+let router = Router::new()
+    .get("/users/:id", |_| async { HttpResponse::text(StatusCode::OK, "a") })
+    .get("/users/:name", |_| async { HttpResponse::text(StatusCode::OK, "b") });
+let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+let err = router
+    .serve_listener(listener, ServerConfig::default(), std::future::pending())
+    .await
+    .unwrap_err();
+let ferroly::http::HttpError::Io(io) = err else { panic!() };
+let route = io.get_ref().and_then(|e| e.downcast_ref::<RouteError>());
+assert!(matches!(route, Some(RouteError::Conflict { .. })));
+# }
+```
+
+**HTTP/2.** With the `http2` feature, set `ServerConfig::http2` and the same router also
+serves HTTP/2 — over TLS when the client selects `h2` with ALPN, and on cleartext to clients
+that open with the HTTP/2 preface (h2c prior knowledge). Routes, middleware and `Ctx` are
+unchanged; each stream runs its handler on its own task. See
+[HTTP/2](http.md#http2) for the limits and defences.
+
+```rust
+# #[cfg(feature = "http2")]
+# async fn ex(router: ferroly::turbo::Router) -> Result<(), ferroly::http::HttpError> {
+use ferroly::http::{Http2Config, ServerConfig};
+
+let config = ServerConfig {
+    http2: Some(Http2Config::default()),
+    ..ServerConfig::default()
+};
+router
+    .serve_with_config("0.0.0.0:8080", config, std::future::pending())
+    .await
+# }
+```
 
 ---
 
@@ -1276,10 +1387,10 @@ routing mistakes to stop start-up.
 
 | Method | Verifies | Validation |
 |---|---|---|
-| `jwt_auth(secret)` | HS256 | **Legacy, lenient**: `exp`/`nbf` checked only when present; any non-empty secret. Unchanged, so existing tokens keep working. |
-| `jwt_auth_with(secret, Validation)` | HS256 | [`auth::Validation`](auth.md): `exp` **required** by default, `nbf`, `iat`, issuer, audience, subject, required claims, leeway; secret ≥ 16 bytes. |
-| `jwt_auth_hmac_with(alg, secret, Validation)` | HS256 / HS384 / HS512 | as above; the token's `alg` must equal `alg`. |
-| `jwt_auth_jwks(Arc<RemoteJwks>, Validation)` | RS256 / ES256 … via a remote JWKS endpoint | as above; asynchronous (key fetch + cache). |
+| `jwt_auth(secret)` (**deprecated**) | HS256 | **Legacy, lenient**: `exp`/`nbf` checked only when present; any non-empty secret. Unchanged, so existing tokens keep working. |
+| `jwt_auth_with(secret, Validation)` | HS256 | [`auth::Validation`](auth.md): `exp` **required** by default, `nbf`, `iat`, issuer, audience, subject, required claims, leeway, optional `jti` replay cache; secret ≥ 32 bytes. |
+| `jwt_auth_hmac_with(alg, secret, Validation)` | HS256 / HS384 / HS512 | as above; the token's `alg` must equal `alg`; secret ≥ 32 / 48 / 64 bytes. |
+| `jwt_auth_jwks(Arc<RemoteJwks>, Validation)` | RS\*, PS\*, ES\*, EdDSA via a remote JWKS endpoint, or one found by OIDC discovery (`RemoteJwks::from_issuer`) | as above; asynchronous (key fetch + cache). |
 | `jwt(JwtAuth)` | any of the above | the general form; also `Group::jwt` |
 
 ```rust
@@ -1289,7 +1400,7 @@ use ferroly::turbo::Router;
 
 let _router = Router::new()
     .jwt_auth_with(
-        "a-shared-secret-of-at-least-16-bytes",
+        "a-shared-secret-of-at-least-32-bytes",
         Validation::new().issuer("https://issuer.example").audience("orders-api"),
     )
     .get("/me", |ctx| async move {
@@ -1299,8 +1410,11 @@ let _router = Router::new()
     });
 ```
 
-**Prefer `jwt_auth_with`** (or `jwt`) for new code. `jwt_auth` keeps its original behaviour
-— it does **not** require `exp` — purely for compatibility.
+**Use `jwt_auth_with`** (or `jwt`). `jwt_auth` keeps its original behaviour — it does
+**not** require `exp` and takes any non-empty secret — purely for compatibility, and is
+`#[deprecated]` since 0.6.0, as are `JwtAuth::legacy_hs256` and the `auth::encode_hs256` /
+`decode_hs256` pair it is built on. An empty secret rejects every token and is reported by
+`validate()`.
 
 `JwtAuth` is the configurable form:
 
@@ -1309,20 +1423,26 @@ let _router = Router::new()
 | `JwtAuth::hs256(secret, validation)` / `JwtAuth::hmac(alg, secret, validation)` | Shared-secret tokens. |
 | `JwtAuth::jwks(Jwks, validation)` | A fixed public key set. |
 | `JwtAuth::remote_jwks(Arc<RemoteJwks>, validation)` | A remote, cached key set. |
-| `JwtAuth::legacy_hs256(secret)` | What `jwt_auth` uses. |
+| `JwtAuth::legacy_hs256(secret)` (deprecated) | What `jwt_auth` uses. |
 | `.optional(true)` | A request **without** a token passes anonymously (no claims); a presented token is still verified, and rejected if invalid. |
 | `.verify(token).await` | Verify a token yourself. |
 
 Behaviour:
 
 - The token is taken from `Authorization: Bearer <token>` (scheme case-insensitive);
-  `bearer_token(&ctx)` exposes that.
+  `bearer_token(&ctx)` exposes that. A request with more than one `Authorization` header is
+  ambiguous (a proxy in front may have checked the other one): `bearer_token` returns `None`
+  and the authenticator answers `401`, even when it is optional.
 - Missing token → `401` with `WWW-Authenticate: Bearer`. Invalid token → `401` with
   `WWW-Authenticate: Bearer error="invalid_token"`. The body never says why.
+- A token that cannot be checked — the remote key set cannot be fetched (`KeyFetch`) or no
+  rustls crypto provider is installed (`NoCryptoProvider`) → `503 authentication
+  unavailable`, as the API-key authenticator answers for a failing store.
 - On success the claims are stored as the `Claims` extension: `ctx.claims()` returns
   `Option<Arc<Claims>>` with `get(name)`, `subject()`, `scopes()`, `roles()`, `value()`.
-- A configuration that can accept no token (secret too short, empty key set) rejects every
-  request and is reported by `validate()`.
+- A configuration that can accept no token (a secret below the algorithm's RFC 7518 minimum,
+  an empty key set, RSA/EC keys with no crypto provider installed) rejects every request and
+  is reported by `validate()`.
 
 **Scope and role guards** are filters built on [`auth::Scopes`](auth.md):
 
@@ -1356,6 +1476,74 @@ let _router = Router::new().group("/orders", |g| {
         )
 });
 ```
+
+### API keys (`hash` feature)
+
+`ApiKeyAuth` authenticates requests by an API key looked up in an `ApiKeyStore`:
+
+```rust
+use std::sync::Arc;
+use ferroly::http::{HttpResponse, StatusCode};
+use ferroly::turbo::{require_api_key_scopes, ApiKey, ApiKeyAuth, MemoryApiKeyStore, Route, Router};
+
+let store = Arc::new(MemoryApiKeyStore::new());
+
+// Issuing a key: hand `key` to the client once; only the record is stored.
+let (key, record) = ApiKey::generate("ci-pipeline").unwrap();
+store.insert(record.with_scopes(["deploy", "read"]));
+println!("give this to the client once: {key}");
+
+let _router = Router::new().group("/api", |g| {
+    g.api_key(ApiKeyAuth::new(store.clone()))
+        .get("/me", |ctx| async move {
+            let id = ctx.api_key().map(|k| k.id().to_string()).unwrap_or_default();
+            HttpResponse::text(StatusCode::OK, id)
+        })
+        .route(
+            "/deploy",
+            Route::post(|_| async { HttpResponse::new(StatusCode::ACCEPTED) })
+                .filter(require_api_key_scopes(&["deploy"])),
+        )
+});
+
+// Revocation takes effect on the next request:
+store.remove("ci-pipeline");
+```
+
+How a key is checked:
+
+1. The key is read from `X-API-Key` (or the header set with `.header(name)`; with
+   `.allow_bearer(true)` also from `Authorization: Bearer <key>`).
+2. Its **SHA-256 digest** (`hash_api_key`) is looked up in the store. Stores hold digests,
+   never keys: a leaked store does not leak keys. Keys must be high-entropy random strings —
+   `ApiKey::generate` makes 32 random bytes from the OS CSPRNG — because a plain hash is not a
+   password hash.
+3. The returned record's digest is compared with the computed one **in constant time**, so a
+   store that matches loosely cannot admit the wrong key. `MemoryApiKeyStore` itself compares
+   against every record in constant time, with no early exit.
+4. The scopes from `.require_scopes(&[..])` must all be granted.
+
+| Outcome | Response |
+|---|---|
+| no key | `401` with `WWW-Authenticate: ApiKey header="x-api-key"` (or `.optional(true)`: passes anonymously) |
+| unknown, revoked or altered key | `401` — the same body; never says why |
+| the key header sent more than once (or `Authorization`, with `.allow_bearer(true)`) | `401`, even with `.optional(true)`: which instance counts would be ambiguous |
+| valid key, missing a required scope | `403` |
+| the store returned `Err(ApiKeyStoreError)` | `503`, without the store's message |
+| accepted | the `ApiKey` record is stored; read it with `ctx.api_key()` |
+
+| Item | Description |
+|---|---|
+| `ApiKey::new(id, digest)`, `ApiKey::from_key(id, key)`, `ApiKey::generate(id)` | A record (id, digest, scopes); `generate` returns `(key, record)`. `Debug` shows the id and scopes only. |
+| `.with_scopes([..])`, `id()`, `digest()`, `scopes()`, `has_scope(s)`, `has_all(&[..])` | Scope matching is exact and case-sensitive. |
+| `trait ApiKeyStore` | `find(&digest) -> BoxFuture<Result<Option<ApiKey>, ApiKeyStoreError>>` — implement over a database with an indexed digest column. A lookup by digest leaks nothing useful through timing. |
+| `MemoryApiKeyStore` | In-process: `new()`, `with_key(..)`, `insert(..)` (replaces by id), `remove(id)`, `len()`. |
+| `ApiKeyAuth::new(store)` | `.header(name)`, `.allow_bearer(bool)`, `.require_scopes(&[..])`, `.optional(bool)`, `.authenticate(key).await`. |
+| `Router::api_key(auth)` / `Group::api_key(auth)` | Install as the router's authenticator (replacing any other, `jwt` included) or as a group filter. |
+| `require_api_key_scopes(&[..])` | A per-route filter: `401` without an accepted key, `403` without the scopes. |
+
+Not included: key expiry (put it in your store and return `Ok(None)` once expired),
+per-key rate limits (combine with `RateLimit`), and key rotation workflows.
 
 ### `access_log` (`log` feature)
 
@@ -1516,7 +1704,9 @@ Behaviour that changed in 0.4.0:
 - **Rate limiting is per process.**
 - **Static-file `ETag`s are weak**, so `If-Range` with an entity tag falls back to the whole
   file (a date works).
-- **HTTP/1.1 only** — see [`http`](http.md#limitations).
+- **No HTTP/3.** HTTP/1.1 always, and HTTP/2 with the `http2` feature (see
+  [Finalizing and serving](#finalizing-and-serving)); the transport limits are in
+  [`http`](http.md#limitations).
 
 ---
 

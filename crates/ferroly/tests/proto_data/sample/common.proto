@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package sample.common;
+
+import public "sample/legacy.proto";
+
+// A key/value label.
+message Label {
+  string key = 1;
+  string value = 2;
+}
+
+// Fields declared out of number order are written in number order, as
+// protoc does; see https://protobuf.dev/programming-guides/encoding/.
+// Tabs	are expanded.
+// - a list item
+// continued on the next line
+message Ordered {
+  int32 z = 15;
+  int32 a = 14;
+  oneof pick {
+    string late = 20;
+    string early = 3;
+  }
+}

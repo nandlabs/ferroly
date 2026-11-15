@@ -58,15 +58,17 @@ pub(crate) struct Disposition {
 ///
 /// | Error | Same-model retry | Fallover | Breaker |
 /// |---|---|---|---|
-/// | transport, connect timeout, `5xx` | yes | yes | failure |
+/// | could not connect, connect timeout, `5xx` | yes | yes | failure |
 /// | rate limited / overloaded | yes, after `Retry-After` | yes | failure |
-/// | response or stream-idle timeout | no | only if `idempotent` or `fallback_on_timeout` | failure |
+/// | transport failure after connecting, response or stream-idle timeout | no | only if `idempotent` or `fallback_on_timeout` | failure |
 /// | unparseable response | no | yes | failure |
 /// | context length exceeded, unsupported feature | no | yes — another model may fit | ignored |
 /// | auth, validation (`4xx`), content filter, config | no | **no** | ignored |
 ///
 /// `idempotent` marks calls that are safe to repeat (embeddings): a timeout
-/// then behaves like any other transient failure.
+/// or a transport failure then behaves like any other transient failure.
+/// Otherwise both may follow a request the provider already processed (and
+/// billed), so the call is repeated nowhere unless the caller opted in.
 pub(crate) fn classify(
     err: &GenAiError,
     idempotent: bool,
@@ -75,20 +77,9 @@ pub(crate) fn classify(
     let class = err.error_class();
     match err {
         GenAiError::Timeout { phase } if *phase != TimeoutPhase::Connect => {
-            if idempotent {
-                Disposition {
-                    retry: RetryDecision::Retry,
-                    fallover: true,
-                    outcome: Outcome::Failure,
-                }
-            } else {
-                Disposition {
-                    retry: RetryDecision::Stop,
-                    fallover: fallback_on_timeout,
-                    outcome: Outcome::Failure,
-                }
-            }
+            maybe_sent(idempotent, fallback_on_timeout)
         }
+        GenAiError::Transport(_) => maybe_sent(idempotent, fallback_on_timeout),
         GenAiError::ResponseParse(_)
         | GenAiError::ContextLengthExceeded { .. }
         | GenAiError::Unsupported { .. } => Disposition {
@@ -101,6 +92,23 @@ pub(crate) fn classify(
             fallover: class.retry != RetryDecision::Stop,
             outcome: class.outcome,
         },
+    }
+}
+
+/// The disposition of a failure that may have followed a processed request.
+fn maybe_sent(idempotent: bool, fallback_on_timeout: bool) -> Disposition {
+    if idempotent {
+        Disposition {
+            retry: RetryDecision::Retry,
+            fallover: true,
+            outcome: Outcome::Failure,
+        }
+    } else {
+        Disposition {
+            retry: RetryDecision::Stop,
+            fallover: fallback_on_timeout,
+            outcome: Outcome::Failure,
+        }
     }
 }
 
@@ -145,14 +153,19 @@ mod tests {
 
     #[test]
     fn classifies_errors() {
-        let api = |status| GenAiError::Api {
-            status,
-            message: "x".into(),
-        };
+        let api = |status| GenAiError::api(status, "x");
         // Transient: retry, fall over, count.
-        let d = classify(&GenAiError::Transport("reset".into()), false, false);
+        let d = classify(&GenAiError::Connect("refused".into()), false, false);
         assert!(d.fallover && d.retry == RetryDecision::Retry && d.outcome == Outcome::Failure);
         assert!(classify(&api(503), false, false).fallover);
+
+        // A transport failure after connecting may follow a billed request:
+        // no retry, no fallover unless opted in, but it counts.
+        let reset = GenAiError::Transport("reset".into());
+        let d = classify(&reset, false, false);
+        assert!(!d.fallover && d.retry == RetryDecision::Stop && d.outcome == Outcome::Failure);
+        assert!(classify(&reset, false, true).fallover);
+        assert_eq!(classify(&reset, true, false).retry, RetryDecision::Retry);
 
         // Caller errors: stop, and never count against the model.
         for status in [400, 401, 403, 404, 422] {

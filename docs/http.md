@@ -2,7 +2,9 @@
 
 [← Docs index](README.md) · [← Project README](../README.md)
 
-**Feature:** `http` (pulls in `tokio` + the TLS stack `tokio-rustls`/`rustls`/`ring`/`webpki-roots`).
+**Feature:** `http` (pulls in `tokio` + the TLS stack `tokio-rustls`/`rustls`/`webpki-roots`;
+the `ring` crypto backend comes from the default `tls-ring` feature — see
+[TLS crypto backend](#tls-crypto-backend)).
 
 A **hand-rolled HTTP/1.1 stack** — client *and* server — built directly over `tokio`, with
 HTTPS via `tokio-rustls`. It is the dependency-minimal replacement for the
@@ -39,6 +41,8 @@ built on — you can also use them directly.
 | Proxies | [`Proxy`](#proxies) |
 | Client hooks | [`Interceptor`](#interceptors) |
 | Server | [`serve`](#server-serve) + [`HttpHandler`](#httphandler-trait) trait |
+| HTTP/2 (`http2` feature) | [`Http2Config`](#http2), `ServerConfig::http2`, `ClientBuilder::http2` / `http2_prior_knowledge`, [`Protocol`](#http2) |
+| Trailers and streamed bodies | [`body_channel`, `BodySender`, `BodyStream`](#trailers-and-streaming-bodies), `HttpResponse::trailer` / `body_stream`, `Client::send_body_stream`, `Response::trailers` |
 | Server tuning | [`ServerConfig`](#resource-limits-serverconfig--serve_with_config), [`ErrorHook`](#errors-and-panics-errorhook) |
 | TLS | [`TlsConfig`](#https-serve_tls--tlsconfig) / [`TlsConfigBuilder`](#mutual-tls-and-minimum-version), [`ReloadableTlsConfig`](#certificate-reload), [`ClientTlsConfig`](#client-tls-custom-roots-client-certificates), [`TlsVersion`](#mutual-tls-and-minimum-version) |
 | Outgoing response | [`HttpResponse`](#httpresponse) (`new`/`ok`/`text`/`header`/`body`, plus [`stream`](#streaming-response-bodies-stream--event_stream) / [`event_stream`](#streaming-response-bodies-stream--event_stream) / [`sse`](#structured-server-sent-events-sse--httpsse)) |
@@ -151,6 +155,8 @@ and share it across tasks.
 | `Client::new` | `fn new() -> Client` | The defaults in the table below; also `Default`. Never reads the environment. |
 | `Client::builder` | `fn builder() -> ClientBuilder` | Configure timeouts, limits, pool, TLS, proxy, redirects, decompression, interceptors. |
 | `Client::with_timeout` | `fn with_timeout(self, timeout: Option<Duration>) -> Client` | Sets the **response-head** timeout (same as `ClientBuilder::timeout`); `None` disables it. |
+| `Client::with_max_redirects` | `fn with_max_redirects(self, max: usize) -> Client` | Same as `ClientBuilder::max_redirects`; the pool and other settings are kept. |
+| `Client::with_decompress` | `fn with_decompress(self, enabled: bool) -> Client` | Same as `ClientBuilder::decompress`; the pool and other settings are kept. |
 | `Client::send` | `async fn send(&self, req: Request) -> Result<Response, HttpError>` | Sends the request, returns the final response with a **streaming** body. |
 | `Client::send_streaming` | `async fn send_streaming<B: AsyncRead + Send + Unpin>(&self, req: Request, body: B) -> Result<Response, HttpError>` | Uploads the body from an async reader; see [Streaming uploads](#streaming-uploads). |
 
@@ -207,6 +213,7 @@ let client = Client::builder()
 | `user_agent(impl Into<String>)` / `no_user_agent()` | `ferroly/<version>` | `User-Agent` sent when the request does not set one. |
 | `pool_max_idle_per_host(usize)` | 32 | Idle connections kept per target; `0` disables pooling. |
 | `pool_idle_timeout(Option<Duration>)` | 90 s | How long an idle connection is kept. |
+| `pool_max_active_per_host(Option<usize>)` | unlimited | HTTP/1.1 connections per target in use at once (opening, or carrying a request and its unfinished body). Extra requests queue in order; see below. |
 | `max_redirects(usize)` | 0 | Redirects to follow; see [Redirects](#redirects). |
 | `proxy(Proxy)` / `proxy_from_env()` | none | See [Proxies](#proxies). |
 | `tls(ClientTlsConfig)` | web PKI roots, TLS 1.2+ | See [Client TLS](#client-tls-custom-roots-client-certificates). |
@@ -227,6 +234,20 @@ send() ──► [ connect ]──►[ write request ]──►[ read head ]─�
 is closed when a host exceeds `pool_max_idle_per_host`, and every connection is checked when
 it is taken out: one the server has already closed — or that has unsolicited bytes waiting —
 is discarded before anything is written to it.
+
+**Active connections per host.** `pool_max_active_per_host(Some(n))` bounds how many HTTP/1.1
+connections to one target (host, port, scheme and proxy) are in use at once, so a burst of
+concurrent requests cannot open an unbounded number of sockets to one upstream. A request
+that finds all `n` slots taken waits, first come first served. A slot is freed when its
+response body has been read to the end (the connection returns to the pool and is reused by
+the next waiter, or is closed when it cannot be kept alive, such as after `Connection: close`
+or HTTP/1.0), at once for a response without a body (`HEAD`, `204`, `304`), or when the
+response is dropped. So **read or drop every response**: one left unread holds its slot. The
+wait counts against `timeout` (and `total_timeout`); when it runs out the request fails with
+`HttpError::Timeout` without having been sent. Idle pooled connections do not count against
+the cap. `pool_max_active_per_host` does not apply to HTTP/2, which multiplexes many requests
+on each connection; there, `Http2Config::max_connections_per_origin` (default 4) bounds the
+connections to one origin (see [HTTP/2](#http2)).
 
 ### Retry on a dead pooled connection
 
@@ -472,8 +493,8 @@ Every request a server handler receives knows where it came from:
 
 | Method | Signature | Description |
 |---|---|---|
-| `peer_addr` | `fn peer_addr(&self) -> Option<SocketAddr>` | The remote socket address. `Some` for every served request; `None` for a hand-built one. Behind a reverse proxy this is the proxy's address. |
-| `local_addr` | `fn local_addr(&self) -> Option<SocketAddr>` | The local address the connection was accepted on. |
+| `peer_addr` | `fn peer_addr(&self) -> Option<SocketAddr>` | The remote socket address. `Some` for every served request; `None` for a hand-built one. Behind a reverse proxy this is the proxy's address, unless the proxy sends a [PROXY protocol](#proxy-protocol-behind-a-layer-4-load-balancer) header the server trusts; then it is the client's. |
+| `local_addr` | `fn local_addr(&self) -> Option<SocketAddr>` | The local address the connection was accepted on (with a trusted PROXY header, the destination the client connected to). |
 | `is_tls` | `fn is_tls(&self) -> bool` | Whether the request arrived over TLS (`serve_tls*`). For a client-side request it reflects the URL scheme. |
 | `peer_certificates` | `fn peer_certificates(&self) -> &[Vec<u8>]` | The client's verified certificate chain (DER, leaf first) under [mutual TLS](#mutual-tls-and-minimum-version); empty otherwise. |
 | `set_peer_addr` / `set_tls` | `fn set_peer_addr(&mut self, addr: SocketAddr)`, `fn set_tls(&mut self, tls: bool)` | For unit-testing middleware with a hand-built request. |
@@ -579,8 +600,9 @@ println!("received {total} bytes");
 ```
 
 Piece sizes are an implementation detail: each `chunk()` returns at most 16 KiB, and a
-transfer chunk larger than that arrives as several pieces (the `chunked` framing and trailers
-are stripped for you).
+transfer chunk larger than that arrives as several pieces (the `chunked` framing is
+stripped for you; trailers are kept and available from `Response::trailers` once the body
+has been read — see [Trailers and streaming bodies](#trailers-and-streaming-bodies)).
 
 ### Range requests and resumable downloads
 
@@ -632,8 +654,8 @@ headers:
 
 - **a `HEAD` request, `204`, `304`, `1xx`, a successful `CONNECT`** — no body at all, whatever
   the headers say.
-- **`Transfer-Encoding: chunked`** — chunked decoding, trailers consumed and discarded. Any
-  other `Transfer-Encoding` is an error.
+- **`Transfer-Encoding: chunked`** — chunked decoding; the trailer section is kept and
+  reported by `Response::trailers`. Any other `Transfer-Encoding` is an error.
 - **`Content-Length: N`** — exactly `N` bytes. An invalid or conflicting `Content-Length` is
   an error.
 - **Neither** — read until the server closes the connection (HTTP/1.0-style EOF framing).
@@ -703,14 +725,15 @@ let config = ServerConfig {
 | `idle_timeout: Duration` | 30 s | How long a kept-alive connection may sit idle between requests. |
 | `write_timeout: Duration` | 30 s | Time for the client to accept each piece of the response (up to 64 KiB at a time). A client that stops reading is disconnected and its connection slot released. |
 | `handler_timeout: Option<Duration>` | `None` | Deadline for the handler to return a response. Expiry → the handler future is dropped and the client gets `503`. Does not limit how long a streaming body keeps producing chunks. |
-| `drain_timeout: Duration` | 30 s | On shutdown, how long to wait for in-flight requests. |
+| `drain_timeout: Duration` | 30 s | On shutdown, how long to wait for in-flight requests; connections still open after it are dropped (their handler tasks and streams stopped) and `serve` returns. |
 | `keep_alive: bool` | `true` | `false` answers every request with `Connection: close`. |
-| `max_keep_alive_requests: usize` | 1000 | Requests per connection before it is closed. |
+| `max_keep_alive_requests: usize` | 1000 | HTTP/1.1 requests per connection before it is closed (HTTP/2: `Http2Config::max_streams_per_connection`). |
 | `max_header_bytes: usize` | 64 KiB | Total size of the header section (and of a chunked body's trailer section). Larger → `431`. |
 | `max_headers: usize` | 128 | Number of header lines (and of trailer lines). More → `431`. |
 | `max_line_bytes: usize` | 16 KiB | Length of the request line and of any header or trailer line. Longer → `414` (request line) or `431` (header line). |
 | `normalize_paths: bool` | `false` | Normalise the request path before the handler sees it; see below. |
 | `on_error: Option<ErrorHook>` | `None` | Receives errors the server would otherwise discard; see [Errors and panics](#errors-and-panics-errorhook). |
+| `proxy_protocol: Option<ProxyProtocol>` | `None` | Read a PROXY protocol v1/v2 header from trusted load balancers; see [PROXY protocol](#proxy-protocol-behind-a-layer-4-load-balancer). |
 
 The guarantees these provide:
 
@@ -729,7 +752,10 @@ The guarantees these provide:
   rather than tearing down the whole listener.
 - **Graceful drain** — when `shutdown` resolves the server stops accepting, then waits up to
   `drain_timeout` for in-flight requests to finish before returning, so a rolling deploy does
-  not cut active responses.
+  not cut active responses. Whatever is still running when `drain_timeout` expires —
+  long-lived HTTP/2 or gRPC streams, server-sent events — is stopped and its connection
+  closed, so nothing outlives `serve`. A connection still sending its PROXY header or in its
+  TLS handshake when `shutdown` resolves has sent no request yet; it is closed at once.
 - **Strict parsing** — see [Security hardening](#security-hardening).
 
 **Path normalisation (`normalize_paths`).** With this on, the path of every request goes
@@ -738,6 +764,48 @@ unreserved characters are decoded, `.` and `..` segments removed, and a path wit
 segment (`//`), a malformed escape or an encoded control character is rejected with `400`.
 Routing, authorisation and handlers then all see one canonical path. It is off by default so
 existing handlers keep receiving the path exactly as sent; the query string is never touched.
+
+### PROXY protocol behind a layer-4 load balancer
+
+Behind a TCP (layer-4) load balancer — HAProxy in `mode tcp`, AWS NLB, Envoy, a GCP TCP
+proxy — the socket peer is the balancer, not the client. Such balancers can prefix each
+connection with a [PROXY protocol](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt)
+header naming the real client. Set `ServerConfig::proxy_protocol` to accept it:
+
+```rust
+use ferroly::http::{ProxyProtocol, ServerConfig};
+
+let config = ServerConfig {
+    // The networks the balancers connect from.
+    proxy_protocol: Some(ProxyProtocol::from_cidrs(["10.0.0.0/8", "fd00::/8"]).unwrap()),
+    ..ServerConfig::default()
+};
+# let _ = config;
+```
+
+| `ProxyProtocol` | Description |
+|---|---|
+| `new()` | Trusts no source yet. |
+| `from_cidrs(iter) -> Result<Self, HttpError>` | Trusts these CIDR blocks or single addresses (`10.0.0.0/8`, `127.0.0.1`, `::1`). `0.0.0.0/0` and `::/0` trust everyone — safe only when nothing but the balancer can reach the port. |
+| `trust(cidr) -> Result<Self, HttpError>` / `trust_ip(IpAddr)` | Adds one network or address. |
+| `is_trusted(IpAddr) -> bool` | Whether a source must send a header (IPv4-mapped IPv6 addresses count as IPv4). |
+
+How it behaves:
+
+- **Trusted sources must send a header.** A connection from a trusted address must begin
+  with a v1 (text) or v2 (binary) header, read before anything else, TLS handshake and h2c
+  preface included. Its source address becomes `Request::peer_addr` and its destination
+  `Request::local_addr`, for HTTP/1.1 and HTTP/2 alike. A missing, malformed or
+  over-long header, or one that does not arrive within `head_timeout`, closes the connection
+  and is reported to `on_error`.
+- **Health checks keep the socket addresses.** A v2 `LOCAL` command, a v1 `UNKNOWN` line and
+  v2 `AF_UNIX`/`AF_UNSPEC` addresses are accepted, and the request keeps the balancer's
+  socket addresses.
+- **Untrusted sources are served directly.** Their first bytes are never read as a PROXY
+  header, so a client that reaches the port directly cannot claim another address; a
+  `PROXY …` line from it is just a malformed request (`400`).
+- The header is read exactly, without consuming any byte of the protocol that follows. v2
+  TLVs are skipped. Only the addresses are used; the balancer's own address is not kept.
 
 ### Errors and panics: `ErrorHook`
 
@@ -1299,11 +1367,11 @@ This is deliberate and load-bearing for the crate's dependency policy:
   ferroly's own types (`TlsConfig`, `TlsConfigBuilder`, `ReloadableTlsConfig`,
   `ClientTlsConfig`, `TlsVersion`), replacing `rustls` touches only `transport.rs` — no public
   API changes, and no other module recompiles against a new crypto crate.
-- **The crypto provider is named explicitly.** Every TLS configuration is built with `ring`
-  named directly rather than relying on the process-default provider. If some other
-  dependency's feature unification drags a second provider (`aws-lc-rs`) into the build, the
-  ambiguous default would otherwise panic at runtime; naming `ring` keeps TLS setup
-  deterministic. The default client roots come from `webpki-roots`, built once per process.
+- **The crypto provider is resolved explicitly.** Every TLS configuration names its rustls
+  `CryptoProvider` — the one you installed, else `ring` — instead of leaving it to rustls'
+  implicit default, which panics when feature unification links two backends. See
+  [TLS crypto backend](#tls-crypto-backend). The default client roots come from
+  `webpki-roots`, built once per process.
 - **Verification cannot be disabled.** Trust can be extended or replaced
   ([Client TLS](#client-tls-custom-roots-client-certificates)), never switched off.
 
@@ -1314,6 +1382,88 @@ first when a proxy is configured); for `http`, return the bare TCP stream — ei
 each accepted `TcpStream` in a `tokio_rustls` acceptor built from your `TlsConfig`, producing a
 `Conn` the accept loop serves exactly like a plaintext one. The plain `serve` accept loop
 stays cleartext.
+
+---
+
+## TLS crypto backend
+
+Since `rustls` 0.23 the cryptography is a pluggable `CryptoProvider` (`ring`, `aws-lc-rs`, a
+FIPS build, an HSM-backed provider…). ferroly does **not** force one on you. Every place that
+needs a provider — client and server TLS configurations, the mutual-TLS client verifier, and
+RS256 / ES256 [JWK verification](auth.md#asymmetric-tokens-and-jwks) — goes
+through one resolver, in this order:
+
+1. the **process-default provider**, if your application installed one
+   (`CryptoProvider::install_default`);
+2. **`ring`**, if the `tls-ring` feature is enabled — it is part of `default` and `full`, so
+   existing builds behave exactly as before;
+3. otherwise a typed error (never a panic): `HttpError::Tls("no rustls CryptoProvider is
+   installed: …")` from `TlsConfig::from_pem` / `TlsConfigBuilder::build` /
+   `ClientBuilder::build` with custom TLS / an `https` request, and
+   `JwtError::NoCryptoProvider` from JWK verification.
+
+The `ring` fallback is used explicitly; ferroly never installs it as the process default, so
+the choice stays yours. Plain-text HTTP needs no provider at all: `Client::builder().build()`
+succeeds without one and only an `https` request reports the missing provider.
+
+| Feature | Effect |
+|---|---|
+| `tls-ring` (default, in `full`) | Turns on `rustls/ring` and `tokio-rustls/ring` (only when `http` is enabled — it does not enable `http` by itself). |
+| `tls-ring` off | No crypto backend is compiled in by ferroly; `cargo tree -e normal` shows no `ring`. |
+
+**Bring your own provider**: turn off default features, depend on `rustls` with your
+backend, and install it once at start-up:
+
+```toml
+[dependencies]
+ferroly = { version = "*", default-features = false, features = ["codec", "errutils", "http"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+```
+
+```rust,ignore
+fn main() {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("a crypto provider was already installed");
+    // ... build clients and servers as usual ...
+}
+```
+
+**For FIPS**, `aws_lc_rs::default_provider()` is *not* enough: it is the ordinary
+`aws-lc-rs` build. Enable rustls' `fips` feature (which builds `aws-lc-fips-sys`, needing
+its own C/CMake/Go toolchain), install `rustls::crypto::default_fips_provider()`, and
+confirm it — `CryptoProvider::fips()` is `true` only for a provider whose every algorithm is
+FIPS-approved:
+
+```toml
+rustls = { version = "0.23", default-features = false, features = ["fips", "std", "tls12"] }
+```
+
+```rust,ignore
+fn main() {
+    let provider = rustls::crypto::default_fips_provider();
+    assert!(provider.fips(), "not a FIPS provider");
+    provider.install_default().expect("a crypto provider was already installed");
+    // ...
+}
+```
+
+Only what goes through the provider is then FIPS-backed: TLS and RS256 / ES256 JWK
+verification. **HS256/384/512 JWTs and everything in [`hash`](hash.md) and
+[`sig`](sig.md) (SHA-2, HMAC, HKDF, PBKDF2, Ed25519, and so SigV4 and OAuth signing) stay
+ferroly's own, unvalidated code** — see [auth](auth.md#limitations) and the crate README's
+security posture.
+
+**When to install.** Install the provider before building any TLS configuration yourself:
+a `ClientTlsConfig` / `TlsConfig` you built, and a running server, keep the provider they
+were built with. What ferroly resolves on demand follows a later install: the default
+client configuration of an `https` request (rebuilt when the resolved provider changes) and
+the JWK verifiers (looked up on every verification), so a provider installed lazily is not
+silently bypassed by `ring` there.
+
+With `tls-ring` left on, an installed provider still wins; `ring` is then only linked, not
+used. Make sure the final binary does not need `ring` for anything else before relying on
+that to keep it out — the way to keep it out of the build is `default-features = false`.
 
 ---
 
@@ -1407,9 +1557,9 @@ All are fields of [`ServerConfig`](#resource-limits-serverconfig--serve_with_con
 | Idle time between requests (`idle_timeout`) | 30 s | close |
 | Each response write of up to 64 KiB (`write_timeout`) | 30 s | close |
 | Handler run time (`handler_timeout`) | none | `503` |
-| Requests per connection (`max_keep_alive_requests`) | 1000 | `Connection: close` |
+| Requests per connection (`max_keep_alive_requests`, HTTP/1.1) | 1000 | `Connection: close` |
 | Concurrent connections (`max_connections`) | 1024 | further connections wait |
-| Shutdown drain (`drain_timeout`) | 30 s | return |
+| Shutdown drain (`drain_timeout`) | 30 s | stop the remaining connections, return |
 
 Other protections: a handler panic is contained (`500`); a handler cannot desynchronise a
 response by setting its own `Content-Length` or `Transfer-Encoding`; when the server closes
@@ -1433,6 +1583,7 @@ response is not lost to a TCP reset.
 | Idle time between body reads (`read_timeout`) | 300 s | `Timeout` |
 | Whole exchange (`total_timeout`) | none | `Timeout` |
 | Idle pooled connection lifetime (`pool_idle_timeout`) / per host (`pool_max_idle_per_host`) | 90 s / 32 | connection closed |
+| Connections in use per host (`pool_max_active_per_host`) | unlimited | request waits for a slot, within `timeout` |
 
 A response carrying both `Transfer-Encoding: chunked` and `Content-Length` is read as chunked
 and its connection is not reused.
@@ -1498,7 +1649,13 @@ pub enum HttpError {
 - `Protocol` means a malformed message — or one the client will not send.
 - `Timeout` and `ConnectTimeout` are distinct so a caller can tell "nothing was sent"
   (`ConnectTimeout`: safe to retry any method) from "the request may have been processed".
-  `HttpError::is_timeout()` is `true` for both.
+  `HttpError::is_timeout()` is `true` for both, and for an HTTP/2 connection timer
+  (`Http2Cause::Timeout`, see [HTTP/2 errors](#errors)), so a caller treats HTTP/1.1 and
+  HTTP/2 timeouts alike.
+- `HttpError::is_connect_failure()` is `true` for `ConnectTimeout` and for an `Io` error raised
+  while resolving the host or opening the TCP connection (its kind and message are unchanged).
+  It is `false` for an `Io` error of the same kind raised after the connection was open, so a
+  caller can retry exactly the failures where no request byte was sent.
 - The enum is `#[non_exhaustive]`: always keep a wildcard arm.
 
 The type derives `ferroly_derive::FerrolyError` (see [`ferroly::derive`](derive.md)), giving it
@@ -1524,22 +1681,348 @@ match client.send(req).await {
 
 ---
 
+## HTTP/2
+
+**Feature:** `http2` (implies `http`; part of `full`). Adds no dependency — the frame
+codec, HPACK, flow control and the stream state machine are hand-rolled in
+`src/http/h2/`, and the only public HTTP/2 type is [`Http2Config`](#limits-and-defences).
+
+HTTP/2 is **opt-in at runtime** on both sides. With it off — or when it is not negotiated —
+everything above (HTTP/1.1 framing, limits, keep-alive, the pool) is exactly as before.
+
+### Negotiation
+
+| | Server | Client |
+|---|---|---|
+| TLS | `ServerConfig { http2: Some(..) }` advertises `h2` and `http/1.1` with ALPN; a client that selects `h2` gets HTTP/2, anything else HTTP/1.1 | `ClientBuilder::http2(true)` offers `h2` then `http/1.1`; if the server selects `http/1.1` (or no ALPN), the request goes over HTTP/1.1 on that same connection, and the origin is remembered as HTTP/1.1-only for 10 minutes |
+| Cleartext | with `http2` set, a connection that opens with the connection preface (`PRI * HTTP/2.0…`) is h2c ("prior knowledge", RFC 9113 §3.3); every other connection is HTTP/1.1 | `ClientBuilder::http2_prior_knowledge(true)` speaks h2c to `http://` URLs without negotiation — use it only for servers known to support it |
+
+The h2c **`Upgrade: h2c`** mechanism from HTTP/1.1 is **not implemented**: RFC 9113
+deprecates it. Requests through a forward (non-tunnelling) proxy always use HTTP/1.1; an
+`https` request through a `CONNECT` tunnel can negotiate `h2`.
+
+```rust
+use ferroly::http::{Client, Http2Config, ServerConfig};
+
+# fn ex() -> Result<(), ferroly::http::HttpError> {
+// Server: HTTP/2 over TLS (ALPN) and h2c, HTTP/1.1 for everyone else.
+let config = ServerConfig {
+    http2: Some(Http2Config::default()),
+    ..ServerConfig::default()
+};
+// Pass `config` to serve_with_config / serve_tls_with_config — or to
+// turbo's Router::serve_with_config / rest's server_config — unchanged.
+
+// Client: offer h2 to https origins; requests to an origin are multiplexed
+// over up to `max_connections_per_origin` connections (default 4).
+let client = Client::builder().http2(true).build()?;
+// Or cleartext h2c with prior knowledge:
+let h2c = Client::builder().http2_prior_knowledge(true).build()?;
+# let _ = (config, client, h2c);
+# Ok(())
+# }
+```
+
+### Same handlers, same router
+
+HTTP/2 requests are dispatched to the **same [`HttpHandler`](#httphandler-trait)** as
+HTTP/1.1, so [`turbo`](turbo.md) and [`rest`](rest.md) work over HTTP/2 unchanged. Each
+stream runs its handler on its own task, with the same panic isolation (a panic is a `500`
+on that stream, reported as `HttpError::HandlerPanic`), the same `handler_timeout` (`503`),
+the same `max_body_bytes` (`413`), `normalize_paths` and [`ErrorHook`](#errors-and-panics-errorhook).
+
+A handler sees an HTTP/1.1-shaped request: `uri.host` comes from `:authority` (a `host`
+header is added when the client sent none), split `cookie` fields are joined with `; `, and
+[`Request::protocol`] reports `Protocol::Http2` (`Http10`/`Http11` otherwise). The response
+is written as HEADERS + DATA: the server lower-cases header names, drops connection-specific
+headers (`connection`, `keep-alive`, `transfer-encoding`, `upgrade`, `proxy-connection`),
+adds `date`, and sets `content-length` for a fixed body without trailers. `CONNECT` over
+HTTP/2 is answered with `501`.
+
+On the client, [`Response::protocol`] says which protocol answered.
+
+### Trailers and streaming bodies
+
+These work over both protocols; over HTTP/2 they are what gRPC is built on.
+
+| Direction | API |
+|---|---|
+| Server → trailers | `HttpResponse::trailer(name, value)` / `with_trailers(HeaderMap)` / `trailers()` — a trailing HEADERS frame on HTTP/2; chunked with a trailer section on HTTP/1.1 |
+| Server → streamed body | `HttpResponse::body_stream(status, BodyStream)` — chunks as they come, then the sender's trailers (merged after any set with `trailer`) |
+| Server ← streamed body | `HttpHandler::wants_body_stream(&req) -> bool` (default `false`), then `Request::take_body_stream()` — chunks as they arrive, then the request's trailers |
+| Client → streamed body | `Client::send_body_stream(req, BodyStream)` — returns at the response head; on HTTP/2 the upload continues in the background, concurrently with reading the response |
+| Client ← trailers | `Response::trailers()` once `chunk()` returned `None`, or `Response::bytes_with_trailers()` |
+| Glue | `body_channel(capacity) -> (BodySender, BodyStream)`; `BodySender::send` / `finish` / `send_trailers`; `BodyStream::chunk` / `trailers` / `take_trailers` / `collect`; `BodyStream::from_bytes` / `empty` |
+
+A body **ends cleanly only when the sender says so** (`finish` or `send_trailers`).
+Dropping a `BodySender` without either aborts the body: over HTTP/2 the stream is reset
+(`RST_STREAM`), over HTTP/1.1 the connection closes before the final chunk, and the reader
+gets an error — a crashed producer never looks like a complete message.
+
+Bidirectional streaming on one stream — a handler that echoes each request chunk as it
+arrives:
+
+```rust
+use ferroly::http::{body_channel, BoxFuture, HttpHandler, HttpResponse, Request, StatusCode};
+
+struct Echo;
+
+impl HttpHandler for Echo {
+    fn wants_body_stream(&self, _req: &Request) -> bool {
+        true
+    }
+
+    fn handle(&self, mut req: Request) -> BoxFuture<'_, HttpResponse> {
+        Box::pin(async move {
+            let mut input = req.take_body_stream().expect("asked for a stream");
+            let (mut out, body) = body_channel(8);
+            tokio::spawn(async move {
+                while let Ok(Some(chunk)) = input.chunk().await {
+                    if out.send(chunk).await.is_err() {
+                        return; // the client went away
+                    }
+                }
+                let mut trailers = ferroly::http::HeaderMap::new();
+                trailers.set("x-status", "0");
+                let _ = out.send_trailers(trailers).await;
+            });
+            HttpResponse::body_stream(StatusCode::OK, body)
+        })
+    }
+}
+```
+
+And the client side of the same call:
+
+```rust
+use ferroly::http::{body_channel, Client, Method, Request};
+
+# async fn ex() -> Result<(), ferroly::http::HttpError> {
+let client = Client::builder().http2_prior_knowledge(true).build()?;
+let (mut tx, rx) = body_channel(8);
+let req = Request::builder(Method::Post, "http://127.0.0.1:8080/echo")?.build();
+tx.send(b"ping".to_vec()).await?;
+let mut resp = client.send_body_stream(req, rx).await?;
+assert_eq!(resp.chunk().await?.as_deref(), Some(&b"ping"[..]));
+tx.finish().await?;
+while resp.chunk().await?.is_some() {}
+let status = resp.trailers().and_then(|t| t.get("x-status"));
+# let _ = status;
+# Ok(())
+# }
+```
+
+Over HTTP/2, streaming request bodies are not buffered, so `max_body_bytes` and
+`body_timeout` do not apply to them — the handler decides how much to read and for how
+long. Dropping the request `BodyStream` early discards the rest of the body without
+affecting the response.
+
+Over HTTP/1.1 a handler that asks for a stream also runs as soon as the head arrives, and
+the `Content-Length` or chunked body is read piece by piece as the client sends it (one
+piece per chunk, at most 16 KiB each, with at most four pieces queued for the handler
+before the server stops reading). The response can be written while the body is still
+arriving, so the echo above works over HTTP/1.1 too. The buffered-body caps still apply:
+
+- a `Content-Length` over `max_body_bytes` is refused with `413` before the handler runs; a
+  chunked body that grows past it fails the stream with `HttpError::BodyTooLarge`;
+- `body_timeout` bounds the total time spent waiting for the client's bytes (time the
+  handler takes to read a piece does not count); expiry fails the stream with
+  `HttpError::Timeout`;
+- a malformed or cut-off body fails the stream with `HttpError::Protocol`;
+- the chunked trailer section ends the stream (`BodyStream::trailers`).
+
+A body that failed, or that the handler dropped before its end, leaves unread bytes on the
+connection, so the server closes it after the response (`Connection: close` when it is
+already known). A fully read body leaves the connection reusable. If the response is
+complete but something still holds the body stream unread, the server waits at most
+`body_timeout` more before closing. `turbo` routes still receive buffered bodies. A client
+`send_body_stream` over HTTP/1.1 uploads first, then reads the response.
+
+### Limits and defences
+
+`Http2Config` (`#[non_exhaustive]`: start from `Http2Config::default()` and assign fields):
+
+| Field | Default | Effect |
+|---|---|---|
+| `max_concurrent_streams` | 100 | `SETTINGS_MAX_CONCURRENT_STREAMS`; extra streams get `REFUSED_STREAM`. A stream the peer resets keeps its slot until its handler task has actually stopped |
+| `initial_stream_window_size` | 1 MiB | per-stream receive window (`65 535 ..= 2³¹-1`) |
+| `initial_connection_window_size` | 4 MiB | connection receive window (`65 535 ..= 2³¹-1`) |
+| `max_frame_size` | 16 384 | largest frame accepted; bigger is `FRAME_SIZE_ERROR` |
+| `max_header_list_size` | 64 KiB | decoded header list cap (name + value + 32 per field); a larger request gets `431`. The server also applies `ServerConfig::max_header_bytes` (and `max_headers` for the field count) when smaller |
+| `header_table_size` | 4096 | the HPACK dynamic table the peer may use towards us (`4096 ..= 1 MiB`) |
+| `max_resets_per_window` | 200 | abusive stream resets per `flood_window`; beyond it `GOAWAY(ENHANCE_YOUR_CALM)` — the **rapid-reset** (CVE-2023-44487) and **MadeYouReset** (CVE-2025-8671) defence. What counts: on a server, a client RST_STREAM within `rapid_reset_threshold` of the stream's opening (before its response is complete); on both sides, every stream this side resets because the peer broke a rule on it (flow control, a malformed or truncated message). A stream refused for exceeding `max_concurrent_streams` is not counted here: not at all before the client has acknowledged this side's SETTINGS (it may not know the limit yet), as a control frame afterwards. Ordinary cancellations — a gRPC deadline, a client giving up on a slow or long-lived stream — never count, nor do resets of completed streams, nor (on a client) any reset the server sends, `NO_ERROR` after an early response included |
+| `rapid_reset_threshold` | 100 ms | how young a stream must be for the client's reset of it to count toward `max_resets_per_window`. `Duration::ZERO` counts no client reset there. Older streams are covered by `max_cancels_per_window` |
+| `max_cancels_per_window` | 1000 | server: client resets of streams whose response is not yet complete, **whatever their age**, per `flood_window` — or twice the streams completed normally in the window, when that is more; beyond it `GOAWAY(ENHANCE_YOUR_CALM)`. Without it, a client that holds each stream just past `rapid_reset_threshold` could start `max_concurrent_streams / rapid_reset_threshold` handlers per second, and keep that much work a reset does not stop (a spawned task, a blocking job, a downstream query) running. The default allows about `max_concurrent_streams` cancellations per second with nothing completing, far more than deadline expiries and abandoned requests produce |
+| `max_control_frames_per_window` | 1000 | SETTINGS, PING, PRIORITY, empty DATA, unknown frames, HEADERS for closed streams, streams refused over `max_concurrent_streams`, and RST_STREAM or WINDOW_UPDATE for streams closed so long ago that they are forgotten, per `flood_window`; beyond it `GOAWAY(ENHANCE_YOUR_CALM)`. Not counted: late DATA on a cancelled stream (bounded by flow control), connection-level WINDOW_UPDATEs (a fast download sends many), and RST_STREAM or WINDOW_UPDATE for one of the last 256 closed streams — routine, since a client such as Go's returns stream window for response bytes as it reads them, after the response has ended |
+| `flood_window` | 10 s | the window the flood budgets are counted over |
+| `max_buffered_body_bytes` | 16 MiB | server: the budget for request bodies one connection holds for buffered handlers (at least `max_body_bytes`). Bodies are admitted in arrival order by their `content-length` (or `max_body_bytes` without one); an admitted body gets flow-control credit and always finishes, one that does not fit waits with only its initial stream window until earlier ones are done. Beyond the budget the connection withholds connection-level credit, so one connection holds at most `max(this, max_body_bytes) + initial_connection_window_size` of bodies still arriving (about 20 MiB by default, not `max_concurrent_streams × max_body_bytes`). Only a client that fills that window with waiting bodies gets the youngest refused (`REFUSED_STREAM`, retryable), so the admitted ones can finish; waiting is bounded by `body_timeout` |
+| `max_streams_per_connection` | `None` | server: after this many streams, finish the connection with a graceful, two-phase GOAWAY (RFC 9113 §6.8: GOAWAY with the largest stream id and a PING, then the final GOAWAY once the PING is answered or after a second — streams the client opened in between are served). `None` never does |
+| `stream_stall_timeout` | 30 s | server: reset a stream (`RST_STREAM(CANCEL)`) whose response has been blocked by the client's flow control this long — a client that stopped reading. Blocked time adds up across short bursts of progress and is forgotten only after 16 KiB more has been sent, so granting a byte of window now and then does not hold a stream for ever. `None` disables it; consider that for long-lived streams to slow consumers (gRPC streaming, server-sent events) |
+| `keepalive_interval` | `None` | send a PING when the peer has shown no sign of life for this long while streams are open (a sign of life is any frame, or output draining from a full socket — a slow but live reader of a large response is not taken for a dead peer); no answer within `keepalive_timeout` closes the connection (`Http2Cause::Timeout`), which detects a dead peer that would otherwise hang a stream without a deadline. grpc-go servers by default close connections that ping more often than every 5 minutes |
+| `keepalive_timeout` | 20 s | how long a keep-alive PING, and this side's SETTINGS, may stay unacknowledged (SETTINGS: then `GOAWAY(SETTINGS_TIMEOUT)`) |
+| `max_connections_per_origin` | 4 | client: when every connection to an origin has as many open streams as its server allows, dial another, up to this many; beyond that, requests wait for a free slot (bounded by `timeout`) |
+
+Always on, not configurable:
+
+- **CONTINUATION flood** (CVE-2024-27316): a header block (HEADERS + CONTINUATION) is capped
+  at twice `max_header_list_size` and 64 CONTINUATION frames, and must complete within
+  `head_timeout`; beyond that, `GOAWAY(ENHANCE_YOUR_CALM)`. No other frame may interleave.
+- **HPACK bombs**: a block that decodes past the list cap is still decoded (to keep the
+  dynamic table in sync) but its fields are dropped and the request answered `431`; strings
+  longer than the cap are skipped, never copied; integers are bounded.
+- **Flow control**: a peer that sends past a stream window gets `RST_STREAM(FLOW_CONTROL_ERROR)`,
+  past the connection window `GOAWAY(FLOW_CONTROL_ERROR)`. Body bytes are credited back only
+  as they are consumed, so a slow handler or client exerts backpressure on the sender.
+  `SETTINGS_INITIAL_WINDOW_SIZE` changes adjust every open stream.
+- **Output backpressure**: when the connection's output buffer holds 64 KiB it stops
+  scheduling DATA, and at 256 KiB it also stops reading frames, so a peer that does not read
+  cannot make the server queue PING/SETTINGS acknowledgements or data without bound, while a
+  peer that reads a large response slowly still has its PINGs, resets and window updates
+  processed. The write timeout runs from when output became pending, not from the last
+  write, so a handler slower than `write_timeout` does not get the connection closed.
+- **Streamed bodies**: DATA that arrives while a body stream still has an unread chunk is
+  added to the next chunk, so a flood of tiny DATA frames costs its bytes, not a queued event
+  per frame.
+- Malformed requests (upper-case or connection-specific header names, a `te` other than
+  `trailers`, bad or duplicate pseudo-headers, a `content-length` the DATA does not match,
+  control characters other than HTAB in values, leading or trailing whitespace in values, an
+  `:authority` with userinfo or that is not a valid `host[:port]`, an invalid `:scheme`) are
+  reset with `PROTOCOL_ERROR` — the same requests HTTP/1.1 refuses; protocol violations on
+  the connection (bad preface, a first frame that is not SETTINGS, DATA on an idle stream,
+  an even stream id from a client, a lower stream id than one already used, `PUSH_PROMISE`,
+  invalid HPACK, invalid SETTINGS) end it with `GOAWAY` and the RFC 9113 error code.
+- **Closed streams** (RFC 9113 §5.1): frames still in flight for a stream this side reset
+  are ignored; DATA or HEADERS after the peer's own RST_STREAM get `RST_STREAM(STREAM_CLOSED)`;
+  after both sides ended a stream, `GOAWAY(STREAM_CLOSED)`. The last 256 closed streams are
+  remembered for this.
+- Header and trailer values this side sends are trimmed of surrounding whitespace, which
+  HTTP/2 forbids and HTTP/1.1 ignores, so a handler that works over one works over the other.
+
+`ServerConfig` applies to HTTP/2 as follows: `head_timeout` bounds the preface + first
+SETTINGS and each header block; `body_timeout` a buffered request body (`408`);
+`write_timeout` a stalled socket (the connection is closed); `max_body_bytes` buffered
+request bodies only (a handler that streams its body reads any size; a buffered handler gets
+`413` up front for a larger `content-length`); `idle_timeout` closes a connection with no
+open stream (`GOAWAY(NO_ERROR)`). `max_keep_alive_requests` and `keep_alive` do not apply:
+an HTTP/2 connection carries any number of streams unless `max_streams_per_connection` is
+set. On shutdown the server sends the two-phase `GOAWAY(NO_ERROR)`, finishes the streams in
+flight within `drain_timeout`, then closes; streams still open after `drain_timeout` are
+stopped.
+
+On the client, `ClientBuilder::http2_config` sets the same limits; `pool_idle_timeout` closes
+an idle HTTP/2 connection, `read_timeout` bounds each body read and each upload step, and
+`timeout` the response head — including the wait for a stream slot when the server's
+`SETTINGS_MAX_CONCURRENT_STREAMS` is reached. A request refused before it was processed
+(`REFUSED_STREAM`, or above a `GOAWAY`'s last stream) is retried once when its body can be
+replayed; an idempotent request whose reused connection died before the response head (a TCP
+reset, an EOF, an unanswered keep-alive) is retried once the same way. The retry goes to
+another connection with a free stream slot whose server has announced its stream limit,
+never back to the one that failed while such a connection is there; else to a new connection
+while the origin has fewer than `max_connections_per_origin`; only at that limit to the least
+loaded connection (preferring one whose server has announced its limit, which queues the
+retry for a free slot rather than sending it to be refused). That may be the refusing
+connection itself — with `max_connections_per_origin = 1` it always is. A request body
+streamed from a `BodyStream` (`send_body_stream`) stops, and its stream is dropped so the
+producer sees the request gone, as soon as the stream is refused or reset or the response is
+dropped before its end, even while the body is idle; after a clean response it carries on to
+its end, as a server that answered early may still read it.
+
+The client opens a further connection to an origin when every existing one is saturated, and
+never more than `max_connections_per_origin` (default 4); beyond that, requests queue on the
+least loaded connection. A connection whose server has not yet announced
+`SETTINGS_MAX_CONCURRENT_STREAMS` counts as saturated at 100 streams, so a burst from a cold
+client spreads over connections instead of being refused. `pool_max_active_per_host` does
+not apply to HTTP/2. The client forgets after 10 minutes that an origin answered ALPN with
+HTTP/1.1.
+
+### Errors
+
+Every stream or connection failure from the HTTP/2 engine is `HttpError::Http2`, whose
+`Http2Error` carries a structured `Http2Cause` (also via `HttpError::http2_cause()`), so
+callers can map failures without matching message text:
+
+| `Http2Cause` | Meaning |
+|---|---|
+| `Reset(code)` | the peer reset the stream with `RST_STREAM(code)` (`Http2ErrorCode::CANCEL`, …) |
+| `Refused` | the peer refused the stream before processing it (already retried once when the body could be replayed); safe to retry |
+| `GoAway { code, last_stream_id }` | the peer sent GOAWAY and the connection closed before the stream completed |
+| `ConnectionClosed` | the connection closed before the stream completed, without GOAWAY |
+| `Io(kind)` | the connection failed with an I/O error (a TCP reset, …) |
+| `Timeout` | a connection-level timer: write stall, unanswered keep-alive PING or SETTINGS, a server's head timeout, or a stream's stall timeout |
+| `LocalLimit` | this side found the peer over one of its flood budgets and closed the connection with `GOAWAY(ENHANCE_YOUR_CALM)` |
+| `Protocol(code)` | this side found the peer breaking an HTTP/2 rule and reset the stream or closed the connection with `code` |
+| `LocalReset(code)` | this side reset the stream for its own reasons: its reader went away (`CANCEL`), a server handler stopped before completing its response (`INTERNAL_ERROR`), the response was complete before the request body (`NO_ERROR`), or a buffered body was refused to stay within the body budget (`REFUSED_STREAM`) |
+
+`HttpError::Timeout` remains the client's own deadline (`timeout`, `read_timeout`).
+`HttpError::is_timeout()` is `true` for it and for `Http2Cause::Timeout` alike.
+
+```
+use ferroly::http::{Http2Cause, HttpError};
+
+fn worth_retrying(e: &HttpError) -> bool {
+    matches!(
+        e.http2_cause(),
+        Some(Http2Cause::Refused | Http2Cause::ConnectionClosed | Http2Cause::Io(_))
+    )
+}
+# let _ = worth_retrying;
+```
+
+### Interoperability
+
+Tested against `curl` (libcurl + nghttp2: `--http2-prior-knowledge`, `--http2` over TLS,
+`--parallel` multiplexing) in `tests/http2_curl.rs`, which skips itself when `curl` is missing
+or lacks HTTP/2, and manually against Go's `net/http` HTTP/2 server and client (h2c and TLS,
+trailers, multi-MiB bodies, concurrent streams, bidirectional streaming). The server passes
+all 146 cases of [h2spec](https://github.com/summerwind/h2spec) 2.6.0 (h2c); the
+connection state machine is fuzzed by the `h2_conn` target under `fuzz/`.
+
+The `Interop` CI workflow runs the [h2spec](https://github.com/summerwind/h2spec)
+conformance suite (v2.6.0) against `crates/ferroly/examples/h2spec_server.rs` over h2c and
+uploads its report; run it locally with `interop/h2spec.sh` (needs an `h2spec` binary).
+`interop/go-http.sh` drives the same server with Go's `net/http` client (h2c): thousands of
+sequential and concurrent requests with 64 KiB answers must stay on one connection, and
+concurrent uploads beyond the body budget must all finish.
+
+### HTTP/2 limitations
+
+- No server push (the client disables it; a `PUSH_PROMISE` is a protocol error), no
+  stream priorities (parsed and validated, otherwise ignored, as RFC 9113 allows), no
+  `CONNECT` or extended `CONNECT` (RFC 8441), and no h2c `Upgrade`.
+- The HPACK encoder never inserts into the dynamic table (static-table indexing, literals
+  and Huffman coding only) — valid HPACK, slightly larger headers on the wire.
+- Request trailers reach a handler only through a streamed body (`take_body_stream`), over
+  HTTP/2 and (chunked) HTTP/1.1 alike; a buffered request drops them.
+- Flow-control windows are fixed (`initial_stream_window_size`,
+  `initial_connection_window_size`), with no bandwidth-delay adaptation. On the client, a few
+  large response bodies that are not being read can use up a connection's window and stall
+  the other responses on that connection; read or drop bodies promptly, or raise the
+  connection window.
+- No HTTP/2 metrics (open streams, resets, window stalls, GOAWAY reasons) beyond the errors
+  the server reports to `on_error`.
+
+---
+
 ## Limitations
 
-- **HTTP/1.1 only.** No HTTP/2 or HTTP/3, and no ALPN negotiation.
-- **Keep-alive, but no client pipelining.** A client connection carries one request/response
-  at a time.
-- **Request bodies are buffered on the server.** A handler receives the whole body as a
-  `Vec<u8>` (bounded by `max_body_bytes`); there is no streaming request-body API yet.
-  Response bodies can be streamed in both directions, and the client can stream an upload.
+- **HTTP/1.1 by default; HTTP/2 with the `http2` feature** (see [HTTP/2](#http2) and its
+  own limitations). No HTTP/3.
+- **Keep-alive, but no HTTP/1.1 client pipelining.** An HTTP/1.1 connection carries one
+  request/response at a time; HTTP/2 multiplexes.
+- **Request bodies are buffered on the server unless the handler asks for a stream.** By
+  default a handler receives the whole body as a `Vec<u8>` (bounded by `max_body_bytes`); a
+  handler that returns `true` from `wants_body_stream` reads it incrementally with
+  `Request::take_body_stream`, over HTTP/1.1 and HTTP/2 alike. `turbo` always buffers.
 - **No cookie jar, and no automatic retry beyond the dead-connection case.** Those belong to
   the higher layers — see [`ferroly::rest`](rest.md) / [`ferroly::clients`](clients.md).
 - **Decompression covers `gzip` and `deflate` only** (opt-in), and only for responses; the
   server does not compress.
 - **One certificate per listener.** No SNI-based certificate selection; use
   [certificate reload](#certificate-reload) to rotate.
-- **No PROXY-protocol or forwarded-header handling**, no static-file or `Range` responses on
-  the server — build those on `HttpHandler` or use [`ferroly::turbo`](turbo.md).
+- **No forwarded-header (`Forwarded` / `X-Forwarded-For`) handling**, no static-file or
+  `Range` responses on the server — build those on `HttpHandler` or use
+  [`ferroly::turbo`](turbo.md). The [PROXY protocol](#proxy-protocol-behind-a-layer-4-load-balancer)
+  is supported.
 - **`NO_PROXY` has no CIDR matching.**
 - **Bodies buffered where noted.** `bytes`/`text` buffer the whole body (up to the cap); use
   `chunk` for large or open-ended responses.

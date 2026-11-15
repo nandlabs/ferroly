@@ -35,7 +35,7 @@ Key design choices in the Rust port:
 
 ```toml
 [dependencies]
-ferroly = { version = "0.5", features = ["lifecycle"] }
+ferroly = { version = "0.6", features = ["lifecycle"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -222,6 +222,7 @@ let opts = ComponentOptions::new()
 | `start_timeout: Option<Duration>` | Bounds each `start` attempt of this component. Overrides `ManagerOptions::start_timeout`. |
 | `stop_timeout: Option<Duration>` | Bounds each `stop` of this component. Overrides both `ManagerOptions::stop_timeout` and the bound passed to `stop_all_with_timeout`. |
 | `restart: Option<RestartPolicy>` | Automatic restarts; `None` (default) disables supervision. |
+| `liveness: Option<LivenessWatch>` | Polls `Component::health` while running and reports a failure when it keeps answering `Down` (`watch_liveness`); `None` (default) polls nothing. See [liveness-driven restarts](#liveness-driven-restarts). |
 
 **Timeout precedence.** For a start: the component's own `start_timeout`, else the
 manager's. For a stop: the component's own `stop_timeout`, else the bound of the
@@ -229,15 +230,19 @@ sweep (`stop_all_with_timeout(d)`), else the manager's. A component that exceeds
 bound is cancelled, marked `Error`, and reported as `LifecycleError::Timeout(id)`.
 
 ```rust
+#[non_exhaustive]
 pub struct RestartPolicy {
-    pub max_restarts: u32,          // give up after this many automatic restarts
-    pub initial_backoff: Duration,  // delay before the first restart
-    pub max_backoff: Duration,      // cap on the doubling delay
+    pub max_restarts: u32,               // give up after this many automatic restarts
+    pub initial_backoff: Duration,       // delay before the first restart
+    pub max_backoff: Duration,           // cap on the doubling delay
+    pub reset_after: Option<Duration>,   // uptime after which the budget is restored
 }
 ```
 
-`RestartPolicy::new(max_restarts)` uses a 100 ms initial backoff doubling up to 30 s;
-`.with_backoff(initial, max)` changes both. `delay(n)` is
+`RestartPolicy::new(max_restarts)` uses a 100 ms initial backoff doubling up to 30 s and no
+`reset_after`; `.with_backoff(initial, max)` changes both backoffs, and
+`.reset_after(uptime)` restores the full budget when the component fails after running at
+least `uptime` since its last (re)start. `delay(n)` is
 `initial_backoff * 2^(n-1)` capped at `max_backoff`. See
 [Supervision](#supervision-automatic-restarts).
 
@@ -455,7 +460,7 @@ any other sink) inside your observer.
 
 ## Supervision (automatic restarts)
 
-A component registered with a `RestartPolicy` is restarted automatically in two
+A component registered with a `RestartPolicy` is restarted automatically in three
 situations:
 
 1. **Its start fails** (error, panic or per-component timeout). The start is retried
@@ -467,6 +472,8 @@ situations:
    `mgr.report_failure(id, reason)`: the component moves to `Error` and, after the
    backoff, the manager calls `stop()` (best effort, to release resources) and then
    `start()` in the background.
+3. **Its liveness check keeps failing** — opt in with
+   [`watch_liveness`](#liveness-driven-restarts), which calls `report_failure` for you.
 
 ```rust
 use std::sync::Arc;
@@ -493,7 +500,10 @@ Rules worth knowing:
 
 - **One budget.** `max_restarts` covers both situations, counted since the last
   *explicit* `start`/`stop` of the component through the manager. An explicit start
-  grants a fresh budget.
+  grants a fresh budget. Without `reset_after`, rare failures add up over the process's
+  lifetime (a component that fails once a week ends in `Error` after `max_restarts`
+  weeks); with `RestartPolicy::reset_after(uptime)`, a failure after at least `uptime`
+  of running starts the count over.
 - **An explicit action wins.** If you `stop` (or `start`) the component while a
   restart is waiting out its backoff, the scheduled restart is abandoned.
 - **Only that component is restarted.** Its dependents are left as they are.
@@ -503,9 +513,45 @@ Rules worth knowing:
 - Without a policy, `report_failure` just moves the component to `Error`, which is
   enough to make the manager [not ready and not live](#component-health).
 
-There is no health polling: the manager does not call `Component::health` on a timer
-and restart on `Down`. Detect the failure in your component and call
-`report_failure`.
+### Liveness-driven restarts
+
+`ComponentOptions::watch_liveness(LivenessWatch)` makes the manager poll the
+component's own `Component::health()` while it is `Running`:
+
+```rust
+use std::time::Duration;
+use ferroly::lifecycle::{ComponentOptions, LivenessWatch, RestartPolicy};
+
+let opts = ComponentOptions::new()
+    .restart(RestartPolicy::new(5))
+    .watch_liveness(
+        LivenessWatch::new(Duration::from_secs(10)) // poll every 10 s
+            .failure_threshold(3)                   // 3 consecutive `Down` = failed
+            .initial_delay(Duration::from_secs(60)), // warm-up grace after each (re)start
+    );
+// mgr.register_with(component, opts)?;
+```
+
+- After `failure_threshold` consecutive `Down` answers (a panicking `health()` counts as
+  `Down`; `Degraded` and `None` do not) the manager calls `report_failure`, so the
+  restart policy above applies: `Error`, backoff, `stop()`, `start()`, under the same
+  budget. Without a restart policy the component is left in `Error`, which makes
+  `is_live()` fail — so an orchestrator restarts the whole process instead.
+- The count starts over whenever the component leaves `Running`, and an `Up` or
+  `Degraded` answer resets it.
+- Each time the component enters `Running`, the first poll waits `initial_delay`
+  (default zero) plus one `interval`, so a component that reports `Down` while it warms
+  up is not restarted in a loop.
+- A failure is charged only to the instance that answered `Down`: if the component was
+  stopped and started again in the meantime, the stale report is dropped.
+- Polling begins the first time the component is started through the manager (it runs
+  on the Tokio runtime) and ends when the component is unregistered or the manager is
+  dropped. `LivenessWatch::new` defaults the threshold to 3; the interval is at least
+  1 ms. `LivenessWatch` is `#[non_exhaustive]`; the bounds (threshold at least 1, interval
+  at least 1 ms) are enforced again when the watch runs, so a field assigned out of range
+  is clamped.
+- The signal is the component's own `health()`. Free-standing checks registered on a
+  [`HealthRegistry`](#healthregistry) are not tied to a component and are not watched.
 
 ## Graceful shutdown
 
@@ -950,9 +996,10 @@ async fn main() -> Result<(), LifecycleError> {
 
 - **Stop is sequential.** Parallel start is available; components always stop one
   after another.
-- **No health-driven supervision.** Restarts are triggered by a failed start or an
-  explicit `report_failure`, not by polling `Component::health`. A restart does not
-  cascade to dependents.
+- **Health-driven supervision is opt-in and per component.** Restarts come from a
+  failed start, an explicit `report_failure`, or `watch_liveness` polling the
+  component's own `health()`; `HealthRegistry` checks never restart anything. A
+  restart does not cascade to dependents.
 - **Cancellation is cooperative.** A timed-out or cancelled `start`/`stop` is aborted
   at its next `.await`; a component that blocks the thread without awaiting cannot be
   interrupted.

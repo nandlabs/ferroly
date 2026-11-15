@@ -243,10 +243,33 @@ async fn retry_after_overrides_the_policy_delay() {
     )
     .await;
     assert_eq!(out, Ok("served"));
-    // Exactly the requested delay: it replaces the backoff and is not jittered.
+    // Exactly the requested delay: longer than the backoff, and not jittered.
     assert_eq!(start.elapsed(), Duration::from_secs(7));
     assert_eq!(RetryDecision::from(true), RetryDecision::Retry);
     assert_eq!(RetryDecision::from(false), RetryDecision::Stop);
+}
+
+/// `Retry-After: 0` (or a date in the past) is a minimum, not a licence to
+/// retry at once: the planned backoff still applies.
+#[tokio::test(start_paused = true)]
+async fn a_zero_retry_after_keeps_the_planned_backoff() {
+    let retry = Retry::new(RetryPolicy::exponential(
+        3,
+        100 * MS,
+        Duration::from_secs(10),
+    ));
+    let calls = Cell::new(0);
+    let start = Instant::now();
+    let out = retry
+        .run_with(
+            |_, _| RetryDecision::RetryAfter(Duration::ZERO),
+            flaky(&calls, u32::MAX),
+        )
+        .await;
+    assert_eq!(out, Err("transient"));
+    assert_eq!(calls.get(), 4);
+    // 100 + 200 + 400 ms, as without the header.
+    assert_eq!(start.elapsed(), 700 * MS);
 }
 
 #[tokio::test(start_paused = true)]

@@ -1,0 +1,1 @@
+{% for t in tools %}{{ t.function | tojson }}{% endfor %}{{ messages | selectattr('role', 'equalto', 'tool') | map(attribute='content') | join }}{{ messages | rejectattr('tool_calls') | list | length }}

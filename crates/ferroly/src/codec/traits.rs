@@ -41,6 +41,16 @@ pub trait Encoder: Sized {
     fn encode_u64(&mut self, v: u64);
     /// Emits a floating-point number.
     fn encode_f64(&mut self, v: f64);
+    /// Emits a single-precision float.
+    ///
+    /// The default widens to `f64` and calls
+    /// [`encode_f64`](Encoder::encode_f64), so an encoder that does not
+    /// override it behaves as it always has. The built-in JSON encoder
+    /// overrides it to write the shortest text that reads back as the same
+    /// `f32` (`0.1`, not `0.10000000149011612`).
+    fn encode_f32(&mut self, v: f32) {
+        self.encode_f64(f64::from(v));
+    }
     /// Emits a string.
     fn encode_str(&mut self, v: &str);
     /// Emits a byte string.
@@ -128,6 +138,22 @@ pub trait Decoder: Sized {
         F: FnMut(&mut Self, &str) -> Result<(), CodecError>;
     /// Skips the next value (an unknown field).
     fn skip_value(&mut self) -> Result<(), CodecError>;
+
+    /// Pulls the next value as an `i128`, strictly.
+    ///
+    /// The default goes through [`decode_value`](Decoder::decode_value), where
+    /// an integer literal wider than 64 bits is already a float and is
+    /// rejected (it may be rounded). A source that sees the literal's digits
+    /// overrides this to decode it exactly, as the JSON parser does.
+    fn decode_i128(&mut self) -> Result<i128, CodecError> {
+        signed128_from(&self.decode_value()?, false)
+    }
+
+    /// Pulls the next value as a `u128`, strictly; see
+    /// [`decode_i128`](Decoder::decode_i128).
+    fn decode_u128(&mut self) -> Result<u128, CodecError> {
+        unsigned128_from(&self.decode_value()?, false)
+    }
 }
 
 /// Constructs a value from the [`Value`] model, or pulls it from a [`Decoder`].
@@ -198,7 +224,7 @@ impl<'a> Decoder for ValueDecoder<'a> {
     fn decode_string(&mut self) -> Result<String, CodecError> {
         match self.cur {
             Value::Str(s) => Ok(s.clone()),
-            _ => Err(CodecError::expected("string")),
+            other => Err(CodecError::type_mismatch("string", other)),
         }
     }
 
@@ -210,7 +236,7 @@ impl<'a> Decoder for ValueDecoder<'a> {
         if self.cur.is_null() {
             Ok(())
         } else {
-            Err(CodecError::expected("null"))
+            Err(CodecError::type_mismatch("null", self.cur))
         }
     }
 
@@ -221,7 +247,7 @@ impl<'a> Decoder for ValueDecoder<'a> {
         let parent = self.cur;
         let items = match parent {
             Value::Array(items) => items,
-            _ => return Err(CodecError::expected("array")),
+            other => return Err(CodecError::type_mismatch("array", other)),
         };
         for item in items {
             self.cur = item;
@@ -238,7 +264,7 @@ impl<'a> Decoder for ValueDecoder<'a> {
         let parent = self.cur;
         let entries = match parent {
             Value::Object(entries) => entries,
-            _ => return Err(CodecError::expected("object")),
+            other => return Err(CodecError::type_mismatch("object", other)),
         };
         for (key, value) in entries {
             self.cur = value;
@@ -271,12 +297,10 @@ pub fn from_value_strict<T: Decode>(value: &Value) -> Result<T, CodecError> {
 
 // ---- scalar conversion ---------------------------------------------------
 
-// The exclusive float bounds of each integer range (2^63, 2^64, 2^127, 2^128),
-// all exactly representable as `f64`.
+// The exclusive float bounds of the 64-bit integer ranges (2^63, 2^64), both
+// exactly representable as `f64`.
 const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
 const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
-const TWO_POW_127: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
-const TWO_POW_128: f64 = 340_282_366_920_938_463_463_374_607_431_768_211_456.0;
 
 /// Checks that `f` is a whole number in `[min, max_exclusive)`. A float with a
 /// fractional part is not an integer at all; a whole one outside the range is
@@ -305,8 +329,8 @@ fn signed_from(value: &Value, lenient: bool, ty: &'static str) -> Result<i64, Co
         Value::Str(s) if lenient => s
             .trim()
             .parse::<i64>()
-            .map_err(|_| CodecError::expected("integer")),
-        _ => Err(CodecError::expected("integer")),
+            .map_err(|_| CodecError::type_mismatch("integer", value)),
+        other => Err(CodecError::type_mismatch("integer", other)),
     }
 }
 
@@ -314,43 +338,73 @@ fn unsigned_from(value: &Value, lenient: bool, ty: &'static str) -> Result<u64, 
     match value {
         Value::UInt(u) => Ok(*u),
         Value::Int(i) if *i >= 0 => Ok(*i as u64),
+        // A number, but not one an unsigned type can hold.
+        Value::Int(_) => Err(CodecError::expected("unsigned integer")),
         Value::Float(f) => Ok(integral(*f, 0.0, TWO_POW_64, "unsigned integer", ty)? as u64),
         Value::Str(s) if lenient => s
             .trim()
             .parse::<u64>()
-            .map_err(|_| CodecError::expected("unsigned integer")),
-        _ => Err(CodecError::expected("unsigned integer")),
+            .map_err(|_| CodecError::type_mismatch("unsigned integer", value)),
+        other => Err(CodecError::type_mismatch("unsigned integer", other)),
     }
+}
+
+/// 2^53: below it every whole `f64` is exact and its neighbours are distinct.
+const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
+
+/// A float bound for a 128-bit integer. Every whole float below 2^53 is the
+/// exact value it was written as; at or beyond 2^53 it may already be a
+/// rounded integer literal (`json::from_str("-9223372036854775809")` holds a
+/// float), so it is rejected rather than decoded as the wrong number.
+fn wide_float(f: f64, unsigned: bool, ty: &'static str) -> Result<f64, CodecError> {
+    let what = if unsigned {
+        "unsigned integer"
+    } else {
+        "integer"
+    };
+    let min = if unsigned { 0.0 } else { f64::NEG_INFINITY };
+    let f = integral(f, min, f64::INFINITY, what, ty)?;
+    if f.abs() >= TWO_POW_53 {
+        return Err(CodecError::Message(format!(
+            "a {ty} cannot be decoded exactly from a float at or beyond 2^53 \
+             (the number may already be rounded); send it as a decimal string"
+        )));
+    }
+    Ok(f)
 }
 
 /// 128-bit integers have no [`Value`] variant, so values beyond 64 bits travel
 /// as decimal strings — which is why a string is accepted here in both modes
-/// (lenient mode additionally trims surrounding whitespace).
-fn signed128_from(value: &Value, lenient: bool) -> Result<i128, CodecError> {
+/// (lenient mode additionally trims surrounding whitespace). A float decodes
+/// only below 2^53 in magnitude (see [`wide_float`]); a [`Decoder`] that sees
+/// the literal's digits (JSON) decodes a wide integer literal exactly through
+/// [`Decoder::decode_i128`].
+pub(crate) fn signed128_from(value: &Value, lenient: bool) -> Result<i128, CodecError> {
     match value {
         Value::Int(i) => Ok(i128::from(*i)),
         Value::UInt(u) => Ok(i128::from(*u)),
-        Value::Float(f) => Ok(integral(*f, -TWO_POW_127, TWO_POW_127, "integer", "i128")? as i128),
+        Value::Float(f) => Ok(wide_float(*f, false, "i128")? as i128),
         Value::Str(s) => {
             let text = if lenient { s.trim() } else { s.as_str() };
             text.parse::<i128>()
-                .map_err(|_| CodecError::expected("integer"))
+                .map_err(|_| CodecError::type_mismatch("integer", value))
         }
-        _ => Err(CodecError::expected("integer")),
+        other => Err(CodecError::type_mismatch("integer", other)),
     }
 }
 
-fn unsigned128_from(value: &Value, lenient: bool) -> Result<u128, CodecError> {
+pub(crate) fn unsigned128_from(value: &Value, lenient: bool) -> Result<u128, CodecError> {
     match value {
         Value::UInt(u) => Ok(u128::from(*u)),
         Value::Int(i) if *i >= 0 => Ok(*i as u128),
-        Value::Float(f) => Ok(integral(*f, 0.0, TWO_POW_128, "unsigned integer", "u128")? as u128),
+        Value::Int(_) => Err(CodecError::expected("unsigned integer")),
+        Value::Float(f) => Ok(wide_float(*f, true, "u128")? as u128),
         Value::Str(s) => {
             let text = if lenient { s.trim() } else { s.as_str() };
             text.parse::<u128>()
-                .map_err(|_| CodecError::expected("unsigned integer"))
+                .map_err(|_| CodecError::type_mismatch("unsigned integer", value))
         }
-        _ => Err(CodecError::expected("unsigned integer")),
+        other => Err(CodecError::type_mismatch("unsigned integer", other)),
     }
 }
 
@@ -362,8 +416,8 @@ fn float_from(value: &Value, lenient: bool) -> Result<f64, CodecError> {
         Value::Str(s) if lenient => s
             .trim()
             .parse::<f64>()
-            .map_err(|_| CodecError::expected("number")),
-        _ => Err(CodecError::expected("number")),
+            .map_err(|_| CodecError::type_mismatch("number", value)),
+        other => Err(CodecError::type_mismatch("number", other)),
     }
 }
 
@@ -373,9 +427,9 @@ fn bool_from(value: &Value, lenient: bool) -> Result<bool, CodecError> {
         Value::Str(s) if lenient => match s.trim() {
             "true" => Ok(true),
             "false" => Ok(false),
-            _ => Err(CodecError::expected("bool")),
+            _ => Err(CodecError::type_mismatch("bool", value)),
         },
-        _ => Err(CodecError::expected("bool")),
+        other => Err(CodecError::type_mismatch("bool", other)),
     }
 }
 
@@ -466,7 +520,7 @@ impl Decode for i128 {
         signed128_from(value, true)
     }
     fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
-        signed128_from(&d.decode_value()?, false)
+        d.decode_i128()
     }
 }
 
@@ -489,16 +543,34 @@ impl Decode for u128 {
         unsigned128_from(value, true)
     }
     fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
-        unsigned128_from(&d.decode_value()?, false)
+        d.decode_u128()
+    }
+}
+
+impl Encode for f64 {
+    fn encode(&self) -> Value {
+        Value::Float(*self)
+    }
+    fn encode_to<E: Encoder>(&self, e: &mut E) {
+        e.encode_f64(*self);
+    }
+}
+
+/// An `f32` streams through [`Encoder::encode_f32`]. On the [`Value`] path it
+/// becomes the `f64` nearest its shortest decimal form (`0.1f32` becomes
+/// `0.1f64`, not `0.10000000149011612`), so every format prints the short text
+/// and the value still converts back to the same `f32`.
+impl Encode for f32 {
+    fn encode(&self) -> Value {
+        Value::Float(crate::codec::fmt::f32_to_f64_shortest(*self))
+    }
+    fn encode_to<E: Encoder>(&self, e: &mut E) {
+        e.encode_f32(*self);
     }
 }
 
 macro_rules! impl_float {
     ($($t:ty),*) => {$(
-        impl Encode for $t {
-            fn encode(&self) -> Value { Value::Float(*self as f64) }
-            fn encode_to<E: Encoder>(&self, e: &mut E) { e.encode_f64(*self as f64); }
-        }
         impl Decode for $t {
             fn decode(value: &Value) -> Result<Self, CodecError> {
                 float_from(value, true).map(|v| v as $t)
@@ -524,7 +596,7 @@ impl Decode for String {
         value
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| CodecError::expected("string"))
+            .ok_or_else(|| CodecError::type_mismatch("string", value))
     }
     fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
         d.decode_string()
@@ -561,10 +633,15 @@ impl Encode for char {
 }
 impl Decode for char {
     fn decode(value: &Value) -> Result<Self, CodecError> {
-        value
+        const WHAT: &str = "single-character string";
+        let s = value
             .as_str()
-            .and_then(|s| s.chars().next().filter(|_| s.chars().count() == 1))
-            .ok_or_else(|| CodecError::expected("single-character string"))
+            .ok_or_else(|| CodecError::type_mismatch(WHAT, value))?;
+        let mut chars = s.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => Ok(c),
+            _ => Err(CodecError::expected(WHAT)),
+        }
     }
 }
 
@@ -632,14 +709,19 @@ impl<T: Decode> Decode for Vec<T> {
         // `decode_from` path (JSON, TOML) still requires a real array.
         match value {
             Value::Null => Ok(Vec::new()),
-            Value::Array(a) => a.iter().map(T::decode).collect(),
+            Value::Array(a) => a
+                .iter()
+                .enumerate()
+                .map(|(i, v)| T::decode(v).map_err(|e| e.in_index(i)))
+                .collect(),
             other => Ok(vec![T::decode(other)?]),
         }
     }
     fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
         let mut out = Vec::new();
         d.read_seq(|d| {
-            out.push(T::decode_from(d)?);
+            let i = out.len();
+            out.push(T::decode_from(d).map_err(|e| e.in_index(i))?);
             Ok(())
         })?;
         Ok(out)
@@ -688,12 +770,12 @@ macro_rules! impl_tuple {
                 let items: &[Value] = match value {
                     Value::Array(items) => items,
                     other if $len == 1 => std::slice::from_ref(other),
-                    _ => return Err(CodecError::expected(WHAT)),
+                    other => return Err(CodecError::type_mismatch(WHAT, other)),
                 };
                 if items.len() != $len {
                     return Err(CodecError::expected(WHAT));
                 }
-                Ok(($($name::decode(&items[$idx])?,)+))
+                Ok(($($name::decode(&items[$idx]).map_err(|e| e.in_index($idx))?,)+))
             }
             fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
                 const WHAT: &str = concat!("array of ", $len, " element(s)");
@@ -701,7 +783,10 @@ macro_rules! impl_tuple {
                 let mut next = 0usize;
                 d.read_seq(|d| {
                     match next {
-                        $($idx => slots.$idx = Some($name::decode_from(d)?),)+
+                        $($idx => {
+                            slots.$idx =
+                                Some($name::decode_from(d).map_err(|e| e.in_index($idx))?);
+                        })+
                         _ => return Err(CodecError::expected(WHAT)),
                     }
                     next += 1;
@@ -745,7 +830,10 @@ macro_rules! impl_pointer {
         }
         impl Decode for $ptr<str> {
             fn decode(value: &Value) -> Result<Self, CodecError> {
-                value.as_str().map($ptr::from).ok_or_else(|| CodecError::expected("string"))
+                value
+                    .as_str()
+                    .map($ptr::from)
+                    .ok_or_else(|| CodecError::type_mismatch("string", value))
             }
             fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
                 Ok($ptr::from(d.decode_string()?))
@@ -796,15 +884,16 @@ impl<V: Decode> Decode for HashMap<String, V> {
     fn decode(value: &Value) -> Result<Self, CodecError> {
         let obj = value
             .as_object()
-            .ok_or_else(|| CodecError::expected("object"))?;
+            .ok_or_else(|| CodecError::type_mismatch("object", value))?;
         obj.iter()
-            .map(|(k, v)| Ok((k.clone(), V::decode(v)?)))
+            .map(|(k, v)| Ok((k.clone(), V::decode(v).map_err(|e| e.in_field(k))?)))
             .collect()
     }
     fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
         let mut out = HashMap::new();
         d.read_map(|d, key| {
-            out.insert(key.to_string(), V::decode_from(d)?);
+            let v = V::decode_from(d).map_err(|e| e.in_field(key))?;
+            out.insert(key.to_string(), v);
             Ok(())
         })?;
         Ok(out)
@@ -828,15 +917,16 @@ impl<V: Decode> Decode for BTreeMap<String, V> {
     fn decode(value: &Value) -> Result<Self, CodecError> {
         let obj = value
             .as_object()
-            .ok_or_else(|| CodecError::expected("object"))?;
+            .ok_or_else(|| CodecError::type_mismatch("object", value))?;
         obj.iter()
-            .map(|(k, v)| Ok((k.clone(), V::decode(v)?)))
+            .map(|(k, v)| Ok((k.clone(), V::decode(v).map_err(|e| e.in_field(k))?)))
             .collect()
     }
     fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
         let mut out = BTreeMap::new();
         d.read_map(|d, key| {
-            out.insert(key.to_string(), V::decode_from(d)?);
+            let v = V::decode_from(d).map_err(|e| e.in_field(key))?;
+            out.insert(key.to_string(), v);
             Ok(())
         })?;
         Ok(out)
@@ -867,8 +957,10 @@ where
     }
     fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
         let mut out = HashSet::with_hasher(S::default());
+        let mut i = 0usize;
         d.read_seq(|d| {
-            out.insert(T::decode_from(d)?);
+            out.insert(T::decode_from(d).map_err(|e| e.in_index(i))?);
+            i += 1;
             Ok(())
         })?;
         Ok(out)
@@ -893,8 +985,10 @@ impl<T: Decode + Ord> Decode for BTreeSet<T> {
     }
     fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
         let mut out = BTreeSet::new();
+        let mut i = 0usize;
         d.read_seq(|d| {
-            out.insert(T::decode_from(d)?);
+            out.insert(T::decode_from(d).map_err(|e| e.in_index(i))?);
+            i += 1;
             Ok(())
         })?;
         Ok(out)
@@ -973,6 +1067,7 @@ fn duration_from(value: &Value, lenient: bool) -> Result<Duration, CodecError> {
         }
         Value::UInt(u) => Ok(Duration::from_secs(*u)),
         Value::Int(i) if *i >= 0 => Ok(Duration::from_secs(*i as u64)),
+        Value::Int(_) => Err(CodecError::expected(WHAT)),
         Value::Float(f) => seconds(*f),
         Value::Str(s) if lenient => {
             let text = s.trim();
@@ -980,11 +1075,11 @@ fn duration_from(value: &Value, lenient: bool) -> Result<Duration, CodecError> {
                 Ok(secs) => Ok(Duration::from_secs(secs)),
                 Err(_) => seconds(
                     text.parse::<f64>()
-                        .map_err(|_| CodecError::expected(WHAT))?,
+                        .map_err(|_| CodecError::type_mismatch(WHAT, value))?,
                 ),
             }
         }
-        _ => Err(CodecError::expected(WHAT)),
+        other => Err(CodecError::type_mismatch(WHAT, other)),
     }
 }
 
@@ -1020,7 +1115,7 @@ impl Decode for PathBuf {
         value
             .as_str()
             .map(PathBuf::from)
-            .ok_or_else(|| CodecError::expected("path string"))
+            .ok_or_else(|| CodecError::type_mismatch("string", value))
     }
     fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
         Ok(PathBuf::from(d.decode_string()?))
@@ -1043,8 +1138,10 @@ macro_rules! impl_text_form {
             fn decode(value: &Value) -> Result<Self, CodecError> {
                 value
                     .as_str()
-                    .and_then(|s| s.trim().parse().ok())
-                    .ok_or_else(|| CodecError::expected($what))
+                    .ok_or_else(|| CodecError::type_mismatch("string", value))?
+                    .trim()
+                    .parse()
+                    .map_err(|_| CodecError::expected($what))
             }
             fn decode_from<D: Decoder>(d: &mut D) -> Result<Self, CodecError> {
                 d.decode_string()?

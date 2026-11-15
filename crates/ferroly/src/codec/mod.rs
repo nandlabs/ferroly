@@ -59,17 +59,20 @@ mod error;
 mod fmt;
 pub mod json;
 mod limits;
+mod regex;
 mod registry;
 pub mod schema;
+mod time;
 pub mod toml;
 mod traits;
 mod value;
 pub mod xml;
 pub mod yaml;
 
-pub use error::CodecError;
+pub use error::{CodecError, PathSegment};
 pub use limits::Limits;
 pub use registry::{decode, decode_with, encode, resolve, try_encode, Format};
+pub use time::DateTime;
 pub use traits::{emit_value, from_value_strict, Decode, Decoder, Encode, Encoder, ValueDecoder};
 pub use value::{find, Value};
 

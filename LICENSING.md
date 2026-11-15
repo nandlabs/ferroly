@@ -32,7 +32,9 @@ conditions. See [CONTRIBUTING.md](CONTRIBUTING.md).
 Ferroly is intentionally dependency-minimal. Its entire runtime dependency tree
 is `tokio` plus the TLS stack (`rustls` / `tokio-rustls` / `rustls-pki-types` /
 `webpki-roots`); the only build-time dependencies are the proc-macro tooling
-(`proc-macro2` / `syn` / `quote`) used by `ferroly-derive`.
+(`proc-macro2` / `syn` / `quote`) used by `ferroly-derive`. The optional
+`log-bridge` feature adds the `log` facade crate (`MIT OR Apache-2.0`, no
+dependencies of its own).
 
 **Every dependency is permissively licensed** — there is no copyleft (no GPL,
 LGPL, AGPL, MPL, or EPL) anywhere in the tree. The complete set of licenses in

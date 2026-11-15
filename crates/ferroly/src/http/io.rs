@@ -524,6 +524,8 @@ pub(crate) struct ChunkedReader {
     total: u64,
     /// Cap on `total`; exceeding it fails before the chunk is read.
     max: Option<u64>,
+    /// The trailer section, once read (empty sections are not kept).
+    trailers: Option<HeaderMap>,
 }
 
 impl ChunkedReader {
@@ -536,7 +538,14 @@ impl ChunkedReader {
             done: false,
             total: 0,
             max,
+            trailers: None,
         }
+    }
+
+    /// Takes the trailer section read after the last chunk, if it was not
+    /// empty.
+    pub(crate) fn take_trailers(&mut self) -> Option<HeaderMap> {
+        self.trailers.take()
     }
 
     /// Replaces the size cap.
@@ -550,7 +559,7 @@ impl ChunkedReader {
     /// Each chunk's data must be followed by exactly CRLF. Chunk-size lines
     /// are capped at [`MAX_CHUNK_LINE_BYTES`] (or the configured line limit,
     /// if that is smaller); the trailer section is bounded by `limits` (line
-    /// length, count and total bytes) and then discarded.
+    /// length, count and total bytes) and kept for [`take_trailers`](Self::take_trailers).
     pub(crate) async fn next<R: AsyncBufRead + Unpin>(
         &mut self,
         r: &mut R,
@@ -606,19 +615,23 @@ impl ChunkedReader {
                 .ok_or_else(truncated)?;
             let size = parse_chunk_size(&line, limits.allow_bare_lf)?;
             if size == 0 {
-                read_header_block(r, limits, &mut started)
-                    .await
-                    .map_err(|e| match e {
-                        HeadError::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                            truncated()
-                        }
-                        HeadError::Bad { status, .. }
-                            if status == StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE =>
-                        {
-                            HttpError::Protocol("trailer section too large".into())
-                        }
-                        e => e.into(),
-                    })?;
+                let trailers =
+                    read_header_block(r, limits, &mut started)
+                        .await
+                        .map_err(|e| match e {
+                            HeadError::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                truncated()
+                            }
+                            HeadError::Bad { status, .. }
+                                if status == StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE =>
+                            {
+                                HttpError::Protocol("trailer section too large".into())
+                            }
+                            e => e.into(),
+                        })?;
+                if !trailers.is_empty() {
+                    self.trailers = Some(trailers);
+                }
                 self.done = true;
                 return Ok(None);
             }
@@ -863,6 +876,83 @@ where
     }
     bounded(idle, w.flush()).await?;
     Ok(())
+}
+
+/// Writes a request body read from a [`BodyStream`]: chunked with the
+/// stream's trailers in the trailer section, or exactly the declared number
+/// of bytes (no trailers). Each read and write is bounded by `idle`.
+pub(crate) async fn write_piped_body<W>(
+    w: &mut W,
+    encoding: BodyEncoding,
+    body: &mut super::BodyStream,
+    idle: Option<Duration>,
+) -> Result<(), HttpError>
+where
+    W: AsyncWrite + Unpin,
+{
+    match encoding {
+        BodyEncoding::Chunked => {
+            while let Some(chunk) = next_piece(body, idle).await? {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let mut frame = Vec::with_capacity(chunk.len() + 16);
+                frame.extend_from_slice(format!("{:X}\r\n", chunk.len()).as_bytes());
+                frame.extend_from_slice(&chunk);
+                frame.extend_from_slice(b"\r\n");
+                bounded(idle, w.write_all(&frame)).await?;
+            }
+            let mut last = b"0\r\n".to_vec();
+            if let Some(trailers) = body.trailers() {
+                for (k, v) in trailers.iter() {
+                    if !is_token(k) || !v.bytes().all(is_field_value_byte) {
+                        return Err(HttpError::Protocol("invalid trailer field".into()));
+                    }
+                    if k.eq_ignore_ascii_case("content-length")
+                        || k.eq_ignore_ascii_case("transfer-encoding")
+                    {
+                        continue;
+                    }
+                    last.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+                }
+            }
+            last.extend_from_slice(b"\r\n");
+            bounded(idle, w.write_all(&last)).await?;
+        }
+        BodyEncoding::Length(declared) => {
+            let mut sent = 0u64;
+            while let Some(chunk) = next_piece(body, idle).await? {
+                sent += chunk.len() as u64;
+                if sent > declared {
+                    return Err(HttpError::Protocol(
+                        "request body is longer than its Content-Length".into(),
+                    ));
+                }
+                bounded(idle, w.write_all(&chunk)).await?;
+            }
+            if sent != declared {
+                return Err(HttpError::Protocol(
+                    "request body is shorter than its Content-Length".into(),
+                ));
+            }
+        }
+    }
+    bounded(idle, w.flush()).await?;
+    Ok(())
+}
+
+/// The next chunk of a body stream, within `idle`.
+async fn next_piece(
+    body: &mut super::BodyStream,
+    idle: Option<Duration>,
+) -> Result<Option<Vec<u8>>, HttpError> {
+    match idle {
+        Some(d) => match tokio::time::timeout(d, body.chunk()).await {
+            Ok(r) => r,
+            Err(_) => Err(HttpError::Timeout),
+        },
+        None => body.chunk().await,
+    }
 }
 
 /// Awaits an I/O future, failing with [`HttpError::Timeout`] after `limit`.

@@ -12,7 +12,12 @@
 //! | Encodings | [`base64`], [`hex`] |
 //! | Comparison | [`ct_eq`], [`Digest::ct_eq`] |
 //! | Secrets | [`Secret`] (redacting, wiped on drop) |
-//! | Randomness | [`random`] (OS CSPRNG; Unix only) |
+//! | Randomness | [`random`] (OS CSPRNG: Unix and Windows; not wasm) |
+//!
+//! Hasher states, [`Hmac`] key states and the KDF intermediates are
+//! **overwritten with zeros when dropped** (best-effort, like [`Secret`]: an
+//! ordinary write the optimiser is discouraged, not prevented, from eliding;
+//! copies the compiler made on the stack are not reached).
 //!
 //! Every hasher is **incremental** — feed bytes with `update` as they arrive
 //! (a download, a large file read) and call `finalize` once, without buffering
@@ -41,6 +46,14 @@
 //! acceleration, and — apart from the explicit constant-time comparisons —
 //! make no side-channel guarantees. If your environment mandates validated
 //! cryptography, do not use this module for that purpose.
+//!
+//! **There is no FIPS route for SHA, HMAC, HKDF or PBKDF2.** They are not
+//! delegated to the rustls `CryptoProvider`, so installing a FIPS provider
+//! (`rustls::crypto::default_fips_provider()`) changes TLS and the JWT
+//! RS\*/PS\*/ES\* verification in `ferroly::auth`, but not this module,
+//! nor what is built on it: HS\* JWTs, SigV4 request signing, OAuth helpers,
+//! the turbo CSRF and API-key hashing, and `ferroly::sig` Ed25519
+//! (which is hand-rolled too).
 
 #![deny(missing_docs)]
 
@@ -117,6 +130,17 @@ pub trait HashAlgorithm: Clone {
     fn update(&mut self, data: &[u8]);
     /// Finishes the hash and returns the digest.
     fn finalize(self) -> Self::Output;
+
+    /// Overwrites a digest with zeros. [`Hmac`] and [`kdf`] call it on
+    /// intermediate digests (keyed material) once they are done with them.
+    ///
+    /// The provided implementation does nothing, so an implementation outside
+    /// this crate keeps compiling without making its `Output` writable; such
+    /// an implementation should override it to have its intermediates wiped
+    /// too. Every hash in this crate does.
+    fn wipe_output(output: &mut Self::Output) {
+        let _ = output;
+    }
 }
 
 /// A fixed-size hash output.
@@ -190,6 +214,31 @@ impl<const N: usize> AsRef<[u8]> for Digest<N> {
     }
 }
 
+impl<const N: usize> AsMut<[u8]> for Digest<N> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+/// The first `BLOCK` bytes of `data` as a block, borrowed, and the rest.
+fn split_block(data: &[u8]) -> Option<(&[u8; BLOCK], &[u8])> {
+    if data.len() < BLOCK {
+        return None;
+    }
+    let (block, rest) = data.split_at(BLOCK);
+    block.try_into().ok().map(|block| (block, rest))
+}
+
+/// Overwrites `slots` with zeros (`Default`), then passes them through
+/// [`std::hint::black_box`] so the optimiser is discouraged from eliding the
+/// stores as dead. Best-effort, like the [`Secret`] wipe.
+pub(crate) fn wipe<T: Copy + Default>(slots: &mut [T]) {
+    for slot in slots.iter_mut() {
+        *slot = T::default();
+    }
+    std::hint::black_box(slots);
+}
+
 // ---- SHA-256 -------------------------------------------------------------
 
 const SHA256_K: [u32; 64] = [
@@ -245,16 +294,14 @@ impl Sha256 {
             self.buf_len += take;
             data = &data[take..];
             if self.buf_len == BLOCK {
-                let block = self.buf;
-                sha256_compress(&mut self.h, &block);
+                sha256_compress(&mut self.h, &self.buf);
                 self.buf_len = 0;
             }
         }
-        while data.len() >= BLOCK {
-            let mut block = [0u8; BLOCK];
-            block.copy_from_slice(&data[..BLOCK]);
-            sha256_compress(&mut self.h, &block);
-            data = &data[BLOCK..];
+        while let Some((block, rest)) = split_block(data) {
+            // Compressed in place: no stack copy of the input.
+            sha256_compress(&mut self.h, block);
+            data = rest;
         }
         if !data.is_empty() {
             self.buf[..data.len()].copy_from_slice(data);
@@ -269,21 +316,36 @@ impl Sha256 {
         self.buf[i] = 0x80;
         if i + 1 > BLOCK - 8 {
             self.buf[i + 1..].fill(0);
-            let block = self.buf;
-            sha256_compress(&mut self.h, &block);
+            sha256_compress(&mut self.h, &self.buf);
             self.buf = [0; BLOCK];
         } else {
             self.buf[i + 1..].fill(0);
         }
         self.buf[BLOCK - 8..].copy_from_slice(&bit_len.to_be_bytes());
-        let block = self.buf;
-        sha256_compress(&mut self.h, &block);
+        sha256_compress(&mut self.h, &self.buf);
 
         let mut out = [0u8; 32];
         for (i, word) in self.h.iter().enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
         }
         Digest(out)
+    }
+}
+
+impl Sha256 {
+    /// Overwrites the chaining state, the buffered input and the length.
+    fn zeroize(&mut self) {
+        wipe(&mut self.h);
+        wipe(&mut self.buf);
+        self.buf_len = 0;
+        self.total = 0;
+        std::hint::black_box(&*self);
+    }
+}
+
+impl Drop for Sha256 {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
@@ -300,6 +362,9 @@ impl HashAlgorithm for Sha256 {
     }
     fn finalize(self) -> Digest<32> {
         Sha256::finalize(self)
+    }
+    fn wipe_output(output: &mut Digest<32>) {
+        wipe(output.as_mut());
     }
 }
 
@@ -392,16 +457,14 @@ impl Sha1 {
             self.buf_len += take;
             data = &data[take..];
             if self.buf_len == BLOCK {
-                let block = self.buf;
-                sha1_compress(&mut self.h, &block);
+                sha1_compress(&mut self.h, &self.buf);
                 self.buf_len = 0;
             }
         }
-        while data.len() >= BLOCK {
-            let mut block = [0u8; BLOCK];
-            block.copy_from_slice(&data[..BLOCK]);
-            sha1_compress(&mut self.h, &block);
-            data = &data[BLOCK..];
+        while let Some((block, rest)) = split_block(data) {
+            // Compressed in place: no stack copy of the input.
+            sha1_compress(&mut self.h, block);
+            data = rest;
         }
         if !data.is_empty() {
             self.buf[..data.len()].copy_from_slice(data);
@@ -416,21 +479,29 @@ impl Sha1 {
         self.buf[i] = 0x80;
         if i + 1 > BLOCK - 8 {
             self.buf[i + 1..].fill(0);
-            let block = self.buf;
-            sha1_compress(&mut self.h, &block);
+            sha1_compress(&mut self.h, &self.buf);
             self.buf = [0; BLOCK];
         } else {
             self.buf[i + 1..].fill(0);
         }
         self.buf[BLOCK - 8..].copy_from_slice(&bit_len.to_be_bytes());
-        let block = self.buf;
-        sha1_compress(&mut self.h, &block);
+        sha1_compress(&mut self.h, &self.buf);
 
         let mut out = [0u8; 20];
         for (i, word) in self.h.iter().enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
         }
         Digest(out)
+    }
+}
+
+impl Drop for Sha1 {
+    fn drop(&mut self) {
+        wipe(&mut self.h);
+        wipe(&mut self.buf);
+        self.buf_len = 0;
+        self.total = 0;
+        std::hint::black_box(&*self);
     }
 }
 
@@ -447,6 +518,9 @@ impl HashAlgorithm for Sha1 {
     }
     fn finalize(self) -> Digest<20> {
         Sha1::finalize(self)
+    }
+    fn wipe_output(output: &mut Digest<20>) {
+        wipe(output.as_mut());
     }
 }
 

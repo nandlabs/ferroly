@@ -18,7 +18,10 @@ services:
 - a **rotating file** writer (size and daily rotation with retention);
 - opt-in **sampling**, **caller capture** and a **panic hook**;
 - a process-global logger, context providers, and trace correlation with
-  [`obs`](obs.md).
+  [`obs`](obs.md);
+- an opt-in **bridge from the `log` facade crate** (feature `log-bridge`), so
+  records that other crates emit with `log::info!` flow through the same
+  pipeline — see [Bridging the `log` crate](#bridging-the-log-crate).
 
 Everything is built on [`ferroly::codec::Value`](codec.md) — field values keep
 their type (a number stays a number in JSON output, not a quoted string) — with
@@ -26,10 +29,9 @@ no external logging framework and no `serde`.
 
 Deliberately **out of scope**:
 
-- **A bridge from the `log` / `tracing` facade crates.** Capturing records that
-  third-party crates emit through those facades needs the facade crates as
-  dependencies, which this toolkit does not take. Diagnostics from `rustls` or
-  `tokio` are therefore not visible through `ferroly::log`.
+- **A bridge from the `tracing` crate.** Only the `log` facade is bridged (see
+  [Bridging the `log` crate](#bridging-the-log-crate)); records emitted only
+  through `tracing` are not visible through `ferroly::log`.
 - **syslog / journald / network sinks.** A sink is any `std::io::Write`; wrap a
   socket or write your own adapter.
 - **Reading the system time zone.** Timestamps are UTC unless you configure a
@@ -47,6 +49,14 @@ ferroly = { version = "*", features = ["log"] }
 ```
 
 The feature implies [`codec`](codec.md) (field values are [`Value`](codec.md)).
+
+To also capture records from the `log` facade crate, enable `log-bridge`
+instead (it implies `log`):
+
+```toml
+[dependencies]
+ferroly = { version = "*", features = ["log-bridge"] }
+```
 
 ## Quick start
 
@@ -524,6 +534,110 @@ previously installed hook (by default the standard stderr report).
 `install_panic_hook_with(false)` does not chain, so the panic is reported through
 the logger only.
 
+### Bridging the `log` crate
+
+Many ecosystem crates report through the [`log`](https://docs.rs/log/0.4)
+facade (`log::info!`, `log::warn!`, …). The `log-bridge` feature installs a
+ferroly [`Logger`](#logger) as the facade's logger, so those records get the
+same sinks, format, redaction, sampling and context providers as your own.
+
+**Dependency note.** `log-bridge` is off by default (it is part of `full`) and
+is the toolkit's only optional dependency outside the `tokio`/`rustls` budget:
+it adds the `log` crate (0.4, features `std` and `kv`), which has no
+dependencies of its own. Without the feature, `log` is not compiled. `tracing`
+is out of scope — there is no `tracing` bridge.
+
+```rust
+use ferroly::log::{self, bridge, Level, Logger};
+
+fn main() {
+    log::set_max_level(Level::Info);
+    // Route every `log` record to a JSON logger on stderr …
+    bridge::install(Logger::json().with("service", "api"))
+        .expect("no other `log` logger installed");
+
+    // … so a dependency's `log::warn!(attempt = 2; "retrying")` prints
+    // {"ts":"…","level":"warn","msg":"retrying","target":"some_crate::client","service":"api","attempt":2}
+}
+```
+
+```rust
+// ferroly::log::bridge
+pub fn install(logger: Logger) -> Result<(), BridgeError> // route to this logger
+pub fn install_global() -> Result<(), BridgeError>       // route to the global logger
+pub fn is_installed() -> bool
+pub fn stats() -> BridgeStats                            // counters, see below
+pub const MAX_KV_FIELDS: usize = 64;
+
+#[non_exhaustive]
+pub enum BridgeError {
+    AlreadyInstalled,     // the bridge was installed before
+    OtherLoggerInstalled, // another `log` implementation (env_logger, …) was
+}
+```
+
+`install_global()` forwards each record to whichever logger
+[`set_global`](#process-global-logger) holds *at that moment* (the stderr
+default until one is set), so the global logger can be replaced later.
+`install(logger)` uses that one logger for the life of the process.
+
+**Installation is once per process.** The facade accepts a single logger, so a
+second `install` / `install_global` returns `Err(BridgeError::AlreadyInstalled)`,
+and a call made after another `log` implementation was installed returns
+`Err(BridgeError::OtherLoggerInstalled)`. Neither panics.
+
+#### How a `log` record maps
+
+| `log` record | ferroly record |
+|---|---|
+| `Level::Trace` … `Level::Error` | `Level::Trace` … `Level::Error` (one to one) |
+| the formatted message | `msg` |
+| `target` (the module path unless set with `target: "…"`) | `target` — it **replaces** the logger's own `with_target` and selects the [per-target level](#targets-and-per-module-levels); a record with an empty target keeps the logger's |
+| `module_path`, when it differs from the target | a `module` field |
+| `file` / `line` | `caller` (`file:line`), when the logger has `with_caller(true)` |
+| key-value pairs (`log::info!(user = 7, ok = true; "…")`) | typed fields: integers, floats, booleans and strings keep their type; anything else is its `Display` text. At most `MAX_KV_FIELDS` (64) per record; further pairs are ignored |
+
+#### Counters: `stats`
+
+The bridge never fails a `log` call, so what it cannot deliver it drops; `bridge::stats()`
+makes those losses visible (process-wide, since start):
+
+| `BridgeStats` field | Counts |
+|---|---|
+| `forwarded` | records that passed the filters and were handed to the logger |
+| `reentrant` | records dropped because they were logged from inside a synchronous sink's writer (writing them would re-enter the sink's lock) |
+| `truncated` | forwarded records that had more than `MAX_KV_FIELDS` key-value pairs and lost the rest |
+
+Records the level filters reject are not counted. Drops further down — the sampler, or a
+full non-blocking sink (`Logger::dropped`) — are counted where they happen, as for any
+record.
+
+Bridged fields go through the usual [redaction](#redaction) and
+[reserved-key](#field-order-repeated-keys-and-reserved-keys) rules, after the
+context-provider and `with` fields. `log::logger().flush()` calls
+[`Logger::flush`](#flushing-and-the-buffering-contract).
+
+#### Level filtering
+
+A bridged record is filtered exactly like a direct one — logger floor, then the
+target override or the global level (using the `log` record's target), then
+the sinks — so `log::log_enabled!(…)` agrees with `Logger::enabled`.
+
+The facade also has its own global gate, `log::max_level()`, which the `log`
+macros check before anything else. The bridge keeps it at the **lowest level
+the logger could emit for any target** — the most permissive of the global
+level and every `set_level_for` override, bounded by the logger's floor and its
+most permissive sink — and recomputes it whenever `set_max_level`,
+`set_level_for`, `clear_level_for`, `clear_target_levels` or `set_global`
+changes the filters. A disabled `log::debug!` therefore costs one atomic load.
+Don't call `log::set_max_level` yourself while the bridge is installed: the next
+filter change overwrites it, and a gate stricter than ferroly's filters drops
+records ferroly would have kept.
+
+The `log` crate's compile-time `max_level_*` / `release_max_level_*` features,
+if some crate in the build enables them, still apply before the bridge sees a
+record.
+
 ### Carried context fields with `with`
 
 `.with(k, v)` attaches a field to a logger clone so every subsequent record
@@ -612,7 +726,9 @@ flushes does not deadlock: the nested record is discarded.
 
 ## Limitations
 
-- **No bridge from the `log` / `tracing` crates** (see Overview).
+- **No bridge from `tracing`.** The `log` bridge (feature `log-bridge`) can be
+  installed once per process, and `log` key-value values other than numbers,
+  booleans and strings are carried as their `Display` text.
 - **No syslog/journald/network sinks, no compression of rotated files.**
 - **Redaction is by field name**, not by scanning values or message text.
 - **Plain-format messages are free text** — `key=value` inside a message is

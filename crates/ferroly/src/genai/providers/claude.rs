@@ -9,8 +9,8 @@ use ferroly::codec::{json, Value};
 use ferroly::hash::base64;
 
 use super::common::{
-    f32_num, merge_custom, obj, s, stream_failure, tool_result_text, u32_field, ErrorHint,
-    HttpCore, ProviderFailure,
+    check_image_mime, document_text, f32_num, merge_custom, mime_essence, obj, s, stream_failure,
+    tool_result_text, u32_field, unsupported_document, ErrorHint, HttpCore, ProviderFailure,
 };
 use super::sse::{Framing, StreamParser};
 use super::ProviderOptions;
@@ -426,7 +426,7 @@ fn build_body(request: &CompletionRequest, opts: &BodyOptions) -> Result<Value, 
     // tool_result of one round into a single user message.
     let mut messages: Vec<(&'static str, Vec<Value>)> = Vec::new();
     for message in request.messages.iter().filter(|m| m.role != Role::System) {
-        let content = encode_content(message);
+        let content = encode_content(message)?;
         if content.is_empty() {
             continue;
         }
@@ -591,8 +591,9 @@ fn role_str(role: Role) -> &'static str {
     }
 }
 
-/// Encodes a message's parts as Messages API content blocks.
-fn encode_content(msg: &Message) -> Vec<Value> {
+/// Encodes a message's parts as Messages API content blocks. An image part
+/// with a non-image MIME type, or a document Claude cannot read, is refused.
+fn encode_content(msg: &Message) -> Result<Vec<Value>, GenAiError> {
     // tool_result blocks must lead the user message that answers a tool call.
     let mut results: Vec<Value> = Vec::new();
     let mut blocks: Vec<Value> = Vec::new();
@@ -603,17 +604,52 @@ fn encode_content(msg: &Message) -> Vec<Value> {
                     blocks.push(obj([("type", s("text")), ("text", s(t))]));
                 }
             }
-            MessagePart::Image { data, mime_type } => blocks.push(obj([
-                ("type", s("image")),
-                (
-                    "source",
+            MessagePart::Image { data, mime_type } => {
+                check_image_mime(mime_type)?;
+                blocks.push(obj([
+                    ("type", s("image")),
+                    (
+                        "source",
+                        obj([
+                            ("type", s("base64")),
+                            ("media_type", s(mime_type)),
+                            ("data", s(&base64::encode(data))),
+                        ]),
+                    ),
+                ]));
+            }
+            MessagePart::Document {
+                data,
+                mime_type,
+                name,
+            } => {
+                let essence = mime_essence(mime_type);
+                let source = if essence == "application/pdf" {
                     obj([
                         ("type", s("base64")),
-                        ("media_type", s(mime_type)),
+                        ("media_type", s("application/pdf")),
                         ("data", s(&base64::encode(data))),
-                    ]),
-                ),
-            ])),
+                    ])
+                } else if essence.starts_with("text/") {
+                    // Plain-text documents use a text source (Claude reads
+                    // them as `text/plain`, whatever the subtype).
+                    obj([
+                        ("type", s("text")),
+                        ("media_type", s("text/plain")),
+                        ("data", s(document_text(data, mime_type)?)),
+                    ])
+                } else {
+                    return Err(unsupported_document(PROVIDER, mime_type));
+                };
+                let mut block = vec![
+                    ("type".to_string(), s("document")),
+                    ("source".to_string(), source),
+                ];
+                if let Some(title) = name {
+                    block.push(("title".to_string(), s(title)));
+                }
+                blocks.push(Value::Object(block));
+            }
             MessagePart::FileRef { uri, mime_type } => {
                 let is_http = uri.starts_with("https://") || uri.starts_with("http://");
                 let source = obj([("type", s("url")), ("url", s(uri))]);
@@ -656,7 +692,7 @@ fn encode_content(msg: &Message) -> Vec<Value> {
         }
     }
     results.extend(blocks);
-    results
+    Ok(results)
 }
 
 /// Normalizes a `usage` object. `complete` is false for the partial usage

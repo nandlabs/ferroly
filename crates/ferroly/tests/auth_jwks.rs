@@ -1,5 +1,8 @@
 #![cfg(all(feature = "auth", feature = "http"))]
-//! Asymmetric JWT verification (RS256 / ES256) from JWK and JWKS keys.
+#![allow(deprecated)] // deliberately exercises the legacy JWT API alongside the new one
+//! Asymmetric JWT verification (RS256 / ES256) from JWK and JWKS keys. The
+//! other algorithms (RS384/512, PS*, ES384, EdDSA), OIDC discovery and `jti`
+//! replay are in `auth_algorithms.rs`.
 //!
 //! Proven against the RFC 7515 appendix A.2 (RS256) and A.3 (ES256) examples,
 //! plus a second key pair of each type generated and signed with the OpenSSL
@@ -493,8 +496,10 @@ fn a_public_key_is_never_usable_as_an_hmac_secret() {
 #[test]
 fn unsecured_and_unknown_algorithms_are_rejected() {
     let (_, p, _) = segments(RFC7515_A2_TOKEN);
+    // Unknown, unsecured or mis-cased names, and known algorithms an RSA key
+    // cannot verify (`ES384`, `EdDSA`, `HS256`).
     for alg in [
-        "none", "None", "NONE", "RS384", "PS256", "ES384", "EdDSA", "rs256", "",
+        "none", "None", "NONE", "ES384", "ES512", "EdDSA", "Ed25519", "rs256", "ps256", "RS1", "",
     ] {
         let header = b64(format!(r#"{{"alg":"{alg}"}}"#).as_bytes());
         for signature in ["", segments(RFC7515_A2_TOKEN).2] {
@@ -504,12 +509,32 @@ fn unsecured_and_unknown_algorithms_are_rejected() {
                 Err(JwtError::UnsupportedAlg),
                 "alg {alg:?}"
             );
-            assert_eq!(
-                Jwks::from_keys(vec![rfc_rsa_jwk()]).verify(&token, &rfc_time()),
-                Err(JwtError::UnsupportedAlg),
-                "alg {alg:?}"
-            );
+            let by_set = Jwks::from_keys(vec![rfc_rsa_jwk()]).verify(&token, &rfc_time());
+            // A known algorithm no key in the set accepts is an unknown key.
+            let want = if Algorithm::from_name(alg).is_some() {
+                JwtError::UnknownKey
+            } else {
+                JwtError::UnsupportedAlg
+            };
+            assert_eq!(by_set, Err(want), "alg {alg:?}");
         }
+    }
+    // Other RSA algorithms are accepted by an unpinned RSA key, but the
+    // RS256 signature is not valid under them.
+    for alg in ["RS384", "RS512", "PS256", "PS384", "PS512"] {
+        let header = b64(format!(r#"{{"alg":"{alg}"}}"#).as_bytes());
+        let token = format!("{header}.{p}.{}", segments(RFC7515_A2_TOKEN).2);
+        assert_eq!(
+            rfc_rsa_jwk().verify(&token, &rfc_time()),
+            Err(JwtError::InvalidSignature),
+            "alg {alg:?}"
+        );
+        // ...and refused outright by a key pinned to RS256.
+        assert_eq!(
+            openssl_rsa_jwk().verify(&token, &rfc_time()),
+            Err(JwtError::UnsupportedAlg),
+            "alg {alg:?}"
+        );
     }
     // A missing alg and a non-string alg.
     for header in [r#"{"typ":"JWT"}"#, r#"{"alg":256}"#, r#"{"alg":null}"#] {
@@ -617,6 +642,12 @@ fn jwk_parsing_rejects_unusable_keys() {
         ),
         // Coordinates of the wrong size, or missing.
         format!(r#"{{"kty":"EC","crv":"P-256","x":"AQAB","y":"{RFC7515_A3_Y}"}}"#),
+        format!(r#"{{"kty":"EC","crv":"P-384","x":"{RFC7515_A3_X}","y":"{RFC7515_A3_Y}"}}"#),
+        // Ed25519: wrong length, small-order point, missing x.
+        r#"{"kty":"OKP","crv":"Ed25519","x":"AQAB"}"#.to_string(),
+        r#"{"kty":"OKP","crv":"Ed25519","x":"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#
+            .to_string(),
+        r#"{"kty":"OKP","crv":"Ed25519"}"#.to_string(),
         format!(r#"{{"kty":"EC","crv":"P-256","x":"{RFC7515_A3_X}"}}"#),
         format!(r#"{{"kty":"EC","x":"{RFC7515_A3_X}","y":"{RFC7515_A3_Y}"}}"#),
         // Not a JWK at all.
@@ -630,14 +661,25 @@ fn jwk_parsing_rejects_unusable_keys() {
         assert_eq!(Jwk::from_json(text), Err(JwtError::InvalidKey), "{text}");
     }
 
-    let unsupported = [
+    // Now supported: other RSA algorithms, pinned by `alg`, and Ed25519.
+    for text in [
         rsa(r#","alg":"RS384""#),
         rsa(r#","alg":"PS256""#),
+        r#"{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#
+            .to_string(),
+    ] {
+        assert!(Jwk::from_json(&text).is_ok(), "{text}");
+    }
+
+    let unsupported = [
         rsa(r#","alg":"RSA-OAEP""#),
         rsa(r#","alg":"HS256""#),
+        rsa(r#","alg":"ES256""#),
         ec(r#","alg":"RS256""#),
-        format!(r#"{{"kty":"EC","crv":"P-384","x":"{RFC7515_A3_X}","y":"{RFC7515_A3_Y}"}}"#),
-        r#"{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#
+        ec(r#","alg":"ES384""#),
+        format!(r#"{{"kty":"EC","crv":"secp256k1","x":"{RFC7515_A3_X}","y":"{RFC7515_A3_Y}"}}"#),
+        r#"{"kty":"OKP","crv":"Ed448","x":"AQAB"}"#.to_string(),
+        r#"{"kty":"OKP","crv":"X25519","x":"hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo"}"#
             .to_string(),
         r#"{"kty":"oct","k":"AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow"}"#
             .to_string(),
@@ -707,10 +749,11 @@ fn mixed_jwks_json() -> String {
 #[test]
 fn jwks_parses_and_skips_unsupported_entries() {
     let jwks = Jwks::from_json(&mixed_jwks_json()).unwrap();
-    assert_eq!(jwks.len(), 4);
-    assert_eq!(jwks.skipped(), 5);
+    assert_eq!(jwks.len(), 5);
+    assert_eq!(jwks.skipped(), 4);
     assert!(!jwks.is_empty());
-    assert_eq!(jwks.keys().len(), 4);
+    assert_eq!(jwks.keys().len(), 5);
+    assert_eq!(jwks.find("ed").unwrap().key_type(), KeyType::Ed25519);
     assert_eq!(jwks.find("rsa-1").unwrap().key_type(), KeyType::Rsa);
     assert_eq!(jwks.find("ec-1").unwrap().key_type(), KeyType::EcP256);
     assert!(jwks.find("enc-1").is_none());
@@ -783,12 +826,18 @@ struct JwksEndpoint {
     body: Mutex<String>,
     status: AtomicUsize,
     hits: AtomicUsize,
+    /// Milliseconds to wait before answering.
+    delay_ms: AtomicUsize,
 }
 
 impl HttpHandler for JwksEndpoint {
     fn handle(&self, _req: Request) -> BoxFuture<'_, HttpResponse> {
         Box::pin(async move {
             self.hits.fetch_add(1, Ordering::SeqCst);
+            let delay = self.delay_ms.load(Ordering::SeqCst) as u64;
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             let status = StatusCode(self.status.load(Ordering::SeqCst) as u16);
             HttpResponse::new(status)
                 .header("content-type", "application/json")
@@ -802,6 +851,7 @@ async fn spawn_endpoint(body: String) -> (Arc<JwksEndpoint>, String) {
         body: Mutex::new(body),
         status: AtomicUsize::new(200),
         hits: AtomicUsize::new(0),
+        delay_ms: AtomicUsize::new(0),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/jwks.json", listener.local_addr().unwrap());
@@ -828,7 +878,7 @@ fn rsa_and_ec_jwks() -> String {
 #[tokio::test]
 async fn remote_jwks_fetches_once_and_caches() {
     let (endpoint, url) = spawn_endpoint(rsa_only_jwks()).await;
-    let remote = RemoteJwks::new(url);
+    let remote = RemoteJwks::new(url).allow_insecure_http(true);
     for _ in 0..5 {
         let claims = remote
             .verify(OPENSSL_RSA_TOKEN, &Validation::new())
@@ -850,7 +900,7 @@ async fn remote_jwks_fetches_once_and_caches() {
 #[tokio::test]
 async fn remote_jwks_concurrent_first_use_shares_one_fetch() {
     let (endpoint, url) = spawn_endpoint(rsa_only_jwks()).await;
-    let remote = Arc::new(RemoteJwks::new(url));
+    let remote = Arc::new(RemoteJwks::new(url).allow_insecure_http(true));
     let mut tasks = Vec::new();
     for _ in 0..16 {
         let remote = remote.clone();
@@ -867,7 +917,9 @@ async fn remote_jwks_concurrent_first_use_shares_one_fetch() {
 #[tokio::test]
 async fn remote_jwks_refetches_on_unknown_kid_after_rotation() {
     let (endpoint, url) = spawn_endpoint(rsa_only_jwks()).await;
-    let remote = RemoteJwks::new(url).min_refresh_interval(Duration::ZERO);
+    let remote = RemoteJwks::new(url)
+        .allow_insecure_http(true)
+        .min_refresh_interval(Duration::ZERO);
     assert!(remote
         .verify(OPENSSL_RSA_TOKEN, &Validation::new())
         .await
@@ -893,7 +945,7 @@ async fn remote_jwks_refetches_on_unknown_kid_after_rotation() {
 async fn remote_jwks_rate_limits_refetches_for_unknown_kids() {
     let (endpoint, url) = spawn_endpoint(rsa_only_jwks()).await;
     // The default 30 s minimum spacing applies.
-    let remote = RemoteJwks::new(url);
+    let remote = RemoteJwks::new(url).allow_insecure_http(true);
     assert!(remote.get().await.is_ok());
     for _ in 0..20 {
         assert_eq!(
@@ -911,6 +963,7 @@ async fn remote_jwks_rate_limits_refetches_for_unknown_kids() {
 async fn remote_jwks_refreshes_after_the_interval() {
     let (endpoint, url) = spawn_endpoint(rsa_only_jwks()).await;
     let remote = RemoteJwks::new(url)
+        .allow_insecure_http(true)
         .refresh_interval(Duration::from_millis(40))
         .min_refresh_interval(Duration::ZERO);
     assert_eq!(remote.get().await.unwrap().len(), 1);
@@ -931,6 +984,7 @@ async fn remote_jwks_refreshes_after_the_interval() {
 async fn remote_jwks_keeps_serving_the_cached_set_when_refresh_fails() {
     let (endpoint, url) = spawn_endpoint(rsa_only_jwks()).await;
     let remote = RemoteJwks::new(url)
+        .allow_insecure_http(true)
         .refresh_interval(Duration::from_millis(20))
         .min_refresh_interval(Duration::ZERO);
     assert!(remote
@@ -962,7 +1016,9 @@ async fn remote_jwks_keeps_serving_the_cached_set_when_refresh_fails() {
 async fn remote_jwks_first_fetch_failure_is_an_error() {
     let (endpoint, url) = spawn_endpoint(rsa_only_jwks()).await;
     endpoint.status.store(500, Ordering::SeqCst);
-    let remote = RemoteJwks::new(url).min_refresh_interval(Duration::ZERO);
+    let remote = RemoteJwks::new(url)
+        .allow_insecure_http(true)
+        .min_refresh_interval(Duration::ZERO);
     match remote.verify(OPENSSL_RSA_TOKEN, &Validation::new()).await {
         Err(JwtError::KeyFetch(reason)) => assert!(reason.contains("500"), "{reason}"),
         other => panic!("expected a fetch error, got {other:?}"),
@@ -976,15 +1032,166 @@ async fn remote_jwks_first_fetch_failure_is_an_error() {
 
     // An oversized body is refused.
     let (_endpoint, url) = spawn_endpoint(rsa_and_ec_jwks()).await;
-    let tiny = RemoteJwks::new(url).max_response_bytes(64);
+    let tiny = RemoteJwks::new(url)
+        .allow_insecure_http(true)
+        .max_response_bytes(64);
     assert!(matches!(tiny.get().await, Err(JwtError::KeyFetch(_))));
 
     // Nothing listening / not a URL.
     let dead = RemoteJwks::new("http://127.0.0.1:1/jwks.json")
+        .allow_insecure_http(true)
         .with_client(Client::new().with_timeout(Some(Duration::from_secs(5))));
     assert!(matches!(dead.get().await, Err(JwtError::KeyFetch(_))));
     assert!(matches!(
         RemoteJwks::new("not a url").get().await,
         Err(JwtError::KeyFetch(_))
     ));
+}
+
+/// SEC-5: plain-http key-set and issuer URLs need an explicit opt-in.
+#[tokio::test]
+async fn remote_jwks_refuses_plain_http_without_the_opt_in() {
+    let (endpoint, url) = spawn_endpoint(rsa_only_jwks()).await;
+    let remote = RemoteJwks::new(url.clone());
+    match remote.get().await {
+        Err(JwtError::KeyFetch(reason)) => assert!(reason.contains("https"), "{reason}"),
+        other => panic!("expected a fetch error, got {other:?}"),
+    }
+    let issuer = url.trim_end_matches("/jwks.json").to_string();
+    let discovered = RemoteJwks::from_issuer(issuer);
+    assert!(matches!(
+        discovered.discover().await,
+        Err(JwtError::KeyFetch(_))
+    ));
+    assert!(matches!(
+        discovered
+            .verify(OPENSSL_RSA_TOKEN, &Validation::new())
+            .await,
+        Err(JwtError::KeyFetch(_))
+    ));
+    // Nothing was sent.
+    assert_eq!(endpoint.hits.load(Ordering::SeqCst), 0);
+    // With the opt-in the same URL works.
+    assert!(RemoteJwks::new(url)
+        .allow_insecure_http(true)
+        .get()
+        .await
+        .is_ok());
+}
+
+/// SEC-4: a refresh in flight does not block callers that can use the
+/// cached set, whether it was started by the refresh interval or by an
+/// unknown `kid`.
+#[tokio::test]
+async fn remote_jwks_serves_the_cached_set_while_a_refresh_is_in_flight() {
+    let (endpoint, url) = spawn_endpoint(rsa_only_jwks()).await;
+    let remote = Arc::new(
+        RemoteJwks::new(url.clone())
+            .allow_insecure_http(true)
+            .refresh_interval(Duration::from_millis(50))
+            .min_refresh_interval(Duration::ZERO),
+    );
+    assert!(remote.get().await.is_ok());
+    endpoint.delay_ms.store(2_000, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // The set is due for a refresh; the first caller starts it and waits.
+    let refreshing = {
+        let remote = remote.clone();
+        tokio::spawn(async move { remote.get().await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(endpoint.hits.load(Ordering::SeqCst), 2, "refresh started");
+    // A known-kid token verifies against the cached set meanwhile.
+    let quick = tokio::time::timeout(
+        Duration::from_millis(1_000),
+        remote.verify(OPENSSL_RSA_TOKEN, &Validation::new()),
+    )
+    .await
+    .expect("verification waited for the refresh");
+    assert!(quick.is_ok(), "{quick:?}");
+    assert!(refreshing.await.unwrap().is_ok());
+
+    // An unknown kid starts a (slow) fetch; known-kid tokens do not wait.
+    let fresh = Arc::new(
+        RemoteJwks::new(url)
+            .allow_insecure_http(true)
+            .min_refresh_interval(Duration::ZERO),
+    );
+    endpoint.delay_ms.store(0, Ordering::SeqCst);
+    assert!(fresh.get().await.is_ok());
+    endpoint.delay_ms.store(2_000, Ordering::SeqCst);
+    let unknown = {
+        let fresh = fresh.clone();
+        tokio::spawn(async move {
+            fresh
+                .verify(OPENSSL_EC_TOKEN_PLAIN, &Validation::new())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let quick = tokio::time::timeout(
+        Duration::from_millis(1_000),
+        fresh.verify(OPENSSL_RSA_TOKEN, &Validation::new()),
+    )
+    .await
+    .expect("verification waited for the unknown-kid fetch");
+    assert!(quick.is_ok(), "{quick:?}");
+    assert_eq!(unknown.await.unwrap(), Err(JwtError::UnknownKey));
+}
+
+/// SEC-6: a cached set is served while refreshes fail only up to
+/// `max_stale` past its refresh interval.
+#[tokio::test]
+async fn remote_jwks_stops_serving_a_set_older_than_max_stale() {
+    let (endpoint, url) = spawn_endpoint(rsa_only_jwks()).await;
+    let remote = RemoteJwks::new(url)
+        .allow_insecure_http(true)
+        .refresh_interval(Duration::from_millis(30))
+        .max_stale(Duration::from_millis(150))
+        .min_refresh_interval(Duration::ZERO);
+    assert!(remote
+        .verify(OPENSSL_RSA_TOKEN, &Validation::new())
+        .await
+        .is_ok());
+    endpoint.status.store(503, Ordering::SeqCst);
+
+    // Stale, within the bound: the refresh fails, the cached keys still work.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(remote
+        .verify(OPENSSL_RSA_TOKEN, &Validation::new())
+        .await
+        .is_ok());
+    // Past the bound: the fetch error is returned.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    match remote.verify(OPENSSL_RSA_TOKEN, &Validation::new()).await {
+        Err(JwtError::KeyFetch(reason)) => assert!(reason.contains("503"), "{reason}"),
+        other => panic!("expected a fetch error, got {other:?}"),
+    }
+    // Recovery is immediate once the endpoint is back.
+    endpoint.status.store(200, Ordering::SeqCst);
+    assert!(remote
+        .verify(OPENSSL_RSA_TOKEN, &Validation::new())
+        .await
+        .is_ok());
+
+    // While backing off, a set past the bound is not served either.
+    let backing_off = RemoteJwks::new(remote.discover().await.unwrap())
+        .allow_insecure_http(true)
+        .refresh_interval(Duration::from_millis(30))
+        .max_stale(Duration::from_millis(30))
+        .min_refresh_interval(Duration::from_secs(3600));
+    assert!(backing_off.get().await.is_ok());
+    endpoint.status.store(503, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(matches!(
+        backing_off.get().await,
+        Err(JwtError::KeyFetch(_))
+    ));
+    let hits = endpoint.hits.load(Ordering::SeqCst);
+    assert!(matches!(
+        backing_off.get().await,
+        Err(JwtError::KeyFetch(_))
+    ));
+    assert_eq!(endpoint.hits.load(Ordering::SeqCst), hits, "backed off");
 }

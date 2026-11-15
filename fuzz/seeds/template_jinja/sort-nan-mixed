@@ -1,0 +1,1 @@
+{% set nan = 'nan'|float %}{{ [nan, 21, 7, nan, 3, 1e999, -1e999, 1e999 - 1e999]|sort }}{{ {'a': nan, 'b': 1, 'c': -1}|dictsort(by='value') }}{{ [[1, nan], [1, 'x'], [0]]|sort }}{{ [1, 'a']|sort }}

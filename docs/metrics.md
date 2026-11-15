@@ -31,9 +31,9 @@ operations — no lock per update once you hold the handle.
 
 ```toml
 [dependencies]
-ferroly = { version = "0.5", features = ["metrics"] }
+ferroly = { version = "0.6", features = ["metrics"] }
 # with the router integration:
-ferroly = { version = "0.5", features = ["turbo", "metrics"] }
+ferroly = { version = "0.6", features = ["turbo", "metrics"] }
 ```
 
 ## Quick start
@@ -147,7 +147,7 @@ assert!(reg.encode().contains("payload_bytes_bucket{le=\"1024\"} 1"));
 | `remove(name, labels) -> bool` | Remove one series. |
 | `reset()` | Zero every instrument, keep all registrations (cached handles stay attached). |
 | `clear()` | Remove every family and collector and zero the diagnostic counters. |
-| `register_collector(f)` / `register_process_collector()` | See [Collectors](#collectors-and-process-metrics). |
+| `register_collector(f)` / `register_collector_while(f)` / `register_process_collector()` / `collector_count()` | See [Collectors](#collectors-and-process-metrics). |
 
 Each distinct **label set** under a name is its own time series. Repeated calls
 with the same name + labels return the same instrument, so you can fetch a handle
@@ -313,23 +313,58 @@ assert!(reg.encode().contains("queue_depth 3"));
 
 A collector that itself calls `encode()` does not re-run the collectors.
 
+`register_collector_while(|reg| -> bool)` registers a collector with a limited
+life: it is removed the first time it returns `false`, typically once the object
+it mirrors through a `Weak` is gone, so short-lived sources do not leave a
+callback that runs on every scrape forever. `collector_count()` reports how
+many are registered.
+
 `register_process_collector()` (opt-in, idempotent) adds:
 
-| Metric | Type | Platforms |
-|---|---|---|
-| `process_start_time_seconds` | gauge | all — off Linux this is the moment the collector was first registered, a close approximation when metrics are set up at startup |
-| `process_uptime_seconds` | gauge | all |
-| `process_cpu_seconds_total` | counter | Linux |
-| `process_resident_memory_bytes` | gauge | Linux |
-| `process_virtual_memory_bytes` | gauge | Linux |
-| `process_threads` | gauge | Linux |
-| `process_open_fds` | gauge | Linux |
-| `process_max_fds` | gauge | Linux (omitted when the limit is `unlimited`) |
+| Metric | Type | Linux | macOS | Windows | Elsewhere |
+|---|---|---|---|---|---|
+| `process_start_time_seconds` | gauge | yes | yes | yes | approximated (below) |
+| `process_uptime_seconds` | gauge | yes | yes | yes | yes |
+| `process_cpu_seconds_total` | counter | yes | yes | yes | — |
+| `process_resident_memory_bytes` | gauge | yes | yes | yes (working set) | — |
+| `process_virtual_memory_bytes` | gauge | yes | yes | yes (committed private memory) | — |
+| `process_open_fds` | gauge | yes | yes | yes (open handles) | — |
+| `process_threads` | gauge | yes | yes | — | — |
+| `process_max_fds` | gauge | yes (omitted when unlimited) | yes (omitted when unlimited) | — | — |
 
-The Linux values are parsed from `/proc/self/{stat,status,fd,limits}` and
-`/proc/stat` with plain `std::fs` — no `unsafe`, no dependency. CPU time and
-start time assume the standard 100 Hz `USER_HZ` clock tick. A value that cannot
-be read is simply omitted; on other platforms only the first two are emitted.
+Where the values come from:
+
+- **Linux:** `/proc/self/{stat,status,fd,limits}` and `/proc/stat`, read with plain
+  `std::fs`. CPU time and start time assume the standard 100 Hz `USER_HZ` clock tick.
+- **macOS:** `getrusage(RUSAGE_SELF)` (CPU time), `proc_pidinfo` with
+  `PROC_PIDTASKINFO` (resident and virtual size, threads) and `PROC_PIDTBSDINFO`
+  (start time), `getrlimit(RLIMIT_NOFILE)` (the soft limit) and a listing of `/dev/fd`
+  (open descriptors).
+- **Windows:** `GetProcessTimes` (CPU time, start time), `K32GetProcessMemoryInfo`
+  (`WorkingSetSize` as resident memory, `PagefileUsage` — the committed private bytes —
+  as virtual memory) and `GetProcessHandleCount` (open handles, which include more than
+  files). Windows has no per-process descriptor limit, and a thread count needs a
+  process snapshot, so those two are not reported.
+- **Elsewhere** only the start time and uptime are emitted, and the start time is the
+  moment the collector was first registered — a close approximation when metrics are
+  set up at startup.
+
+The macOS and Windows values are read through a few `extern` declarations of the
+operating system's own C API, kept in one small audited `unsafe` module
+(`metrics/process.rs`, `mod ffi`); no dependency is added. A value that cannot be read
+is simply omitted.
+
+### Metrics from other modules
+
+These modules publish into a `Registry` on request:
+
+- **`clients` circuit breakers** — `CircuitBreaker::export_metrics(&reg, name)` /
+  `CircuitBreakerRegistry::export_metrics(&reg)` add a collector for the
+  `circuit_breaker_*` families ([clients](clients.md#exporting-to-ferrolymetrics-feature-metrics)).
+- **`ws` connections** — `ws::MetricsObserver::new(&reg)` records the `ws_*` families
+  ([ws](ws.md#metricsobserver-feature-metrics)).
+- **`turbo`** — `Router::metrics` / `metrics_in(&reg)` record RED metrics
+  ([turbo](turbo.md)).
 
 ### The process-global registry
 

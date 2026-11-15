@@ -57,12 +57,22 @@ The parsers that read untrusted input have `cargo-fuzz` targets under `fuzz/`
 (run weekly in CI) and an always-on generative suite in
 `crates/ferroly/tests/codec_fuzz.rs`. A new parser needs both.
 
+Other CI jobs you can run locally: `cargo check -p ferroly --target
+i686-unknown-linux-gnu --features full` (32-bit), `cargo test --manifest-path
+ci/rt-consumer/Cargo.toml` (`ferroly::rt` in a crate without tokio), and the
+`Interop` workflow's scripts — `interop/h2spec.sh` (needs an `h2spec` binary) and
+`interop/grpc-go.sh` (needs Go), which check the HTTP/2 server against h2spec and
+the gRPC stack against grpc-go in both directions. `interop/go-http.sh` (needs Go)
+drives the HTTP/2 server with Go's `net/http` client.
+
 ## Versioning & releases (please read)
 
-**Every pull request that changes the published crates (anything under `crates/`)
-must carry a version bump** — CI enforces this via the `version-guard` job, and a red
-check there is almost always one of the steps below. PRs that touch only CI, docs
-outside the crates, or the lockfile are exempt: they release nothing.
+**Every pull request that changes the published crates (anything under `crates/`, or
+the root `Cargo.toml`, whose `[workspace.package]` and `[workspace.dependencies]` go
+into both published manifests) must carry a version bump** — CI enforces this via the
+`version-guard` job, and a red check there is almost always one of the steps below.
+PRs that touch only CI, docs outside the crates, or the lockfile are exempt: they
+release nothing.
 
 1. **Bump the crate version** in the root `Cargo.toml` under `[workspace.package]`.
    The crate is pre-1.0, so:
@@ -73,12 +83,167 @@ outside the crates, or the lockfile are exempt: they release nothing.
 3. **Add a matching `## [<version>]` section to `CHANGELOG.md`** describing your
    change. `version-guard` fails if the version has no changelog entry
    (`## [Unreleased]` does not count).
-4. **Do not create the git tag.** The `v<version>` tag is created automatically, on the
-   commit that introduced the version, when your PR merges to `main`. A version that has *already* been tagged is rejected —
-   that is the signal to bump again.
+4. **Do not create the git tag.** The `v<version>` tag is created automatically when
+   your PR merges to `main`, on the commit the merge put there (the squash or merge
+   commit, or the last commit of a rebase merge). A version that has *already* been
+   tagged is rejected — that is the signal to bump again.
+
+`version-guard` runs `.github/scripts/check-release-version.sh`, the same check that
+tag-on-merge and the publish workflow run: both crates carry the version, ferroly's
+`ferroly-derive` requirement in `[workspace.dependencies]` is that version, and the
+changelog has its entry. Run it locally with `.github/scripts/check-release-version.sh
+<version>`.
 
 After bumping, run `cargo build --features full --locked` so `Cargo.lock` picks up the
 new version, and commit the updated lockfile.
+
+### Publishing to crates.io
+
+Contributors don't publish anything: merging a version bump to `main` does it. The
+rest of this section is for maintainers.
+
+**What happens on a release.** `tag-on-merge.yml` creates the `v<version>` tag and
+calls the `Publish to crates.io` workflow (`.github/workflows/publish.yml`) for it.
+That workflow has no tag-push trigger: for a tag push GitHub would run the workflow
+file from the tagged commit, which could be any commit with its own copy of the
+checks. It only runs from `main` (a merge, or *Run workflow*), so its checks are
+always main's. It runs:
+
+1. **verify** (no credentials):
+   - the run is from `main`, and the tag is `v<semver>`;
+   - the tagged commit is on `main`, and passes `check-release-version.sh` (the copy
+     on `main`, not the tagged tree's): both crates and ferroly's requirement on
+     ferroly-derive carry the tag's version, and `CHANGELOG.md` has its entry;
+   - it looks each crate up in the crates.io sparse index and runs `cargo publish
+     --dry-run --locked` for those not yet published. When both are new this is one
+     multi-package dry-run (`-p ferroly-derive -p ferroly`): cargo packages
+     ferroly-derive into a local overlay registry and builds ferroly against it, so
+     ferroly is verified fully even though its derive crate at that version is not
+     on crates.io yet. (A plain `cargo publish --dry-run -p ferroly`, and even
+     `cargo package --no-verify -p ferroly`, fail at that point: neither can resolve
+     `ferroly-derive = "^<version>"`.);
+   - the `crates-io` environment exists, has required reviewers, and deploys from
+     the branch `main` only (see *Repository settings*). GitHub creates a missing
+     environment on first use with no protection at all, so the run stops here
+     instead.
+2. **publish**, in the protected `crates-io` environment, so it waits for a
+   reviewer's approval. It checks out the exact commit `verify` checked (by SHA) and
+   first confirms the tag still points there; a tag moved in between stops the run
+   with nothing uploaded. Then `cargo publish --no-verify -p ferroly-derive` (the
+   build already ran in `verify`, without credentials), polls the sparse index
+   (every 10 s, for up to 10 minutes) until it serves that version, and `cargo
+   publish --no-verify -p ferroly`. A crate whose version is already in the index is
+   skipped, so re-running the workflow is always safe; when both are already there
+   the job (and its approval prompt) is skipped.
+3. **drift**: the `crates.io drift` check below, for the tag just published.
+
+**Publishing an existing tag** (a failed or never-approved run, or a release from
+before this workflow existed): Actions → *Publish to crates.io* → *Run workflow*,
+branch **`main`**, with the tag (for example `v0.5.0`) in the *tag* input. Any
+`v<version>` tag on `main` works, including ones whose tree predates the workflow.
+
+**Backlog: 0.4.0 and 0.5.0 are not on crates.io.** Both are tagged on `main`
+(`v0.4.0`, `v0.5.0`), but crates.io stops at 0.3.2. Once the environment below is set
+up, publish them with the dispatch input, oldest first so crates.io's newest version
+ends up the newest release:
+
+1. *Run workflow* on `main` with tag `v0.4.0` (optional; it keeps crates.io's version
+   history complete); approve it.
+2. *Run workflow* on `main` with tag `v0.5.0`; approve it.
+3. Then any newer tag (`v0.6.0` once merged) the same way, unless its merge already
+   published it.
+
+Until then the daily drift check is red and names both tags.
+
+By hand, from a clean checkout of the tag, with cargo 1.90 or newer (multi-package
+`--dry-run`) and a token in `CARGO_REGISTRY_TOKEN`:
+
+```sh
+git checkout v0.5.0
+cargo publish --dry-run --locked -p ferroly-derive -p ferroly
+cargo publish --locked --no-verify -p ferroly-derive
+# wait until https://index.crates.io/fe/rr/ferroly-derive lists "vers":"0.5.0"
+cargo publish --locked --no-verify -p ferroly
+```
+
+**Drift guard.** `.github/workflows/crates-io-drift.yml` runs daily on `main`, by
+hand, and after every publish run. It asks the crates.io API (User-Agent
+`ferroly-ci`) for both crates:
+
+- after a publish (or by hand with a *tag*): at that tag's version;
+- daily (or by hand without a tag): at every `v*` tag, newest first, down to the
+  newest one that is fully on crates.io, so an older unpublished release is reported
+  too. It also fails when the version on `main` has no tag (tag-on-merge failed or
+  never ran).
+
+The daily run allows a 24-hour grace period for a tag that is still waiting for
+approval; the run after a publish allows none. A failing daily run opens an issue
+titled "crates.io drift: a release is not on crates.io" (or comments on the open one;
+`crates-io-drift-alert.yml`), since GitHub mails a failed schedule only to whoever
+last edited its cron line. Close the issue once the release is published. GitHub
+also disables scheduled workflows after 60 days without repository activity;
+re-enable it under Actions if that happens. The fix for a red drift check is to
+publish the tags it names (above). For an untagged version on `main`, re-run the
+failed `Tag on merge` run of the merge that set the version.
+
+**Repository settings.** Do these before the first publish run; `verify` refuses to
+continue until the environment is protected.
+
+- Settings → Environments → **New environment** `crates-io`, then:
+  - **Required reviewers**: the maintainers who may approve a release (and, ideally,
+    *Prevent self-review*).
+  - **Deployment branches and tags**: *Selected branches and tags*, with exactly one
+    rule: the **branch** `main`. No tag rule: nothing publishes from a tag ref, and
+    `verify` rejects an environment that allows one.
+  - **Credentials**, one of:
+    - *Token* (the default): the **environment** secret `CARGO_REGISTRY_TOKEN`,
+      holding a crates.io API token (crates.io → Account Settings → API Tokens) with
+      an expiry, the **`publish-update` scope only**, and crate scopes limited to
+      **`ferroly` and `ferroly-derive`**. Never add it as a repository secret: the
+      workflows pass no secrets between them, so only the approved `crates-io` job
+      can read it.
+    - *Trusted publishing* (no stored token): on crates.io, for **each** of the two
+      crates, Settings → Trusted Publishing → add a GitHub publisher with owner
+      `nandlabs`, repository `ferroly`, environment `crates-io`, and workflow
+      `publish.yml`; then add a second one, identical but with workflow
+      `tag-on-merge.yml` (crates.io checks the workflow that started the run, and
+      for a merge that is tag-on-merge, which calls `publish.yml`). Then set the
+      environment *variable* `CRATES_IO_TRUSTED_PUBLISHING` to `true`: the publish
+      job exchanges a GitHub OIDC token for a short-lived crates.io token
+      (`rust-lang/crates-io-auth-action`), which is revoked when the job ends. The
+      `CARGO_REGISTRY_TOKEN` secret can then be deleted, and the crates.io token
+      revoked.
+- Merge methods: squash, merge commit and rebase all tag the right commit, so none
+  needs disabling.
+
+**Testing the release workflows.** `.github/tests/test_publish_workflows.py` runs
+the shell in these workflows against throwaway git repositories and a mock crates.io
+and GitHub API on 127.0.0.1 (no network, no credentials). CI's *Release workflow
+tests* job runs it whenever something under `.github/` changes; locally:
+`python3 -I .github/tests/test_publish_workflows.py .`
+
+## Minimum supported Rust version (MSRV)
+
+The MSRV is **Rust 1.75** (`rust-version` in the root `Cargo.toml`). CI's `MSRV (1.75)`
+job builds every feature and runs the whole test suite on it, so tests, doc examples and
+examples must stay within 1.75 as well — no newer std APIs (`File::lock`, `LazyLock`,
+`Option::is_none_or`, …) or syntax.
+
+The policy:
+
+- **Ceiling: stable minus 4.** The MSRV is never newer than the stable release four
+  versions back. Today it is held far lower than that.
+- **Raised only in a minor release** (`0.x` → `0.(x+1)`), with a `CHANGELOG.md` entry —
+  never in a patch release.
+- **Raised immediately when a held-back dependency has an advisory.** Some
+  dependencies are held at old versions because newer ones need newer Rust: `tokio`
+  is held below 1.54 (1.54 needs Rust 1.85), and `zeroize`, `cc` and `find-msvc-tools`
+  are held before edition 2024 (see the `ignore` list in `.github/dependabot.yml`). If
+  one of them gets a security advisory (`cargo deny` checks weekly) whose fix needs a
+  newer Rust, the fix wins: the MSRV is raised in the next release, patch or not.
+- When the MSRV moves, update `rust-version`, the MSRV job's `toolchain:` and
+  `RUSTUP_TOOLCHAIN`, the README badges, and drop the `dependabot.yml` holds it no
+  longer needs.
 
 ## Dependency policy (please read)
 
@@ -86,6 +251,9 @@ Ferroly's defining goal is to be **self-contained**. This is enforced, not aspir
 
 - **The only permitted external runtime dependencies** are `tokio` and the TLS stack
   (`rustls`, `tokio-rustls`, `rustls-pki-types`, `webpki-roots`).
+- **One optional exception:** the `log` facade crate, enabled only by the off-by-default
+  `log-bridge` feature. A bridge into the facade cannot exist without it, and it has no
+  dependencies of its own (the budget script checks that).
 - **Build-time** dependencies are limited to the proc-macro tooling (`proc-macro2`, `syn`,
   `quote`) used by `ferroly-derive`.
 - **New external dependencies are not accepted.** If a feature needs functionality we don't

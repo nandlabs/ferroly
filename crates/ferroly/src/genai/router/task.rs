@@ -63,6 +63,19 @@ pub enum Priority {
     Quality,
 }
 
+impl Priority {
+    /// Parses a priority name as used in configuration (`quality`, `speed`,
+    /// `cost`), ignoring case. `None` for anything else.
+    pub fn parse(name: &str) -> Option<Priority> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "quality" => Priority::Quality,
+            "speed" => Priority::Speed,
+            "cost" => Priority::Cost,
+            _ => return None,
+        })
+    }
+}
+
 /// Bypass routing entirely and target one model (A/B tests, debugging).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pin {
@@ -107,6 +120,14 @@ pub struct Task {
     /// served that key, as long as it is still eligible — useful for prompt
     /// caches and consistent behaviour within a conversation.
     pub sticky_key: Option<String>,
+    /// The tenant the call is made for. When the router (the completion
+    /// router or the [`EmbeddingRouter`](super::EmbeddingRouter)) has a
+    /// [`TenantPolicy`](super::TenantPolicy) for it, the policy restricts the
+    /// eligible models and may set the strategy and priority. A tenant
+    /// without a policy is routed under the router's defaults, or refused
+    /// when the router requires a policy
+    /// ([`RouterBuilder::require_tenant_policy`](super::RouterBuilder::require_tenant_policy)).
+    pub tenant: Option<String>,
 }
 
 impl Task {
@@ -176,6 +197,12 @@ impl Task {
     /// Keeps calls with this key on the same model.
     pub fn sticky_key(mut self, key: impl Into<String>) -> Self {
         self.sticky_key = Some(key.into());
+        self
+    }
+
+    /// Routes the call under the policy of `tenant`.
+    pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
         self
     }
 

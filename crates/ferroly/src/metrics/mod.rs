@@ -119,6 +119,12 @@ impl Counter {
     pub fn get(&self) -> u64 {
         self.v.load(Ordering::Relaxed)
     }
+    /// Sets the counter to `total`, for collectors that mirror a monotonic
+    /// total kept elsewhere (a smaller value reads as a counter reset).
+    #[cfg_attr(not(feature = "clients"), allow(dead_code))]
+    pub(crate) fn set_total(&self, total: u64) {
+        self.v.store(total, Ordering::Relaxed);
+    }
 }
 
 /// A monotonically increasing floating-point counter (for example seconds of
@@ -855,7 +861,8 @@ impl<T: Metric> MetricVec<T> {
 
 // ---- registry ----------------------------------------------------------------
 
-type Collector = Arc<dyn Fn(&Registry) + Send + Sync>;
+/// A registered collector; `false` from it asks to be removed.
+type Collector = Arc<dyn Fn(&Registry) -> bool + Send + Sync>;
 
 /// A collection of metrics, keyed by name and label set, that renders to the
 /// Prometheus (or OpenMetrics) text exposition format.
@@ -1382,19 +1389,68 @@ impl Registry {
     where
         F: Fn(&Registry) + Send + Sync + 'static,
     {
+        lock(&self.collectors).push(Arc::new(move |reg: &Registry| {
+            collector(reg);
+            true
+        }));
+    }
+
+    /// Like [`register_collector`](Self::register_collector), for a collector
+    /// with a limited life: it is removed once it returns `false` (for
+    /// example when the object it mirrors, held through a `Weak`, is gone),
+    /// so short-lived sources do not leave a callback behind on every scrape.
+    ///
+    /// ```
+    /// use std::sync::{Arc, Weak};
+    /// use ferroly::metrics::Registry;
+    ///
+    /// let reg = Registry::new();
+    /// let source = Arc::new(5_i64);
+    /// let weak: Weak<i64> = Arc::downgrade(&source);
+    /// reg.register_collector_while(move |r| match weak.upgrade() {
+    ///     Some(v) => {
+    ///         r.gauge("source_value", "The source.", &[]).set(*v);
+    ///         true
+    ///     }
+    ///     None => false,
+    /// });
+    /// assert!(reg.encode().contains("source_value 5"));
+    /// drop(source);
+    /// reg.encode(); // the collector returns false and is removed
+    /// assert_eq!(reg.collector_count(), 0);
+    /// ```
+    pub fn register_collector_while<F>(&self, collector: F)
+    where
+        F: Fn(&Registry) -> bool + Send + Sync + 'static,
+    {
         lock(&self.collectors).push(Arc::new(collector));
+    }
+
+    /// The number of registered collectors (the process collector counts as
+    /// one).
+    pub fn collector_count(&self) -> usize {
+        lock(&self.collectors).len()
     }
 
     /// Registers the built-in process collector (idempotent). On every encode
     /// it refreshes:
     ///
     /// - `process_start_time_seconds` and `process_uptime_seconds` — on every
-    ///   platform. Off Linux the start time is the moment this module was first
+    ///   platform. On Linux, macOS and Windows the start time is the real
+    ///   process start; elsewhere it is the moment this module was first
     ///   used, which is close to process start when metrics are set up early.
-    /// - On Linux only (read from `/proc/self`): `process_cpu_seconds_total`,
-    ///   `process_resident_memory_bytes`, `process_virtual_memory_bytes`,
-    ///   `process_threads`, `process_open_fds` and `process_max_fds`. Any value
-    ///   that cannot be read is omitted.
+    /// - `process_cpu_seconds_total`, `process_resident_memory_bytes`,
+    ///   `process_virtual_memory_bytes` and `process_open_fds` on Linux
+    ///   (`/proc/self`), macOS (`getrusage`, `proc_pidinfo`, `/dev/fd`) and
+    ///   Windows (`GetProcessTimes`, `K32GetProcessMemoryInfo`,
+    ///   `GetProcessHandleCount`). On Windows the virtual size is the
+    ///   committed private memory (`PagefileUsage`) and the open count is the
+    ///   number of open handles.
+    /// - `process_threads` and `process_max_fds` (the soft `RLIMIT_NOFILE`
+    ///   limit, omitted when unlimited) on Linux and macOS.
+    ///
+    /// Any value that cannot be read is omitted. Other platforms report only
+    /// the start time and uptime.
     pub fn register_process_collector(&self) {
         if !self.process_collector.swap(true, Ordering::Relaxed) {
             process::touch_start();
@@ -1419,8 +1475,14 @@ impl Registry {
         let _reset = Reset;
         // Snapshot first: collectors run without the list lock held.
         let collectors: Vec<Collector> = lock(&self.collectors).clone();
+        let mut finished: Vec<Collector> = Vec::new();
         for collector in collectors {
-            collector(self);
+            if !collector(self) {
+                finished.push(collector);
+            }
+        }
+        if !finished.is_empty() {
+            lock(&self.collectors).retain(|c| !finished.iter().any(|f| Arc::ptr_eq(c, f)));
         }
     }
 

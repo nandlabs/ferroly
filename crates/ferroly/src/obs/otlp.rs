@@ -1,8 +1,16 @@
-//! OTLP/HTTP exporter: ships finished spans to a collector as OTLP JSON.
+//! OTLP exporter: ships finished spans to a collector as OTLP JSON over HTTP
+//! (the default), OTLP protobuf over HTTP (feature `protobuf`) or OTLP/gRPC
+//! (feature `grpc`).
 //!
 //! [`OtlpHttpExporter`] batches spans and `POST`s them to an OTLP `/v1/traces`
-//! endpoint (`Content-Type: application/json`) using the in-house
-//! [`http::Client`](ferroly::http::Client). Because a span ends in a
+//! endpoint (`Content-Type: application/json`, or `application/x-protobuf`
+//! with `OtlpProtocol::HttpProtobuf`) using the in-house
+//! [`http::Client`](ferroly::http::Client), or calls the collector's gRPC
+//! `TraceService/Export` with `OtlpProtocol::Grpc`. The client's TLS trust,
+//! client certificate and proxy are configurable
+//! ([`tls`](OtlpBuilder::tls), [`proxy`](OtlpBuilder::proxy)), or a whole
+//! client can be supplied ([`http_client`](OtlpBuilder::http_client)).
+//! Because a span ends in a
 //! synchronous context, the exporter hands each span to a background task over
 //! a **bounded** queue; the task batches and sends them, so `export` never
 //! blocks and a slow collector cannot grow memory without limit — spans that
@@ -34,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferroly::codec::{json, Value};
-use ferroly::http::{Client, Method, Request};
+use ferroly::http::{Client, ClientTlsConfig, HttpError, Method, Proxy, Request};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::{mpsc, oneshot};
 
@@ -44,6 +52,34 @@ use super::{Exporter, FinishedSpan, Resource, SpanKind, Status};
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// How much of a collector's response body is read before it is abandoned.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// How an [`OtlpHttpExporter`] talks to the collector; set it with
+/// [`OtlpBuilder::protocol`].
+///
+/// Which variants exist depends on the enabled features: `HttpProtobuf`
+/// needs `protobuf`, `Grpc` needs `grpc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum OtlpProtocol {
+    /// OTLP/HTTP with a JSON body (`application/json`) — the default.
+    #[default]
+    HttpJson,
+    /// OTLP/HTTP with a protobuf body (`application/x-protobuf`), sent to
+    /// the same `/v1/traces` URL as JSON. Requires the `protobuf` feature.
+    #[cfg(feature = "protobuf")]
+    HttpProtobuf,
+    /// OTLP/gRPC: a unary call to
+    /// `/opentelemetry.proto.collector.trace.v1.TraceService/Export`. The
+    /// endpoint is the collector's base URL without a path
+    /// (`http://host:4317` for cleartext HTTP/2, or `https://host:4317`).
+    /// Requires the `grpc` feature.
+    #[cfg(feature = "grpc")]
+    Grpc,
+}
+
+/// The gRPC method an OTLP/gRPC export calls.
+#[cfg(feature = "grpc")]
+const GRPC_EXPORT_PATH: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 
 /// Configuration for an [`OtlpHttpExporter`]; create one with
 /// [`OtlpHttpExporter::builder`].
@@ -59,9 +95,54 @@ pub struct OtlpBuilder {
     max_retries: u32,
     retry_backoff: Duration,
     flush_timeout: Duration,
+    protocol: OtlpProtocol,
+    tls: Option<ClientTlsConfig>,
+    proxy: Option<Proxy>,
+    client: Option<Client>,
 }
 
 impl OtlpBuilder {
+    /// The wire protocol (default [`OtlpProtocol::HttpJson`]).
+    pub fn protocol(mut self, protocol: OtlpProtocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// TLS settings for an `https` collector: trusted roots (a private CA),
+    /// a client certificate for mutual TLS, the minimum version. Default:
+    /// the web PKI roots. Ignored when a client is supplied with
+    /// [`http_client`](Self::http_client).
+    ///
+    /// Invalid settings do not fail [`build`](Self::build): every batch then
+    /// fails with the reason, reported in [`OtlpStats::last_error`].
+    pub fn tls(mut self, tls: ClientTlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    /// Sends the exports through a forward proxy (an `https` collector is
+    /// reached through a `CONNECT` tunnel). Default: no proxy. Ignored when a
+    /// client is supplied with [`http_client`](Self::http_client). Over gRPC
+    /// only an `https` collector can be reached through a proxy (HTTP/2 needs
+    /// the tunnel).
+    pub fn proxy(mut self, proxy: Proxy) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
+    /// Sends the exports with `client` instead of one built from
+    /// [`tls`](Self::tls) and [`proxy`](Self::proxy), which are then ignored.
+    /// The client keeps its own settings (interceptors, pool, proxy, TLS);
+    /// the exporter only replaces its response-head timeout with
+    /// [`timeout`](Self::timeout) (see [`Client::with_timeout`]) and bounds
+    /// each export as a whole by the same timeout. Over gRPC the client must
+    /// have HTTP/2 enabled for the endpoint (`ClientBuilder::http2` for
+    /// `https`, `http2_prior_knowledge` for `http`).
+    pub fn http_client(mut self, client: Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
     /// Describes the service that emits the spans (default: a resource with
     /// `service.name` = `unknown_service`).
     pub fn resource(mut self, resource: Resource) -> Self {
@@ -111,16 +192,19 @@ impl OtlpBuilder {
     }
 
     /// How many times a batch is re-sent after a transient failure — a
-    /// transport error, a timeout, or HTTP 429, 502, 503 or 504 (default 3).
-    /// Other responses are not retried.
+    /// transport error other than TLS, a timeout, HTTP 429, 502, 503 or 504,
+    /// or over gRPC the retryable codes of the OTLP specification
+    /// (`RESOURCE_EXHAUSTED` only with a `RetryInfo` detail) (default 3).
+    /// Other responses, and TLS failures on either transport, are not
+    /// retried.
     pub fn max_retries(mut self, retries: u32) -> Self {
         self.max_retries = retries;
         self
     }
 
     /// The pause before the first retry (default 200 ms); it doubles for each
-    /// further retry, up to 30 s. A `Retry-After` header given in seconds
-    /// overrides it.
+    /// further retry, up to 30 s. A `Retry-After` header (seconds or an HTTP
+    /// date) or a gRPC `RetryInfo` delay overrides it.
     pub fn retry_backoff(mut self, backoff: Duration) -> Self {
         self.retry_backoff = backoff;
         self
@@ -142,9 +226,13 @@ impl OtlpBuilder {
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<Control>();
         let counters = Arc::new(Counters::default());
         let flush_timeout = self.flush_timeout;
+        // A transport that cannot be built (invalid TLS options) fails every
+        // batch with the reason, visible in `stats().last_error`.
+        let transport = Transport::build(&self);
         // The exporter's own HTTP calls must not be traced into itself.
         tokio::spawn(super::suppress(run(
             self,
+            transport,
             span_rx,
             ctl_rx,
             Arc::clone(&counters),
@@ -282,6 +370,10 @@ impl OtlpHttpExporter {
             max_retries: 3,
             retry_backoff: Duration::from_millis(200),
             flush_timeout: Duration::from_secs(5),
+            protocol: OtlpProtocol::HttpJson,
+            tls: None,
+            proxy: None,
+            client: None,
         }
     }
 
@@ -389,13 +481,79 @@ impl Exporter for OtlpHttpExporter {
 
 // ---- background task -----------------------------------------------------------
 
+/// What the exports are sent with.
+enum Transport {
+    Http(Client),
+    #[cfg(feature = "grpc")]
+    Grpc(ferroly::grpc::Channel),
+}
+
+/// The transport, or why none could be built (every batch then fails with
+/// that reason).
+type TransportResult = Result<Transport, String>;
+
+impl Transport {
+    fn build(cfg: &OtlpBuilder) -> TransportResult {
+        #[cfg(feature = "grpc")]
+        if cfg.protocol == OtlpProtocol::Grpc {
+            return Self::grpc(cfg);
+        }
+        Ok(Transport::Http(Self::http(cfg, false)?))
+    }
+
+    /// The HTTP client: the supplied one, else one built from the TLS and
+    /// proxy options (`h2`: with HTTP/2 enabled, for gRPC).
+    fn http(cfg: &OtlpBuilder, h2: bool) -> Result<Client, String> {
+        if let Some(client) = &cfg.client {
+            return Ok(client.clone().with_timeout(Some(cfg.timeout)));
+        }
+        let mut builder = Client::builder().timeout(Some(cfg.timeout));
+        if let Some(tls) = &cfg.tls {
+            builder = builder.tls(tls.clone());
+        }
+        if let Some(proxy) = &cfg.proxy {
+            builder = builder.proxy(proxy.clone());
+        }
+        #[cfg(feature = "grpc")]
+        if h2 {
+            builder = builder.http2(true).http2_prior_knowledge(true);
+        }
+        #[cfg(not(feature = "grpc"))]
+        let _ = h2;
+        builder
+            .build()
+            .map_err(|e| format!("cannot build the exporter's HTTP client: {e}"))
+    }
+
+    #[cfg(feature = "grpc")]
+    fn grpc(cfg: &OtlpBuilder) -> TransportResult {
+        use ferroly::grpc::Channel;
+        let invalid = |e: ferroly::grpc::Status| format!("cannot set up the gRPC channel: {e}");
+        let channel = if cfg.client.is_some() || cfg.proxy.is_some() {
+            Channel::from_client(Self::http(cfg, true)?, &cfg.endpoint)
+                .and_then(|builder| builder.timeout(cfg.timeout).build())
+                .map_err(invalid)?
+        } else {
+            let mut builder = Channel::builder(&cfg.endpoint)
+                .map_err(invalid)?
+                .timeout(cfg.timeout);
+            if let Some(tls) = &cfg.tls {
+                builder = builder.tls(tls.clone());
+            }
+            builder.build().map_err(invalid)?
+        };
+        Ok(Transport::Grpc(channel))
+    }
+}
+
 async fn run(
     cfg: OtlpBuilder,
+    transport: TransportResult,
     mut spans: mpsc::Receiver<FinishedSpan>,
     mut control: mpsc::UnboundedReceiver<Control>,
     counters: Arc<Counters>,
 ) {
-    let client = Client::new().with_timeout(Some(cfg.timeout));
+    let client = &transport;
     let mut batch: Vec<FinishedSpan> = Vec::with_capacity(cfg.batch_size.min(1024));
     // The first tick is one full interval away (a plain `interval` fires at
     // once, which would send a needlessly small first batch).
@@ -410,18 +568,18 @@ async fn run(
             biased;
             request = control.recv() => match request {
                 Some(Control::Flush(ack)) => {
-                    let ok = drain(&client, &cfg, &counters, &mut spans, &mut batch).await;
+                    let ok = drain(client, &cfg, &counters, &mut spans, &mut batch).await;
                     ack.send(ok);
                 }
                 Some(Control::Shutdown(ack)) => {
                     spans.close();
-                    let ok = drain(&client, &cfg, &counters, &mut spans, &mut batch).await;
+                    let ok = drain(client, &cfg, &counters, &mut spans, &mut batch).await;
                     ack.send(ok);
                     break;
                 }
                 // Every handle is gone: deliver what is left and stop.
                 None => {
-                    drain(&client, &cfg, &counters, &mut spans, &mut batch).await;
+                    drain(client, &cfg, &counters, &mut spans, &mut batch).await;
                     break;
                 }
             },
@@ -429,16 +587,16 @@ async fn run(
                 Some(span) => {
                     batch.push(span);
                     if batch.len() >= cfg.batch_size {
-                        send_batch(&client, &cfg, &counters, &mut batch).await;
+                        send_batch(client, &cfg, &counters, &mut batch).await;
                     }
                 }
                 None => {
-                    send_batch(&client, &cfg, &counters, &mut batch).await;
+                    send_batch(client, &cfg, &counters, &mut batch).await;
                     break;
                 }
             },
             _ = ticker.tick() => {
-                send_batch(&client, &cfg, &counters, &mut batch).await;
+                send_batch(client, &cfg, &counters, &mut batch).await;
             }
         }
     }
@@ -446,7 +604,7 @@ async fn run(
 
 /// Sends everything already queued; `true` when every batch was accepted.
 async fn drain(
-    client: &Client,
+    client: &TransportResult,
     cfg: &OtlpBuilder,
     counters: &Counters,
     spans: &mut mpsc::Receiver<FinishedSpan>,
@@ -466,7 +624,7 @@ async fn drain(
 struct Failure {
     transient: bool,
     message: String,
-    /// The collector's `Retry-After`, when it gave one in seconds.
+    /// The collector's `Retry-After` (or gRPC `RetryInfo`) delay, if any.
     retry_after: Option<Duration>,
 }
 
@@ -474,7 +632,7 @@ struct Failure {
 /// The batch is released either way, so a broken collector cannot make memory
 /// grow. Returns `true` when the collector accepted it.
 async fn send_batch(
-    client: &Client,
+    client: &TransportResult,
     cfg: &OtlpBuilder,
     counters: &Counters,
     batch: &mut Vec<FinishedSpan>,
@@ -483,13 +641,31 @@ async fn send_batch(
         return true;
     }
     let count = batch.len() as u64;
-    let payload = json::to_string(&otlp_document(&cfg.resource, batch)).into_bytes();
+    let payload = encode_batch(cfg.protocol, &cfg.resource, batch);
     batch.clear();
 
     let mut backoff = cfg.retry_backoff;
     let mut attempt = 0;
     loop {
-        let failure = match post(client, cfg, payload.clone()).await {
+        let outcome = match client {
+            Ok(transport) => {
+                let delivery = deliver(transport, cfg, payload.clone());
+                match tokio::time::timeout(cfg.timeout, delivery).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(Failure {
+                        transient: true,
+                        message: "request failed: timed out".into(),
+                        retry_after: None,
+                    }),
+                }
+            }
+            Err(reason) => Err(Failure {
+                transient: false,
+                message: reason.clone(),
+                retry_after: None,
+            }),
+        };
+        let failure = match outcome {
             Ok(()) => {
                 counters.exported_spans.fetch_add(count, Ordering::Relaxed);
                 counters.sent_batches.fetch_add(1, Ordering::Relaxed);
@@ -515,6 +691,97 @@ async fn send_batch(
     }
 }
 
+/// Encodes a batch for `protocol`.
+fn encode_batch(protocol: OtlpProtocol, resource: &Resource, spans: &[FinishedSpan]) -> Vec<u8> {
+    match protocol {
+        OtlpProtocol::HttpJson => json::to_string(&otlp_document(resource, spans)).into_bytes(),
+        #[cfg(feature = "protobuf")]
+        OtlpProtocol::HttpProtobuf => super::otlp_proto::export_request(resource, spans),
+        #[cfg(feature = "grpc")]
+        OtlpProtocol::Grpc => super::otlp_proto::export_request(resource, spans),
+    }
+}
+
+/// One delivery attempt over `transport`.
+async fn deliver(
+    transport: &Transport,
+    cfg: &OtlpBuilder,
+    payload: Vec<u8>,
+) -> Result<(), Failure> {
+    match transport {
+        Transport::Http(client) => post(client, cfg, payload).await,
+        #[cfg(feature = "grpc")]
+        Transport::Grpc(channel) => grpc_export(channel, cfg, payload).await,
+    }
+}
+
+/// One gRPC `Export` call; `Ok` only for status `OK`.
+#[cfg(feature = "grpc")]
+async fn grpc_export(
+    channel: &ferroly::grpc::Channel,
+    cfg: &OtlpBuilder,
+    payload: Vec<u8>,
+) -> Result<(), Failure> {
+    use super::otlp_proto::RawMessage;
+    let mut request = ferroly::grpc::Request::new(RawMessage(payload));
+    for (name, value) in &cfg.headers {
+        let key = name.to_ascii_lowercase();
+        if let Err(e) = request.metadata_mut().insert(&key, value.clone()) {
+            return Err(Failure {
+                transient: false,
+                message: format!("header {name:?} is not valid gRPC metadata: {e}"),
+                retry_after: None,
+            });
+        }
+    }
+    match channel
+        .unary::<RawMessage, RawMessage>(GRPC_EXPORT_PATH, request)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(status) => {
+            let retry_info = status
+                .details()
+                .and_then(super::otlp_proto::retry_info_delay);
+            Err(Failure {
+                transient: grpc_transient(&status, retry_info.is_some()),
+                message: format!("collector responded with gRPC status {status}"),
+                retry_after: retry_info,
+            })
+        }
+    }
+}
+
+/// Whether a failed `Export` call may be retried: the codes the OTLP
+/// specification lists as retryable, `RESOURCE_EXHAUSTED` only when the
+/// collector sent a `RetryInfo` (the specification's condition), and never a
+/// TLS failure, which retrying does not heal (as on the HTTP path).
+#[cfg(feature = "grpc")]
+fn grpc_transient(status: &ferroly::grpc::Status, has_retry_info: bool) -> bool {
+    use ferroly::grpc::Code;
+    match status.code() {
+        Code::ResourceExhausted => has_retry_info,
+        // The channel reports a transport failure as `UNAVAILABLE`; one from
+        // the TLS handshake carries this crate's "TLS failed" message.
+        Code::Unavailable => !status.message().starts_with("TLS failed"),
+        Code::Cancelled
+        | Code::DeadlineExceeded
+        | Code::Aborted
+        | Code::OutOfRange
+        | Code::DataLoss => true,
+        _ => false,
+    }
+}
+
+/// The `Content-Type` of an OTLP/HTTP request body.
+fn content_type(protocol: OtlpProtocol) -> &'static str {
+    match protocol {
+        #[cfg(feature = "protobuf")]
+        OtlpProtocol::HttpProtobuf => "application/x-protobuf",
+        _ => "application/json",
+    }
+}
+
 /// One `POST`; `Ok` only for a 2xx response.
 async fn post(client: &Client, cfg: &OtlpBuilder, payload: Vec<u8>) -> Result<(), Failure> {
     let mut request = Request::builder(Method::Post, &cfg.endpoint)
@@ -523,7 +790,7 @@ async fn post(client: &Client, cfg: &OtlpBuilder, payload: Vec<u8>) -> Result<()
             message: format!("invalid endpoint {:?}: {e}", cfg.endpoint),
             retry_after: None,
         })?
-        .header("content-type", "application/json");
+        .header("content-type", content_type(cfg.protocol));
     for (name, value) in &cfg.headers {
         request = request.header(name.clone(), value.clone());
     }
@@ -531,16 +798,21 @@ async fn post(client: &Client, cfg: &OtlpBuilder, payload: Vec<u8>) -> Result<()
         .send(request.body(payload).build())
         .await
         .map_err(|e| Failure {
-            transient: true,
+            // An untrusted certificate does not heal by retrying; every other
+            // transport failure may.
+            transient: !matches!(e, HttpError::Tls(_)),
             message: format!("request failed: {e}"),
             retry_after: None,
         })?;
     let status = response.status().as_u16();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    // Seconds or an HTTP date (a date in the past is "now").
     let retry_after = response
         .headers()
         .get("retry-after")
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_secs);
+        .and_then(|v| ferroly::http::parse_retry_after_at(v, now));
     // Read the (small) body so the connection can be reused, but never more
     // than a bounded amount.
     let mut read = 0;
@@ -593,7 +865,7 @@ fn otlp_document(resource: &Resource, spans: &[FinishedSpan]) -> Value {
 }
 
 /// The `SpanKind` enum number (OTLP JSON carries enums as integers).
-fn kind_code(kind: SpanKind) -> i64 {
+pub(super) fn kind_code(kind: SpanKind) -> i64 {
     match kind {
         SpanKind::Internal => 1,
         SpanKind::Server => 2,
@@ -606,7 +878,7 @@ fn kind_code(kind: SpanKind) -> i64 {
 /// Span flags: the W3C trace flags in the low byte (exported spans are
 /// sampled), bit 8 = "the remote-parent bit is meaningful", bit 9 = "the parent
 /// is remote".
-fn span_flags(parent_remote: bool) -> i64 {
+pub(super) fn span_flags(parent_remote: bool) -> i64 {
     0x01 | 0x100 | if parent_remote { 0x200 } else { 0 }
 }
 
@@ -735,31 +1007,8 @@ fn any_value(value: &Value) -> Value {
     Value::Object(vec![(key.into(), inner)])
 }
 
-/// Standard base64 with padding.
-fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        out.push(TABLE[(b[0] >> 2) as usize] as char);
-        out.push(TABLE[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(b[2] & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
+// Standard base64 with padding: the crate's shared implementation.
+use crate::base64::encode as base64;
 
 #[cfg(test)]
 mod tests {

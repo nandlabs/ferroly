@@ -4,10 +4,11 @@
 //! shared between connections, so traffic to one server reveals nothing about
 //! the masks used toward another.
 //!
-//! - On platforms where [`ferroly::hash::random`] works (Unix), the generator
-//!   is seeded with 256 bits from the operating system and the handshake
-//!   nonce is 16 separate OS-random bytes.
-//! - Elsewhere (or if the OS source fails) the seed is a SHA-256 digest over
+//! - On every platform where [`ferroly::hash::random`] works (Unix and
+//!   Windows), the generator is seeded with 256 bits from the operating
+//!   system's CSPRNG and the handshake nonce is 16 separate OS-random bytes.
+//! - Only where there is no OS source (wasm), or if it fails at runtime (a
+//!   sandbox without `/dev/urandom`), is the seed a SHA-256 digest over
 //!   mixed process entropy: wall-clock and monotonic time, stack, heap and
 //!   static addresses, the process id, a counter and several
 //!   `std::collections::hash_map::RandomState` outputs (which the standard
@@ -66,9 +67,14 @@ pub(crate) fn fallback_seed(domain: &[u8]) -> [u8; 32] {
 }
 
 fn seed(domain: &[u8]) -> [u8; 32] {
+    seed_with_source(domain).0
+}
+
+/// A seed and whether it came from the OS CSPRNG (`true`) or the fallback.
+fn seed_with_source(domain: &[u8]) -> ([u8; 32], bool) {
     match random::array::<32>() {
-        Ok(seed) => seed,
-        Err(_) => fallback_seed(domain),
+        Ok(seed) => (seed, true),
+        Err(_) => (fallback_seed(domain), false),
     }
 }
 
@@ -140,6 +146,18 @@ pub(crate) fn unit() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wherever `hash::random` has a source (Unix and Windows), mask seeds
+    /// come from it; the mixed-entropy fallback is only for wasm.
+    #[test]
+    fn mask_seeds_come_from_the_os_csprng_where_there_is_one() {
+        assert_eq!(random::is_supported(), cfg!(any(unix, windows)));
+        if random::is_supported() {
+            let (a, from_os) = seed_with_source(b"mask");
+            assert!(from_os, "the mask seed fell back to process entropy");
+            assert_ne!(a, seed_with_source(b"mask").0);
+        }
+    }
 
     #[test]
     fn generators_are_independent() {

@@ -1,4 +1,4 @@
-//! Connection transport: plain TCP or TLS (via `tokio-rustls`/`ring`), behind a
+//! Connection transport: plain TCP or TLS (via `tokio-rustls`), behind a
 //! boxed I/O object so the rest of the stack is transport-agnostic.
 //!
 //! All TLS configuration is expressed through this module's own types
@@ -6,7 +6,7 @@
 //! no `rustls` type appears in the public API. Certificate verification can be
 //! pointed at different roots but can never be switched off.
 
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -43,13 +43,52 @@ fn protocol_versions(min: TlsVersion) -> &'static [&'static rustls::SupportedPro
     }
 }
 
-/// The crypto provider is named **explicitly** (`ring`) rather than inferred
-/// from the process default. This makes TLS setup deterministic even when
-/// another dependency's feature unification pulls a second provider
-/// (`aws-lc-rs`) into the build — the ambiguous default would otherwise panic
-/// `ClientConfig::builder()` at runtime.
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+/// The message of the error returned when no rustls crypto provider can be
+/// resolved (see [`crypto_provider`]).
+pub(crate) const NO_CRYPTO_PROVIDER: &str = "no rustls CryptoProvider is installed: \
+     install one before using TLS (e.g. \
+     `rustls::crypto::aws_lc_rs::default_provider().install_default()`) \
+     or enable ferroly's `tls-ring` feature";
+
+/// The single resolver of the rustls crypto provider for everything in the
+/// crate that builds a TLS configuration or verifies a signature. In order:
+///
+/// 1. the process-default provider, when the application installed one with
+///    `CryptoProvider::install_default` (this is how `aws-lc-rs`, a FIPS
+///    build or an HSM-backed provider is brought in);
+/// 2. `ring`, when the `tls-ring` feature is enabled (the default);
+/// 3. otherwise `None` — callers turn that into a typed error carrying
+///    [`NO_CRYPTO_PROVIDER`]; nothing here panics.
+///
+/// The provider is named explicitly rather than left to rustls' implicit
+/// default, which panics when feature unification links two backends. The
+/// resolution itself is not cached, and neither are the JWK verifiers nor
+/// (beyond a change of provider) the default client configuration, so a
+/// provider installed after the first https request or JWT verification
+/// takes over from then on. A configuration that was already built — a
+/// `ClientTlsConfig` or `TlsConfig` you built, a running server — keeps the
+/// provider it was built with, so applications still install theirs at
+/// start-up.
+pub(crate) fn crypto_provider() -> Option<Arc<rustls::crypto::CryptoProvider>> {
+    if let Some(installed) = rustls::crypto::CryptoProvider::get_default() {
+        return Some(installed.clone());
+    }
+    #[cfg(feature = "tls-ring")]
+    {
+        static RING: std::sync::OnceLock<Arc<rustls::crypto::CryptoProvider>> =
+            std::sync::OnceLock::new();
+        Some(
+            RING.get_or_init(|| Arc::new(rustls::crypto::ring::default_provider()))
+                .clone(),
+        )
+    }
+    #[cfg(not(feature = "tls-ring"))]
+    None
+}
+
+/// [`crypto_provider`], or [`HttpError::Tls`] when there is none.
+pub(crate) fn provider() -> Result<Arc<rustls::crypto::CryptoProvider>, HttpError> {
+    crypto_provider().ok_or_else(|| HttpError::Tls(NO_CRYPTO_PROVIDER.into()))
 }
 
 fn tls_err(e: impl std::fmt::Display) -> HttpError {
@@ -225,7 +264,7 @@ impl ClientTlsConfig {
                 "no trusted root certificates configured".into(),
             ));
         }
-        let builder = rustls::ClientConfig::builder_with_provider(provider())
+        let builder = rustls::ClientConfig::builder_with_provider(provider()?)
             .with_protocol_versions(protocol_versions(self.min_version))
             .map_err(tls_err)?
             .with_root_certificates(roots);
@@ -240,16 +279,29 @@ impl ClientTlsConfig {
 }
 
 /// The shared default client TLS configuration (web PKI roots, TLS 1.2+),
-/// built once per process.
-pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
-    static DEFAULT: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    DEFAULT
-        .get_or_init(|| {
-            ClientTlsConfig::new()
-                .build()
-                .expect("the default TLS client configuration is valid")
-        })
-        .clone()
+/// built on first use and then shared **for as long as the resolved crypto
+/// provider stays the same**: a process default installed after the first
+/// https request (a FIPS provider installed lazily, say) gets a fresh
+/// configuration built with it instead of the cached `ring` one. Fails
+/// (without caching the failure) only when no crypto provider is available,
+/// so callers resolve it when a TLS connection is actually made, never for
+/// plain-text traffic.
+pub(crate) fn tls_config() -> Result<Arc<rustls::ClientConfig>, HttpError> {
+    type Cached = Option<(
+        Arc<rustls::crypto::CryptoProvider>,
+        Arc<rustls::ClientConfig>,
+    )>;
+    static DEFAULT: RwLock<Cached> = RwLock::new(None);
+    let current = provider()?;
+    if let Some((built_with, config)) = &*DEFAULT.read().unwrap_or_else(PoisonError::into_inner) {
+        if Arc::ptr_eq(built_with, &current) {
+            return Ok(config.clone());
+        }
+    }
+    let config = ClientTlsConfig::new().build()?;
+    let built_with = config.crypto_provider().clone();
+    *DEFAULT.write().unwrap_or_else(PoisonError::into_inner) = Some((built_with, config.clone()));
+    Ok(config)
 }
 
 /// How a TLS server treats client certificates.
@@ -406,11 +458,14 @@ impl TlsConfigBuilder {
         self
     }
 
-    /// Validates the settings and builds the [`TlsConfig`].
+    /// Validates the settings and builds the [`TlsConfig`]. Also fails with
+    /// [`HttpError::Tls`] when no rustls crypto provider is available (the
+    /// `tls-ring` feature is off and the application installed none).
     pub fn build(self) -> Result<TlsConfig, HttpError> {
         let certs = der_chain(&self.cert_chain)?;
         let key = der_key(&self.key)?;
-        let builder = rustls::ServerConfig::builder_with_provider(provider())
+        let provider = provider()?;
+        let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(protocol_versions(self.min_version))
             .map_err(tls_err)?;
         let builder = match &self.client_auth {
@@ -424,7 +479,7 @@ impl TlsConfigBuilder {
                 }
                 let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
                     Arc::new(roots),
-                    provider(),
+                    provider,
                 );
                 let verifier = match self.client_auth {
                     ClientAuth::Optional(_) => verifier.allow_unauthenticated(),
@@ -484,6 +539,13 @@ impl ReloadableTlsConfig {
     }
 }
 
+impl From<TlsConfig> for ReloadableTlsConfig {
+    /// A reloadable handle that starts out serving `tls`.
+    fn from(tls: TlsConfig) -> Self {
+        Self::new(tls)
+    }
+}
+
 /// Splits PEM input into `(label, der_bytes)` pairs (one per `-----BEGIN …-----`
 /// block), decoding the standard-base64 body. Dependency-free.
 pub(crate) fn pem_blocks(pem: &[u8]) -> Vec<(String, Vec<u8>)> {
@@ -502,7 +564,9 @@ pub(crate) fn pem_blocks(pem: &[u8]) -> Vec<(String, Vec<u8>)> {
                 }
                 body.push_str(l);
             }
-            if let Some(der) = base64_std_decode(body.as_bytes()) {
+            // The shared lenient decoder (whitespace allowed; `=` only as
+            // final padding).
+            if let Ok(der) = crate::base64::decode_lenient(body.as_bytes()) {
                 out.push((label, der));
             }
         }
@@ -510,93 +574,79 @@ pub(crate) fn pem_blocks(pem: &[u8]) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Decodes standard (RFC 4648) base64, ignoring whitespace and `=` padding.
-fn base64_std_decode(input: &[u8]) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes: Vec<u8> = input
-        .iter()
-        .copied()
-        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
-        .collect();
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
-        let mut n = 0u32;
-        for &c in chunk {
-            n = (n << 6) | val(c)?;
-        }
-        n <<= 6 * (4 - chunk.len());
-        match chunk.len() {
-            4 => {
-                out.push((n >> 16) as u8);
-                out.push((n >> 8) as u8);
-                out.push(n as u8);
-            }
-            3 => {
-                out.push((n >> 16) as u8);
-                out.push((n >> 8) as u8);
-            }
-            2 => out.push((n >> 16) as u8),
-            _ => return None,
-        }
-    }
-    Some(out)
-}
-
-/// Encodes standard (RFC 4648) base64 with `=` padding.
-pub(crate) fn base64_std_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let n = u32::from(chunk[0]) << 16
-            | u32::from(*chunk.get(1).unwrap_or(&0)) << 8
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
+// Standard (RFC 4648) base64 with `=` padding, for proxy credentials: the
+// crate's shared implementation.
+pub(crate) use crate::base64::encode as base64_std_encode;
 
 /// Wraps an already-accepted TCP stream in a server-side TLS session. Returns
 /// the connection and the client's verified certificate chain (DER, leaf
 /// first; empty when the client presented none).
+#[cfg_attr(not(feature = "ws"), allow(dead_code))]
 pub(crate) async fn accept_tls(
     tcp: TcpStream,
     config: &TlsConfig,
 ) -> Result<(Conn, Vec<Vec<u8>>), HttpError> {
+    let (conn, certs, _) = accept_tls_alpn(tcp, config).await?;
+    Ok((conn, certs))
+}
+
+/// Like [`accept_tls`], also returning the ALPN protocol the handshake
+/// selected (`None` when the client offered none that the config lists).
+pub(crate) async fn accept_tls_alpn(
+    tcp: TcpStream,
+    config: &TlsConfig,
+) -> Result<(Conn, Vec<Vec<u8>>, Option<Vec<u8>>), HttpError> {
     let acceptor = tokio_rustls::TlsAcceptor::from(config.0.clone());
     let stream = acceptor.accept(tcp).await.map_err(tls_err)?;
-    let certs = stream
-        .get_ref()
-        .1
+    let session = stream.get_ref().1;
+    let certs = session
         .peer_certificates()
         .map(|chain| chain.iter().map(|c| c.as_ref().to_vec()).collect())
         .unwrap_or_default();
-    Ok((Box::new(stream), certs))
+    let alpn = session.alpn_protocol().map(<[u8]>::to_vec);
+    Ok((Box::new(stream), certs, alpn))
+}
+
+/// The ALPN identifier of HTTP/2 over TLS.
+#[cfg(feature = "http2")]
+pub(crate) const ALPN_H2: &[u8] = b"h2";
+/// The ALPN identifier of HTTP/1.1.
+#[cfg(feature = "http2")]
+pub(crate) const ALPN_HTTP11: &[u8] = b"http/1.1";
+
+#[cfg(feature = "http2")]
+impl TlsConfig {
+    /// A copy of this configuration that advertises `h2` and `http/1.1` with
+    /// ALPN (preferring `h2`). A client that offers neither still connects
+    /// (and speaks HTTP/1.1).
+    pub(crate) fn with_h2_alpn(&self) -> TlsConfig {
+        let mut engine = (*self.0).clone();
+        engine.alpn_protocols = vec![ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()];
+        TlsConfig(Arc::new(engine))
+    }
+
+    /// Whether two handles share the same engine configuration.
+    pub(crate) fn same_as(&self, other: &TlsConfig) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// A copy of a client configuration that offers `h2` then `http/1.1` with
+/// ALPN.
+#[cfg(feature = "http2")]
+pub(crate) fn with_h2_alpn(tls: &Arc<rustls::ClientConfig>) -> Arc<rustls::ClientConfig> {
+    let mut config = (**tls).clone();
+    config.alpn_protocols = vec![ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()];
+    Arc::new(config)
 }
 
 /// Opens a TCP connection to `host:port` (`host` is a name or a bracket-free
-/// IP literal).
+/// IP literal). A failure is marked as a connect failure
+/// ([`HttpError::is_connect_failure`]).
 pub(crate) async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, HttpError> {
-    let tcp = TcpStream::connect((host, port)).await?;
+    let tcp = TcpStream::connect((host, port))
+        .await
+        .map_err(super::error::connect_failure)?;
     let _ = tcp.set_nodelay(true);
     Ok(tcp)
 }
@@ -610,13 +660,27 @@ pub(crate) async fn tls_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    Ok(tls_handshake_alpn(stream, host, tls).await?.0)
+}
+
+/// Like [`tls_handshake`], also returning the ALPN protocol the server
+/// selected.
+pub(crate) async fn tls_handshake_alpn<S>(
+    stream: S,
+    host: &str,
+    tls: &Arc<rustls::ClientConfig>,
+) -> Result<(Conn, Option<Vec<u8>>), HttpError>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let connector = tokio_rustls::TlsConnector::from(tls.clone());
     let server_name = rustls_pki_types::ServerName::try_from(host.to_string()).map_err(tls_err)?;
     let stream = connector
         .connect(server_name, stream)
         .await
         .map_err(tls_err)?;
-    Ok(Box::new(stream))
+    let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+    Ok((Box::new(stream), alpn))
 }
 
 /// Opens a connection to the URI's host, wrapping in TLS for `https`.
@@ -633,6 +697,22 @@ pub(crate) async fn connect(uri: &Uri, tls: &Arc<rustls::ClientConfig>) -> Resul
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn tcp_connect_errors_are_marked_as_connect_failures() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let err = connect_tcp("127.0.0.1", port).await.unwrap_err();
+        assert!(err.is_connect_failure(), "{err:?}");
+        let HttpError::Io(io) = &err else {
+            panic!("{err:?}")
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::ConnectionRefused);
+        // The same kind raised elsewhere is not a connect failure.
+        let late = HttpError::Io(std::io::ErrorKind::ConnectionRefused.into());
+        assert!(!late.is_connect_failure());
+    }
+
     #[test]
     fn base64_round_trip() {
         for (plain, encoded) in [
@@ -645,8 +725,18 @@ mod tests {
             (&[0xfb, 0xff, 0xfe], "+//+"),
         ] {
             assert_eq!(base64_std_encode(plain), encoded);
-            assert_eq!(base64_std_decode(encoded.as_bytes()).unwrap(), plain);
         }
+    }
+
+    #[test]
+    fn pem_bodies_use_the_shared_lenient_decoder() {
+        let pem = |body: &str| format!("-----BEGIN X-----\n{body}\n-----END X-----\n");
+        let blocks = pem_blocks(pem("Zm9v\nYg==").as_bytes());
+        assert_eq!(blocks, [("X".to_string(), b"foob".to_vec())]);
+        // The old decoder dropped `=` wherever it appeared; padding in the
+        // middle of a body is now rejected.
+        assert!(pem_blocks(pem("Zg==Zm8=").as_bytes()).is_empty());
+        assert!(pem_blocks(pem("Zm9v=Yg").as_bytes()).is_empty());
     }
 
     #[test]

@@ -57,14 +57,8 @@ impl Stub {
 
 fn err_for(o: Outcome) -> GenAiError {
     match o {
-        Outcome::Transient => GenAiError::Api {
-            status: 503,
-            message: "busy".into(),
-        },
-        Outcome::Permanent => GenAiError::Api {
-            status: 400,
-            message: "bad request".into(),
-        },
+        Outcome::Transient => GenAiError::api(503, "busy"),
+        Outcome::Permanent => GenAiError::api(400, "bad request"),
         Outcome::Ok => unreachable!(),
     }
 }
@@ -167,23 +161,16 @@ fn registry_merge_overrides_disables_and_custom() {
 genai:
   routing:
     cost_overrides:
-      -
-        provider: openai
+      - provider: openai
         model: big
         input_cost_per_mtok: 1.0
         output_cost_per_mtok: 2.0
     disabled_models:
-      -
-        provider: openai
-        model: small
+      - {provider: openai, model: small}
     custom_models:
-      -
-        provider: openai
+      - provider: openai
         name: tuned
-        capabilities:
-          - text
-          - chat
-          - json_mode
+        capabilities: [text, chat, json_mode]
         max_input_tokens: 32000
         max_output_tokens: 4096
         input_cost_per_mtok: 0.1
@@ -214,11 +201,9 @@ fn registry_rejects_phantom_custom_model() {
 genai:
   routing:
     custom_models:
-      -
-        provider: nope
+      - provider: nope
         name: x
-        capabilities:
-          - text
+        capabilities: [text]
         max_input_tokens: 1
         max_output_tokens: 1
         input_cost_per_mtok: 0.0
@@ -227,6 +212,149 @@ genai:
     )
     .unwrap();
     assert!(build_registry(&providers, &cfg).is_err());
+}
+
+// ---- YAML form equivalence ----------------------------------------------
+
+/// The `docs/model-router.md` policy example as it was written before the YAML
+/// codec accepted compact items and flow collections (verbose block form).
+const VERBOSE_POLICY: &str = r#"genai:
+  routing:
+    default_strategy: composite
+    fallback_depth: 2
+    rules:
+      -
+        kind: codegen
+        provider: claude
+        model: claude-opus-5-5
+      -
+        tags:
+          - sensitive
+        provider: ollama
+        model: llama3
+    default_model:
+      provider: openai
+      model: gpt-4o-mini
+    cost_overrides:
+      -
+        provider: openai
+        model: gpt-4o
+        input_cost_per_mtok: 2.5
+        output_cost_per_mtok: 10.0
+        cached_input_cost_per_mtok: 1.25
+    rank_overrides:
+      -
+        provider: openai
+        model: gpt-4o-mini
+        quality_rank: 50
+        speed_rank: 90
+    disabled_models:
+      -
+        provider: ollama
+        model: llama2
+    disabled_capabilities:
+      -
+        provider: openai
+        model: gpt-4o-mini
+        capabilities:
+          - vision
+    custom_models:
+      -
+        provider: ollama
+        name: my-finetune
+        capabilities:
+          - text
+          - chat
+        max_input_tokens: 32000
+        max_output_tokens: 4096
+        input_cost_per_mtok: 0.0
+        output_cost_per_mtok: 0.0
+        quality_rank: 40
+        speed_rank: 70
+    cost_staleness_days: 180
+"#;
+
+/// The YAML block that follows `## Configuration (YAML)` in
+/// `docs/model-router.md` (the compact form).
+/// Line endings are normalised: a Windows checkout may turn the doc into CRLF.
+fn documented_policy() -> String {
+    let doc = include_str!("../../../docs/model-router.md").replace("\r\n", "\n");
+    let section = &doc[doc.find("## Configuration (YAML)").expect("section")..];
+    let fence = "```yaml\n";
+    let body = &section[section.find(fence).expect("yaml block") + fence.len()..];
+    body[..body.find("```").expect("block end")].to_string()
+}
+
+#[test]
+fn documented_compact_policy_matches_verbose_form() {
+    let compact = &documented_policy();
+    assert!(
+        compact.contains("- provider: ollama"),
+        "doc example is not compact"
+    );
+    assert!(compact.contains("capabilities: [text, chat]"));
+
+    // Same generic value tree ...
+    let verbose_value = ferroly::codec::yaml::from_str(VERBOSE_POLICY).unwrap();
+    let compact_value = ferroly::codec::yaml::from_str(compact).unwrap();
+    assert_eq!(compact_value, verbose_value);
+
+    // ... and the same parsed routing config, with every section populated.
+    let verbose_cfg = RoutingConfig::from_yaml(VERBOSE_POLICY).unwrap();
+    let compact_cfg = RoutingConfig::from_yaml(compact).unwrap();
+    assert_eq!(compact_cfg, verbose_cfg);
+    assert_eq!(compact_cfg.rules.len(), 2);
+    assert_eq!(compact_cfg.cost_overrides.len(), 1);
+    assert_eq!(compact_cfg.rank_overrides.len(), 1);
+    assert_eq!(compact_cfg.disabled_models.len(), 1);
+    assert_eq!(compact_cfg.disabled_capabilities.len(), 1);
+    assert_eq!(compact_cfg.custom_models.len(), 1);
+    compact_cfg.validate().unwrap();
+}
+
+#[test]
+fn compact_registry_overlay_matches_verbose_form() {
+    let compact = "\
+genai:
+  routing:
+    disabled_models:
+      - {provider: openai, model: small}
+    custom_models:
+      - provider: openai
+        name: tuned
+        capabilities: [text, chat]
+        max_input_tokens: 10
+        max_output_tokens: 10
+        input_cost_per_mtok: 0.0
+        output_cost_per_mtok: 0.0
+";
+    let verbose = "\
+genai:
+  routing:
+    disabled_models:
+      -
+        provider: openai
+        model: small
+    custom_models:
+      -
+        provider: openai
+        name: tuned
+        capabilities:
+          - text
+          - chat
+        max_input_tokens: 10
+        max_output_tokens: 10
+        input_cost_per_mtok: 0.0
+        output_cost_per_mtok: 0.0
+";
+    assert_eq!(
+        ferroly::codec::yaml::from_str(compact).unwrap(),
+        ferroly::codec::yaml::from_str(verbose).unwrap()
+    );
+    assert_eq!(
+        RoutingConfig::from_yaml(compact).unwrap(),
+        RoutingConfig::from_yaml(verbose).unwrap()
+    );
 }
 
 // ---- strategies ----------------------------------------------------------

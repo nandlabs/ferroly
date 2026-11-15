@@ -1,0 +1,1 @@
+{% for k, v in m.items() %}{% if loop.index > 1 %}{% break %}{% endif %}{{ k }}={{ v }}{% continue %}{% endfor %}

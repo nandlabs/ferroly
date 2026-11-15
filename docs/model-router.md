@@ -53,7 +53,8 @@ println!("{}", response.text());
 | `ModelInfo` | per-model facts: capabilities, token limits, quality and speed rank, prices and the date they were correct on |
 | `ProviderSet` | immutable, name-indexed set of providers (no global state) |
 | `ModelRegistry` | provider catalogs **merged** with the config overlay; immutable, hot-reloadable |
-| `Task` | what the call needs: `required` capabilities, per-call budget, `priority`, `kind`, `tags`, optional `pin`, `deadline`, `budget_key`, `sticky_key` |
+| `Task` | what the call needs: `required` capabilities, per-call budget, `priority`, `kind`, `tags`, optional `pin`, `deadline`, `budget_key`, `sticky_key`, `tenant` |
+| `TenantPolicy` | per-tenant allowed providers / models, strategy and priority |
 | `RoutingStrategy` | ranks models for a task (`RuleBased`, `Capability`, `Composite`) |
 | `Route` / `Candidate` | the plan: a `primary` plus ordered `fallbacks` |
 | `RouteDecision` | the trace: chosen, considered, and excluded-with-reason |
@@ -172,9 +173,9 @@ three independent questions:
 
 | Error | Retry the same model | Fall over to the next | Circuit breaker |
 |---|---|---|---|
-| transport failure, connect timeout, `5xx` | yes | yes | failure |
+| could not connect (`GenAiError::Connect`), connect timeout, `5xx` | yes | yes | failure |
 | rate limited (`429`), overloaded (`529`/`503`) | yes — after the provider's `Retry-After` | yes | failure |
-| timeout **after the request was sent** | no | no (unless `fallback_on_timeout`) | failure |
+| transport failure **after connecting**, timeout **after the request was sent** | no | no (unless `fallback_on_timeout`) | failure |
 | unparseable response | no | yes | failure |
 | context length exceeded, unsupported feature | no | yes — another model may fit | ignored |
 | auth (`401`/`403`), validation (`400`/`404`/`422`), content filter | no | **no — routing stops** | **ignored** |
@@ -189,11 +190,14 @@ three independent questions:
   `RouterError::AllRoutesFailed` carrying the last error.
 - **A caller error stops routing.** A different model would fail identically,
   so the error is returned as `RouterError::GenAi`.
-- **Timeouts.** A completion is not idempotent: a response that timed out may
-  still have been generated and billed. It is therefore neither retried nor
-  failed over by default. `RouterBuilder::fallback_on_timeout(true)` opts in to
-  trying the next model. A connect timeout — nothing was sent — is always
-  retried and failed over.
+- **Timeouts and broken connections.** A completion is not idempotent: a
+  response that timed out, or whose connection broke after the request went
+  out, may still have been generated and billed. It is therefore neither
+  retried nor failed over by default. `RouterBuilder::fallback_on_timeout(true)`
+  opts in to trying the next model for both. A failure before anything was
+  sent — a refused connection, a name-resolution or TLS-handshake failure, a
+  connect timeout — is always retried and failed over. A `2xx` stream that
+  ends without sending anything is an unparseable response (failed over).
 
 Options are **clamped** to the chosen model before dispatch (`max_tokens`
 capped to the model's limit; a JSON response format set when the task requires
@@ -360,6 +364,64 @@ has an `AttemptOutcome`: `Succeeded`, `FailedOver`, `Failed`,
 Costs are computed from catalog prices (compiled-in or overridden). They are
 for ranking, budgeting and monitoring — not an invoice.
 
+## Per-tenant policy
+
+`Task::tenant(name)` routes a call under that tenant's `TenantPolicy`:
+
+| Policy part | Effect |
+|---|---|
+| allowed providers / models | only those are eligible: a candidate passes when its provider is allowed or the exact `provider/model` is; every other one is excluded (reason `not allowed for tenant '…'` in the decision trace), and a pin to a model outside the list is `RouterError::NoRoute` |
+| strategy | replaces the router's strategy for the tenant's calls |
+| priority | replaces the task's `Priority` |
+
+A policy without an allow-list (`TenantPolicy::new()`) allows everything;
+`TenantPolicy::deny_all()` is an empty allow-list that allows nothing until
+`allow_provider` / `allow_model` add to it. A tenant without a policy is routed
+under the router's defaults, unless the router is built with
+`RouterBuilder::require_tenant_policy(true)`: then a task naming an unknown
+tenant (a typo, a case difference, a tenant added before its policy) is
+refused with `RouterError::NoRoute`. Turn that on when tenant names come from
+requests. Policies come from code or from configuration:
+
+```rust
+# use ferroly::genai::router::*;
+# fn demo(providers: ProviderSet, registry: std::sync::Arc<dyn ModelRegistry>) {
+let router = RouterBuilder::new(providers, registry)
+    .tenant_policy(
+        "acme",
+        TenantPolicy::new()
+            .allow_provider("ollama")                       // every local model
+            .allow_model("claude", "claude-haiku-5-5")      // plus one hosted one
+            .priority(Priority::Cost),
+    )
+    .build();
+let task = Task::new().tenant("acme");
+# let _ = (router, task);
+# }
+```
+
+```yaml
+genai:
+  routing:
+    tenants:
+      - name: acme
+        allowed_providers: [ollama]
+        allowed_models:
+          - {provider: claude, model: claude-haiku-5-5}
+        strategy: capability            # capability | rule_based | composite
+        priority: cost                  # quality | speed | cost
+```
+
+In configuration, an absent `allowed_providers` / `allowed_models` sets no
+allow-list, while a present one, even `[]`, turns it on: `allowed_providers: []`
+alone allows nothing. A configured tenant is laid over a code-registered one of
+the same name: each part the configuration sets (the allow-list, `strategy`,
+`priority`) replaces the code's, and the parts it leaves out are kept, so an
+entry that only sets `priority` does not drop the code's allow-list. A
+tenant's `rule_based` / `composite` strategy uses the configuration's `rules`
+and `default_model`. Budgets stay per `budget_key` (set it to the tenant name
+to cap a tenant's spend).
+
 ## Sticky routing
 
 `Task::sticky_key(key)` keeps calls with the same key on the model that last
@@ -401,7 +463,7 @@ decision is still logged at debug level.
 Load an operator policy with `RoutingConfig::from_yaml` (read from the
 `genai.routing` section) and build the router from it with
 **`RouterBuilder::from_config`**, which applies all of it: the registry overlay,
-the strategy and the fallback depth.
+the strategy, the fallback depth and the tenant policies.
 
 ```rust,no_run
 # use ferroly::genai::router::*;
@@ -417,48 +479,36 @@ genai:
     default_strategy: composite
     fallback_depth: 2
     rules:
-      -
-        kind: codegen
+      - kind: codegen
         provider: claude
         model: claude-opus-5-5
-      -
-        tags:
-          - sensitive
+      - tags: [sensitive]
         provider: ollama
         model: llama3
     default_model:
       provider: openai
       model: gpt-4o-mini
     cost_overrides:
-      -
-        provider: openai
+      - provider: openai
         model: gpt-4o
         input_cost_per_mtok: 2.5
         output_cost_per_mtok: 10.0
         cached_input_cost_per_mtok: 1.25
     rank_overrides:
-      -
-        provider: openai
+      - provider: openai
         model: gpt-4o-mini
         quality_rank: 50
         speed_rank: 90
     disabled_models:
-      -
-        provider: ollama
-        model: llama2
+      - {provider: ollama, model: llama2}
     disabled_capabilities:
-      -
-        provider: openai
+      - provider: openai
         model: gpt-4o-mini
-        capabilities:
-          - vision
+        capabilities: [vision]
     custom_models:
-      -
-        provider: ollama
+      - provider: ollama
         name: my-finetune
-        capabilities:
-          - text
-          - chat
+        capabilities: [text, chat]
         max_input_tokens: 32000
         max_output_tokens: 4096
         input_cost_per_mtok: 0.0
@@ -480,6 +530,7 @@ genai:
 | `disabled_capabilities` | strip capabilities from a model |
 | `custom_models` | add models (the `provider` must be registered) |
 | `cost_staleness_days` | age after which a compiled-in price is reported (default 180; `0` disables) |
+| `tenants` | per-tenant policies: `name`, `allowed_providers`, `allowed_models`, `strategy`, `priority` (see [Per-tenant policy](#per-tenant-policy)) |
 
 The registry merge order is fixed: base catalogs → cost overrides → rank
 overrides → capability disable → model disable → custom models.
@@ -490,6 +541,8 @@ overrides → capability disable → model disable → custom models.
 - an unknown key anywhere in the `routing` section, or a value of the wrong type;
 - an unknown `default_strategy`, an unknown task `kind`, an unknown capability
   name (in `disabled_capabilities` or `custom_models`);
+- a tenant with an empty or repeated name, an unknown `strategy` or
+  `priority`, or `strategy: rule_based` with no rules;
 - `rules` or `default_model` together with `default_strategy: capability`
   (they would be ignored), or `default_strategy: rule_based` with no rules;
 - a custom model naming an unregistered provider (at registry build).
@@ -498,9 +551,13 @@ overrides → capability disable → model disable → custom models.
 `RoutingConfig::strategy()` builds the configured strategy on its own, and
 `build_registry(&providers, &config)` the registry.
 
-> **YAML note.** ferroly's YAML codec is block-style: write list items with the
-> `-` on its own line followed by the indented mapping (as above), and use block
-> sequences (`- text`) rather than flow style (`[text]`).
+> **YAML note.** The example uses compact sequence items (`- provider: openai`
+> followed by the item's other keys) and single-line flow collections
+> (`[text, chat]`, `{provider: ollama, model: llama2}`). The verbose block form
+> (`-` on its own line, then the indented mapping; `- text` items) decodes to
+> the same config. Flow collections must fit on one line; anchors, aliases and
+> tags are rejected — see the [YAML codec](codec.md#yaml-codec) for the full
+> subset.
 
 ### Stale prices
 
@@ -538,8 +595,29 @@ let resp = router.embed(&task, EmbedRequest::single("", "hello")).await.unwrap()
 
 ## Hot-reload
 
-The registry is immutable; `DefaultRouter::reload(new_registry)` swaps it
-atomically. In-flight routes keep the snapshot they started with.
+**`DefaultRouter::reload_config(&RoutingConfig)`** applies a reloaded
+configuration in full and atomically: the registry overlay, the strategy named
+by `default_strategy` with its `rules` and `default_model`, `fallback_depth`
+and `tenants` — exactly as `RouterBuilder::from_config` applies them to a new
+builder. A key the new configuration leaves out takes its default
+(`fallback_depth` 2; the strategy `capability`, or `composite` when there are
+rules), so a strategy or depth set in code is replaced. Tenant policies
+registered with `RouterBuilder::tenant_policy` are kept, with a configured
+tenant of the same name laid over them. An invalid configuration is refused
+with `RouterError::Config` and the router keeps the previous one.
+
+```rust
+# use ferroly::genai::router::*;
+# fn demo(router: &DefaultRouter, yaml: &str) -> Result<(), RouterError> {
+router.reload_config(&RoutingConfig::from_yaml(yaml)?)?;
+println!("{} with {} fallbacks", router.strategy_name(), router.fallback_depth());
+# Ok(()) }
+```
+
+`DefaultRouter::reload(new_registry)` swaps only the registry and keeps the
+strategy, rules, depth and tenants. Either way, in-flight routes keep the
+snapshot they started with. Circuit breakers, budgets and sticky keys are not
+reset by a reload.
 
 ## Errors
 
@@ -575,7 +653,10 @@ pub enum RouterError {
 - **Budgets are a soft cap** (spend is recorded after the call).
 - **No fallover once a stream has started delivering the answer** (see
   [above](#streaming-and-mid-stream-failure)).
-- **The embedding router** has no breakers, budgets or sticky keys.
+- **The embedding router** has no breakers, budgets or sticky keys. It does
+  apply tenant policies: register them with `EmbeddingRouter::tenant_policy`
+  or `tenant_policies_from(&config)`, and refuse unknown tenants with
+  `require_tenant_policy(true)`.
 
 ## See also
 

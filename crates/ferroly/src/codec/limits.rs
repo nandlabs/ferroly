@@ -36,6 +36,14 @@ pub struct Limits {
     /// (XML: elements; TOML: keys, tables, and array elements) — in one
     /// document. This bounds the memory a small input can expand into.
     pub max_entries: usize,
+    /// Reject an object that repeats a key, instead of keeping every
+    /// occurrence and resolving lookups to the last one. Applies to JSON
+    /// (both the `Value` parser and the streaming decoder) and YAML mappings.
+    /// TOML always rejects a repeated key; XML has no keys to repeat (repeated
+    /// sibling elements are its array form). Off by default, for
+    /// compatibility; turn it on for untrusted input, where two parsers that
+    /// resolve duplicates differently can be made to disagree.
+    pub reject_duplicate_keys: bool,
 }
 
 impl Limits {
@@ -51,6 +59,7 @@ impl Limits {
         max_depth: Self::DEFAULT_MAX_DEPTH,
         max_input_bytes: Self::DEFAULT_MAX_INPUT_BYTES,
         max_entries: Self::DEFAULT_MAX_ENTRIES,
+        reject_duplicate_keys: false,
     };
 
     /// The default budget (same as [`Limits::default`]).
@@ -78,6 +87,26 @@ impl Limits {
         self.max_entries = max_entries;
         self
     }
+
+    /// Returns the budget with duplicate-key rejection on or off (see
+    /// [`reject_duplicate_keys`](Self::reject_duplicate_keys)).
+    ///
+    /// ```
+    /// use ferroly::codec::{json, Limits};
+    ///
+    /// let input = r#"{"role":"user","role":"admin"}"#;
+    /// // Default: kept, and lookups see the last one.
+    /// let v = json::from_str(input).unwrap();
+    /// assert_eq!(v.get("role").and_then(|r| r.as_str()), Some("admin"));
+    /// // Opt-in: an error.
+    /// let strict = Limits::new().with_reject_duplicate_keys(true);
+    /// assert!(json::from_str_with(input, strict).is_err());
+    /// ```
+    #[must_use]
+    pub fn with_reject_duplicate_keys(mut self, reject: bool) -> Self {
+        self.reject_duplicate_keys = reject;
+        self
+    }
 }
 
 impl Default for Limits {
@@ -90,6 +119,7 @@ impl Default for Limits {
 pub(crate) struct Budget {
     max_depth: usize,
     max_entries: usize,
+    reject_duplicate_keys: bool,
     depth: usize,
     entries: usize,
 }
@@ -107,6 +137,7 @@ impl Budget {
         Ok(Budget {
             max_depth: limits.max_depth,
             max_entries: limits.max_entries,
+            reject_duplicate_keys: limits.reject_duplicate_keys,
             depth: 0,
             entries: 0,
         })
@@ -115,6 +146,11 @@ impl Budget {
     /// The configured nesting-depth cap.
     pub(crate) fn max_depth(&self) -> usize {
         self.max_depth
+    }
+
+    /// Whether a repeated object key is an error.
+    pub(crate) fn reject_duplicate_keys(&self) -> bool {
+        self.reject_duplicate_keys
     }
 
     /// Enters a nested container. Paired with [`leave`](Self::leave) on every
@@ -220,9 +256,55 @@ impl KeyIndex {
     }
 }
 
+/// Detects a repeated key among the keys of one object as they are read, for
+/// [`Limits::reject_duplicate_keys`]. Does nothing (and allocates nothing)
+/// when the check is off.
+pub(crate) struct DuplicateKeys {
+    on: bool,
+    keys: Vec<(String, ())>,
+    index: KeyIndex,
+}
+
+impl DuplicateKeys {
+    pub(crate) fn new(on: bool) -> Self {
+        DuplicateKeys {
+            on,
+            keys: Vec::new(),
+            index: KeyIndex::default(),
+        }
+    }
+
+    /// Records `key`; `Err` with a message when it was seen before.
+    pub(crate) fn check(&mut self, key: &str) -> Result<(), String> {
+        if !self.on {
+            return Ok(());
+        }
+        if self.index.find(&self.keys, key).is_some() {
+            let shown: String = key.chars().take(64).collect();
+            return Err(format!("duplicate key {shown:?}"));
+        }
+        self.keys.push((key.to_string(), ()));
+        self.index.inserted(key, self.keys.len() - 1);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_keys_are_found_past_the_index_threshold() {
+        let mut off = DuplicateKeys::new(false);
+        assert!(off.check("a").is_ok() && off.check("a").is_ok());
+        let mut on = DuplicateKeys::new(true);
+        for i in 0..100 {
+            on.check(&format!("k{i}")).unwrap();
+        }
+        assert!(on.check("k3").unwrap_err().contains("\"k3\""));
+        assert!(on.check("k99").is_err());
+        assert!(on.check("k100").is_ok());
+    }
 
     #[test]
     fn line_col_counts_lines_and_characters() {

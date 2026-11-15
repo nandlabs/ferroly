@@ -1,0 +1,32 @@
+// The sample service for the gRPC code-generation tests: one method per RPC
+// shape. `grpc_codegen_golden.rs` keeps `echo_generated.rs` in sync with it.
+syntax = "proto3";
+
+package echo.v1;
+
+// A message to echo.
+message EchoRequest {
+  string message = 1;
+  // How many responses a streaming call sends.
+  int32 repeat = 2;
+}
+
+message EchoResponse {
+  string message = 1;
+  int32 index = 2;
+}
+
+// Echoes messages back, in every RPC shape.
+service Echo {
+  // Returns the message.
+  rpc Unary(EchoRequest) returns (EchoResponse);
+  // Returns the message `repeat` times.
+  rpc ServerStream(EchoRequest) returns (stream EchoResponse);
+  // Joins every message it receives.
+  rpc ClientStream(stream EchoRequest) returns (EchoResponse);
+  // Echoes each message as it arrives.
+  rpc Bidi(stream EchoRequest) returns (stream EchoResponse);
+}
+
+// A service without methods.
+service Nothing {}

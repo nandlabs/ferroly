@@ -30,6 +30,10 @@ const SERVER_CERT: &[u8] = include_bytes!("../src/http/testdata/test_server_cert
 const SERVER_KEY: &[u8] = include_bytes!("../src/http/testdata/test_server_key.pem");
 const CLIENT_CERT: &[u8] = include_bytes!("../src/http/testdata/test_client_cert.pem");
 const CLIENT_KEY: &[u8] = include_bytes!("../src/http/testdata/test_client_key.pem");
+const SERVER2_CERT: &[u8] = include_bytes!("../src/http/testdata/test_server2_cert.pem");
+const SERVER2_KEY: &[u8] = include_bytes!("../src/http/testdata/test_server2_key.pem");
+const SELF_SIGNED_CERT: &[u8] = include_bytes!("../src/http/testdata/self_signed_cert.pem");
+const SELF_SIGNED_KEY: &[u8] = include_bytes!("../src/http/testdata/self_signed_key.pem");
 
 fn close_of(msg: Option<Message>) -> (u16, String) {
     match msg {
@@ -763,6 +767,68 @@ async fn wss_with_mutual_tls_exposes_the_client_certificate() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn wss_certificate_can_be_rotated_without_a_restart() {
+    // Start with a certificate the client does not trust.
+    let tls = TlsConfig::from_pem(SELF_SIGNED_CERT, SELF_SIGNED_KEY)
+        .unwrap()
+        .reloadable();
+    let handle = tls.clone();
+    let server = start(fast_config().tls(tls), echo).await;
+    let url = format!("wss://127.0.0.1:{}/", server.addr.port());
+    let trusted = || fast_options().tls(trust_test_ca());
+
+    let refused = WsClient::dial(&url, trusted()).await;
+    assert!(matches!(refused, Err(WsError::Connect(_))), "{refused:?}");
+
+    // Swap in a certificate from the trusted CA: the very next connection
+    // gets it, with no restart.
+    handle.reload(TlsConfig::from_pem(SERVER_CERT, SERVER_KEY).unwrap());
+    let mut first = WsClient::dial(&url, trusted()).await.unwrap();
+    first.send(Message::text("one")).await.unwrap();
+    assert_eq!(
+        within("echo", first.recv()).await,
+        Some(Message::text("echo: one"))
+    );
+
+    // Rotate again, to another certificate that requires a client
+    // certificate. The established connection keeps working; new ones need
+    // the client identity.
+    handle.reload(
+        TlsConfig::builder()
+            .cert_pem(SERVER2_CERT, SERVER2_KEY)
+            .unwrap()
+            .client_auth_required_pem(CA)
+            .unwrap()
+            .build()
+            .unwrap(),
+    );
+    assert!(WsClient::dial(&url, trusted()).await.is_err());
+    let identity = fast_options().tls(
+        trust_test_ca()
+            .identity_pem(CLIENT_CERT, CLIENT_KEY)
+            .unwrap(),
+    );
+    let mut second = WsClient::dial(&url, identity).await.unwrap();
+    second.send(Message::text("two")).await.unwrap();
+    assert_eq!(
+        within("echo", second.recv()).await,
+        Some(Message::text("echo: two"))
+    );
+    first.send(Message::text("still")).await.unwrap();
+    assert_eq!(
+        within("echo", first.recv()).await,
+        Some(Message::text("echo: still"))
+    );
+
+    // And back to the untrusted one.
+    handle.reload(TlsConfig::from_pem(SELF_SIGNED_CERT, SELF_SIGNED_KEY).unwrap());
+    assert!(WsClient::dial(&url, trusted()).await.is_err());
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+    server.stop().await;
+}
+
 // ---- the reconnecting client -----------------------------------------------
 
 #[tokio::test]
@@ -1060,4 +1126,67 @@ async fn w7_mask_keys_and_nonces_are_per_connection_and_unrelated() {
     assert_eq!(shared, 0);
     let first: HashSet<&[u8; 4]> = streams[0].iter().collect();
     assert!(streams[1].iter().all(|key| !first.contains(key)));
+}
+
+// ---- the built-in metrics observer -------------------------------------------
+
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn metrics_observer_exports_connections_messages_bytes_and_closes() {
+    use ferroly::metrics::Registry;
+    use ferroly::ws::MetricsObserver;
+
+    let registry = Registry::new();
+    let server_metrics = Arc::new(MetricsObserver::new(&registry));
+    let client_metrics = Arc::new(MetricsObserver::with_prefix(&registry, "ws_client"));
+    let server = start(fast_config().observer(server_metrics), echo).await;
+
+    let mut client = WsClient::dial(&server.url("/"), fast_options().observer(client_metrics))
+        .await
+        .unwrap();
+    client.send(Message::text("12345")).await.unwrap();
+    assert_eq!(client.recv().await, Some(Message::text("echo: 12345")));
+    client.close().await.unwrap();
+
+    // A refused (cross-origin) upgrade and a protocol error.
+    let refused = WsClient::dial(
+        &server.url("/"),
+        fast_options().header("origin", "https://evil.example"),
+    )
+    .await;
+    assert!(refused.is_err());
+    let mut raw = Raw::connect(server.addr).await;
+    raw.send(FIN | 0x40 | OP_TEXT, b"rsv").await;
+    assert_eq!(raw.read_close().await.0, close_code::PROTOCOL_ERROR);
+    drop(raw);
+
+    let expected = [
+        "ws_connections_opened_total 2",
+        "ws_connections_active 0",
+        "ws_connections_closed_total{code=\"1000\"} 1",
+        "ws_connections_closed_total{code=\"1002\"} 1",
+        "ws_messages_received_total 1",
+        "ws_received_bytes_total 5",
+        "ws_messages_sent_total 1",
+        "ws_sent_bytes_total 11",
+        "ws_protocol_errors_total{code=\"1002\"} 1",
+        "ws_handshakes_rejected_total{status=\"403\"} 1",
+        "ws_client_connections_opened_total 1",
+        "ws_client_connections_closed_total{code=\"1000\"} 1",
+        "ws_client_sent_bytes_total 5",
+        "ws_client_received_bytes_total 11",
+    ];
+    let settled = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let text = registry.encode();
+            if expected.iter().all(|line| text.contains(line)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let text = registry.encode();
+    assert!(settled.is_ok(), "metrics did not settle:\n{text}");
+    server.stop().await;
 }

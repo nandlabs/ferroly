@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferroly::http::io::HeadLimits;
-use ferroly::http::{ClientTlsConfig, HeaderMap, TlsConfig};
+use ferroly::http::{ClientTlsConfig, HeaderMap, ReloadableTlsConfig};
 
 use super::conn::ConnParams;
 use super::observer::WsObserver;
@@ -275,8 +275,13 @@ pub struct WsServerConfig {
     pub max_line_bytes: usize,
     /// Serve `wss`: every accepted connection performs a TLS handshake with
     /// this configuration first (mutual TLS included, if it is configured).
-    /// Default: `None` (plain `ws`).
-    pub tls: Option<TlsConfig>,
+    /// The configuration is read once per accepted connection, so keeping a
+    /// clone of the [`ReloadableTlsConfig`] and calling
+    /// [`reload`](ReloadableTlsConfig::reload) rotates the certificate for
+    /// new connections without a restart; established ones are unaffected.
+    /// Set it with [`tls`](Self::tls), which also takes a plain
+    /// [`TlsConfig`](ferroly::http::TlsConfig). Default: `None` (plain `ws`).
+    pub tls: Option<ReloadableTlsConfig>,
     /// Called with every valid upgrade request before the `101` is sent; may
     /// reject it or attach per-connection context. Default: none.
     pub upgrade_hook: Option<Arc<dyn UpgradeHook>>,
@@ -342,9 +347,12 @@ impl std::fmt::Debug for WsServerConfig {
 }
 
 impl WsServerConfig {
-    /// Serves `wss` with this TLS configuration.
-    pub fn tls(mut self, tls: TlsConfig) -> Self {
-        self.tls = Some(tls);
+    /// Serves `wss` with this TLS configuration: a fixed
+    /// [`TlsConfig`](ferroly::http::TlsConfig), or a [`ReloadableTlsConfig`]
+    /// whose clone can [`reload`](ReloadableTlsConfig::reload) the
+    /// certificate while the server runs.
+    pub fn tls(mut self, tls: impl Into<ReloadableTlsConfig>) -> Self {
+        self.tls = Some(tls.into());
         self
     }
 

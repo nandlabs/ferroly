@@ -602,8 +602,16 @@ async fn cors_wildcard_is_never_combined_with_credentials() {
     // The contradiction is reported …
     assert!(matches!(router.validate(), Err(RouteError::Config(_))));
 
-    // … and at run time the wildcard is sent without credentials.
-    let addr = spawn(router).await;
+    // … `serve*` refuses to start it, and finalized anyway with
+    // `into_handler` the wildcard is sent without credentials.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(ferroly::http::serve_with_config(
+        listener,
+        router.into_handler(),
+        std::future::pending(),
+        ServerConfig::default(),
+    ));
     let resp = raw(addr, "GET", "/", &[("origin", "https://anyone.test")]).await;
     assert_eq!(
         resp.header("access-control-allow-origin").as_deref(),

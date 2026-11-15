@@ -283,9 +283,11 @@ macro_rules! from_uint {
 }
 from_uint!(u8, u16, u32, u64, usize);
 
+/// Like `Encode for f32`: the `f64` nearest the shortest decimal form of `v`
+/// (`0.1f32` becomes `Value::Float(0.1)`), which converts back to `v` exactly.
 impl From<f32> for Value {
     fn from(v: f32) -> Value {
-        Value::Float(v as f64)
+        Value::Float(super::fmt::f32_to_f64_shortest(v))
     }
 }
 impl From<f64> for Value {

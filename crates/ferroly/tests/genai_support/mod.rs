@@ -47,6 +47,8 @@ enum Step {
     /// Keep the connection open without sending anything more, until the
     /// client goes away.
     Hang,
+    /// Close the connection.
+    Close,
 }
 
 /// A scripted answer to one request.
@@ -125,6 +127,14 @@ impl Reply {
         let owned: Vec<String> = lines.iter().map(|l| format!("{l}\n")).collect();
         let pieces: Vec<&[u8]> = owned.iter().map(|l| l.as_bytes()).collect();
         Reply::chunked("application/x-ndjson", &pieces)
+    }
+
+    /// Accept the request, write `bytes` verbatim, then close the
+    /// connection (for malformed or cut-off answers).
+    pub fn raw_then_close(bytes: &[u8]) -> Reply {
+        Reply {
+            steps: vec![Step::Send(bytes.to_vec()), Step::Close],
+        }
     }
 
     /// Accept the request and never answer.
@@ -288,6 +298,7 @@ async fn serve(
                     }
                 }
                 Step::Sleep(d) => tokio::time::sleep(d).await,
+                Step::Close => return,
                 Step::Hang => {
                     // Wait for the client to go away (read returns 0 / error).
                     let mut sink = [0u8; 64];

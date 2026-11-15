@@ -6,6 +6,22 @@
 //! character by character. The encoder appends scalars in place via the
 //! shared `fmt` writers, avoiding a `String` allocation per value.
 //!
+//! ```
+//! use ferroly::codec::{json, Decode, Encode};
+//!
+//! #[derive(Encode, Decode, PartialEq, Debug)]
+//! struct User { id: u64, name: String, email: Option<String> }
+//!
+//! let user = User { id: 7, name: "Ada".into(), email: None };
+//! let text = json::encode(&user);
+//! assert_eq!(text, r#"{"id":7,"name":"Ada","email":null}"#);
+//! let back: User = json::decode(&text).unwrap();
+//! assert_eq!(back, user);
+//!
+//! // Typed decoding is strict: a JSON string is not a number.
+//! assert!(json::decode::<User>(r#"{"id":"7","name":"Ada","email":null}"#).is_err());
+//! ```
+//!
 //! Parsing follows RFC 8259 strictly: numbers must match the JSON grammar
 //! (`01`, `1.`, `-.5` are rejected), a number that overflows to infinity is an
 //! error, and raw control characters inside strings are rejected. Typed
@@ -19,7 +35,8 @@ use std::fmt::Write as _;
 use ferroly::codec::{emit_value, CodecError, Decode, Decoder, Encode, Encoder, Limits, Value};
 
 use super::fmt;
-use super::limits::{error_at, Budget};
+use super::limits::{error_at, Budget, DuplicateKeys};
+use super::traits::{signed128_from, unsigned128_from};
 
 /// Encodes any [`Encode`] type to a compact JSON string, streaming straight to
 /// the output with no intermediate [`Value`] tree.
@@ -208,6 +225,12 @@ impl Encoder for JsonEncoder {
         }
         fmt::write_json_f64(&mut self.out, v);
     }
+    fn encode_f32(&mut self, v: f32) {
+        if !v.is_finite() {
+            self.non_finite = true;
+        }
+        fmt::write_json_f32(&mut self.out, v);
+    }
     fn encode_str(&mut self, v: &str) {
         write_string(&mut self.out, v);
     }
@@ -385,16 +408,28 @@ impl<'a> Parser<'a> {
     }
 
     /// Consumes a container's opening bracket for the streaming decoder, or
-    /// reports that the next value has the wrong shape.
+    /// reports that the next value has the wrong type (see
+    /// [`mismatch`](Parser::mismatch)).
     fn open(&mut self, bracket: u8, what: &'static str) -> Result<(), CodecError> {
         self.skip_ws();
-        match self.peek() {
-            Some(b) if b == bracket => {
-                self.pos += 1;
-                Ok(())
-            }
-            None => Err(self.err("unexpected end of input")),
-            Some(_) => Err(CodecError::expected(what)),
+        if self.peek() == Some(bracket) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(self.mismatch(what))
+        }
+    }
+
+    /// The error for a streaming decode that wanted `expected` but met
+    /// something else. The token is lexed first, so malformed input is a
+    /// [`Parse`](CodecError::Parse) error with its position (as on the
+    /// `Value` path) rather than a type error naming a kind that is not there;
+    /// a well-formed value of the wrong kind is a
+    /// [`TypeMismatch`](CodecError::TypeMismatch) naming what it was.
+    fn mismatch(&mut self, expected: &'static str) -> CodecError {
+        match self.parse_value() {
+            Ok(found) => CodecError::type_mismatch(expected, &found),
+            Err(e) => e,
         }
     }
 
@@ -406,9 +441,12 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             return Ok(Value::Object(entries));
         }
+        let mut dups = DuplicateKeys::new(self.budget.reject_duplicate_keys());
         loop {
             self.skip_ws();
+            let key_at = self.pos;
             let key = self.parse_string()?;
+            dups.check(&key).map_err(|m| self.err_at(key_at, m))?;
             self.skip_ws();
             self.expect(b':')?;
             self.budget.entry()?;
@@ -659,10 +697,11 @@ impl<'a> Decoder for Parser<'a> {
 
     fn decode_string(&mut self) -> Result<String, CodecError> {
         self.skip_ws();
-        if self.peek() != Some(b'"') {
-            return Err(CodecError::expected("string"));
+        if self.peek() == Some(b'"') {
+            self.parse_string()
+        } else {
+            Err(self.mismatch("string"))
         }
-        self.parse_string()
     }
 
     fn peek_null(&mut self) -> bool {
@@ -675,7 +714,7 @@ impl<'a> Decoder for Parser<'a> {
         if self.take_literal(b"null") {
             Ok(())
         } else {
-            Err(CodecError::expected("null"))
+            Err(self.mismatch("null"))
         }
     }
 
@@ -720,12 +759,15 @@ impl<'a> Decoder for Parser<'a> {
             self.budget.leave();
             return Ok(());
         }
+        let mut dups = DuplicateKeys::new(self.budget.reject_duplicate_keys());
         loop {
             self.skip_ws();
             if self.peek() != Some(b'"') {
                 return Err(self.err("expected object key"));
             }
+            let key_at = self.pos;
             let key = self.parse_str()?;
+            dups.check(&key).map_err(|m| self.err_at(key_at, m))?;
             self.skip_ws();
             self.expect(b':')?;
             self.budget.entry()?;
@@ -746,6 +788,46 @@ impl<'a> Decoder for Parser<'a> {
 
     fn skip_value(&mut self) -> Result<(), CodecError> {
         self.parse_value().map(|_| ())
+    }
+
+    // A wide integer literal is decoded from its digits, exactly; the `Value`
+    // path would see a rounded float.
+    fn decode_i128(&mut self) -> Result<i128, CodecError> {
+        match self.value_and_integer_text()? {
+            (_, Some(text)) => text
+                .parse::<i128>()
+                .map_err(|_| CodecError::out_of_range("i128")),
+            (value, None) => signed128_from(&value, false),
+        }
+    }
+
+    fn decode_u128(&mut self) -> Result<u128, CodecError> {
+        match self.value_and_integer_text()? {
+            (_, Some(text)) => text.parse::<u128>().or_else(|_| {
+                // `-0` is zero; any other negative literal is out of range.
+                if text.bytes().skip(1).all(|b| b == b'0') {
+                    Ok(0)
+                } else {
+                    Err(CodecError::out_of_range("u128"))
+                }
+            }),
+            (value, None) => unsigned128_from(&value, false),
+        }
+    }
+}
+
+impl<'a> Parser<'a> {
+    /// The next value and, when it is an integer literal (no fraction or
+    /// exponent), the literal's text.
+    fn value_and_integer_text(&mut self) -> Result<(Value, Option<&'a str>), CodecError> {
+        self.skip_ws();
+        let start = self.pos;
+        let value = self.parse_value()?;
+        let input: &'a str = self.input;
+        let text = &input[start..self.pos];
+        let integer = matches!(value, Value::Int(_) | Value::UInt(_) | Value::Float(_))
+            && !text.contains(['.', 'e', 'E']);
+        Ok((value, integer.then_some(text)))
     }
 }
 
@@ -787,6 +869,36 @@ mod tests {
         // `get` returns the last occurrence, matching struct decoding.
         assert_eq!(v.get("a").and_then(Value::as_i64), Some(3));
         assert_eq!(v.get("b").and_then(Value::as_i64), Some(2));
+    }
+
+    #[test]
+    fn duplicate_keys_can_be_rejected() {
+        let strict = Limits::new().with_reject_duplicate_keys(true);
+        let err = from_str_with(r#"{"a":1,"b":{"x":1,"x":2}}"#, strict).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "parse error: duplicate key \"x\" at line 1, column 19"
+        );
+        // Same keys in different objects are fine.
+        assert!(from_str_with(r#"[{"a":1},{"a":2}]"#, strict).is_ok());
+        // The streaming decoder applies it too, also to keys it skips.
+        #[derive(ferroly::codec::Decode, Debug)]
+        #[allow(dead_code)]
+        struct S {
+            a: u8,
+        }
+        assert!(decode_with::<S>(r#"{"a":1,"a":2}"#, strict).is_err());
+        assert!(decode_with::<S>(r#"{"a":1,"z":1,"z":2}"#, strict).is_err());
+        assert_eq!(
+            decode_with::<S>(r#"{"a":1,"a":2}"#, Limits::new())
+                .unwrap()
+                .a,
+            2
+        );
+        // Many keys: past the linear-scan threshold.
+        let wide: String = (0..40).map(|i| format!("\"k{i}\":{i},")).collect();
+        assert!(from_str_with(&format!("{{{wide}\"k7\":0}}"), strict).is_err());
+        assert!(from_str_with(&format!("{{{wide}\"k40\":0}}"), strict).is_ok());
     }
 
     #[test]

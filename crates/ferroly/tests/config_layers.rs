@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use ferroly::codec::{json, Decode, Value};
-use ferroly::config::{Config, ConfigError, EnvOptions, SharedConfig, Source};
+use ferroly::config::{Config, ConfigError, EnvOptions, Layer, SharedConfig, Source};
 
 /// A fresh, empty directory unique to one test.
 fn temp_dir(name: &str) -> PathBuf {
@@ -375,6 +375,41 @@ fn env_keys_with_empty_segments_are_ignored() {
     ] {
         std::env::remove_var(var);
     }
+}
+
+#[test]
+fn keys_deeper_than_the_codec_nesting_limit_are_ignored() {
+    // Environment: 128 segments merge, 129 are ignored (short enough for a
+    // Windows variable name).
+    let at_limit = format!("CFGIT_DEEP_{}", vec!["K"; 128].join("__"));
+    let too_deep = format!("CFGIT_DEEP_X__{}", vec!["K"; 128].join("__"));
+    std::env::set_var(&at_limit, "1");
+    std::env::set_var(&too_deep, "1");
+    let cfg = Config::from_env("CFGIT_DEEP_");
+    std::env::remove_var(&at_limit);
+    std::env::remove_var(&too_deep);
+    assert_eq!(cfg.get::<String>(&vec!["k"; 128].join(".")).unwrap(), "1");
+    assert!(!cfg.contains("x"));
+    assert_eq!(cfg.sources().count(), 1);
+
+    // A `.properties` key of ~60k segments, read on a small stack, where
+    // building it used to recurse once per segment.
+    let dir = temp_dir("deep-properties");
+    let path = dir.join("app.properties");
+    std::fs::write(
+        &path,
+        format!("{} = 1\nok = 2\n", vec!["k"; 60_000].join(".")),
+    )
+    .unwrap();
+    let cfg = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || Config::from_file(&path).unwrap())
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(!cfg.contains("k"));
+    assert_eq!(cfg.get::<String>("ok").unwrap(), "2");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -1054,4 +1089,662 @@ fn config_errors_classify_as_invalid_input() {
         ConfigError::UnsupportedFormat("x".into()).kind(),
         ErrorKind::Unsupported
     );
+}
+
+// ---- declarative layer lists (`Layer`) --------------------------------------
+
+#[test]
+fn layers_apply_in_order_and_later_layers_win() {
+    let dir = temp_dir("layers-order");
+    let file = dir.join("app.json");
+    std::fs::write(&file, r#"{"port": "2", "db": {"host": "file"}}"#).unwrap();
+    std::env::set_var("CFGIT_LO_PORT", "3");
+
+    let defaults = obj(&[
+        ("port", s("1")),
+        ("name", s("default")),
+        ("db", obj(&[("host", s("default")), ("user", s("app"))])),
+    ]);
+
+    let cfg = Config::from_layers([
+        Layer::Value(defaults.clone()),
+        Layer::file(&file),
+        Layer::env("CFGIT_LO_"),
+        Layer::args(["--port=4"]),
+    ])
+    .unwrap();
+    assert_eq!(cfg.get::<u16>("port").unwrap(), 4);
+    assert_eq!(cfg.get::<String>("db.host").unwrap(), "file");
+    assert_eq!(cfg.get::<String>("db.user").unwrap(), "app", "deep merge");
+    assert_eq!(cfg.get::<String>("name").unwrap(), "default");
+
+    // Without the args layer the environment wins.
+    let cfg = Config::from_layers([
+        Layer::Value(defaults.clone()),
+        Layer::file(&file),
+        Layer::env("CFGIT_LO_"),
+    ])
+    .unwrap();
+    assert_eq!(cfg.get::<u16>("port").unwrap(), 3);
+
+    // Reversing the list reverses the priority: the defaults now win.
+    let cfg = Config::from_layers([
+        Layer::args(["--port=4"]),
+        Layer::env("CFGIT_LO_"),
+        Layer::file(&file),
+        Layer::Value(defaults),
+    ])
+    .unwrap();
+    assert_eq!(cfg.get::<u16>("port").unwrap(), 1);
+    assert_eq!(cfg.get::<String>("db.host").unwrap(), "default");
+
+    // An empty list is an empty configuration.
+    let empty = Config::from_layers(Vec::new()).unwrap();
+    assert_eq!(empty.value(), &Value::Object(Vec::new()));
+
+    std::env::remove_var("CFGIT_LO_PORT");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn layers_match_the_hand_written_builder_chain() {
+    let dir = temp_dir("layers-equiv");
+    std::fs::write(dir.join("app.toml"), "name = \"svc\"\n[db]\nport = 5432\n").unwrap();
+    std::fs::write(dir.join("app-prod.toml"), "[db]\nhost = \"prod-db\"\n").unwrap();
+    std::fs::write(dir.join("extra.yaml"), "region: eu\n").unwrap();
+    let secret = dir.join("pw");
+    std::fs::write(&secret, "s3cr3t\n").unwrap();
+    std::env::set_var("CFGIT_LE_DB__USER", "app");
+    std::env::set_var("CFGIT_LE_DB__PASSWORD_FILE", &secret);
+    std::env::set_var("CFGIT_LE_TAGS", "a,b");
+    let defaults = obj(&[("port", s("8080")), ("tags", Value::Array(Vec::new()))]);
+    let options = EnvOptions::new().secret_files().list_keys(',', ["tags"]);
+    let args = strings(&["--port", "9000", "--verbose"]);
+
+    let chained = Config::builder()
+        .merge_value(defaults.clone())
+        .merge_profile(dir.join("app"), "prod")
+        .unwrap()
+        .merge_file(dir.join("extra.yaml"))
+        .unwrap()
+        .merge_file_optional(dir.join("missing.json"))
+        .unwrap()
+        .merge_env("CFGIT_LE_DB__")
+        .merge_env_with("CFGIT_LE_", &options)
+        .unwrap()
+        .merge_args(args.clone())
+        .build();
+
+    let listed = Config::builder()
+        .layers([
+            Layer::value(defaults),
+            Layer::profile(dir.join("app"), "prod"),
+            Layer::File(dir.join("extra.yaml")),
+            Layer::OptionalFile(dir.join("missing.json")),
+            Layer::Env("CFGIT_LE_DB__".into()),
+            Layer::env_with("CFGIT_LE_", options),
+            Layer::Args(args),
+        ])
+        .unwrap()
+        .build();
+
+    assert_eq!(listed.value(), chained.value());
+    let sources = |c: &Config| -> Vec<(String, Source)> {
+        c.sources()
+            .map(|(k, s)| (k.to_string(), s.clone()))
+            .collect()
+    };
+    assert_eq!(sources(&listed), sources(&chained));
+    assert_eq!(listed.to_redacted_string(), chained.to_redacted_string());
+    assert_eq!(listed.get::<String>("db.password").unwrap(), "s3cr3t");
+    assert_eq!(listed.get::<String>("db.host").unwrap(), "prod-db");
+    assert_eq!(listed.get::<u16>("port").unwrap(), 9000);
+    assert_eq!(listed.get::<Vec<String>>("tags").unwrap(), ["a", "b"]);
+
+    for var in [
+        "CFGIT_LE_DB__USER",
+        "CFGIT_LE_DB__PASSWORD_FILE",
+        "CFGIT_LE_TAGS",
+    ] {
+        std::env::remove_var(var);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn layers_record_provenance_and_compose_with_builder_calls() {
+    let dir = temp_dir("layers-provenance");
+    let file = dir.join("app.json");
+    std::fs::write(&file, r#"{"db": {"host": "file", "user": "file"}}"#).unwrap();
+    std::env::set_var("CFGIT_LP_DB__HOST", "env");
+
+    // Layers continue a chain that already has layers, and the chain goes on
+    // after them.
+    let cfg = Config::builder()
+        .merge_value(obj(&[("name", s("default")), ("port", Value::Int(0))]))
+        .layers([Layer::file(&file), Layer::env("CFGIT_LP_")])
+        .unwrap()
+        .merge_args(strings(&["--port=9"]))
+        .build();
+
+    assert_eq!(cfg.source("name"), Some(&Source::Value));
+    assert_eq!(cfg.source("port"), Some(&Source::Args));
+    assert_eq!(
+        cfg.source("db.host"),
+        Some(&Source::Env("CFGIT_LP_DB__HOST".into()))
+    );
+    assert!(matches!(cfg.source("db.user"), Some(Source::File(p)) if p.ends_with("app.json")));
+
+    std::env::remove_var("CFGIT_LP_DB__HOST");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn layers_stop_at_the_first_failing_layer() {
+    let dir = temp_dir("layers-errors");
+    let good = dir.join("good.json");
+    std::fs::write(&good, r#"{"a": 1}"#).unwrap();
+    let bad = dir.join("bad.json");
+    std::fs::write(&bad, "{ not json").unwrap();
+
+    let err = |layers: Vec<Layer>| Config::from_layers(layers).unwrap_err();
+
+    assert!(matches!(
+        err(vec![Layer::file(&good), Layer::file(dir.join("missing.json"))]),
+        ConfigError::Io(msg) if msg.contains("missing.json")
+    ));
+    assert!(matches!(
+        err(vec![Layer::file("settings.ini")]),
+        ConfigError::UnsupportedFormat(p) if p == "settings.ini"
+    ));
+    assert!(matches!(
+        err(vec![Layer::optional_file(&bad)]),
+        ConfigError::Parse { path, .. } if path.ends_with("bad.json")
+    ));
+    assert!(matches!(
+        err(vec![Layer::profile(dir.join("good"), "../etc")]),
+        ConfigError::InvalidProfile(p) if p == "../etc"
+    ));
+    std::env::set_var("CFGIT_LX_PW_FILE", dir.join("no-such-secret"));
+    assert!(matches!(
+        err(vec![Layer::env_with("CFGIT_LX_", EnvOptions::new().secret_files())]),
+        ConfigError::Io(msg) if msg.contains("CFGIT_LX_PW_FILE")
+    ));
+    std::env::remove_var("CFGIT_LX_PW_FILE");
+
+    // The first failure is the one reported; later layers are not read.
+    assert!(matches!(
+        err(vec![
+            Layer::file(dir.join("first-missing.json")),
+            Layer::file(&bad),
+        ]),
+        ConfigError::Io(msg) if msg.contains("first-missing.json")
+    ));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn layer_debug_does_not_print_values() {
+    let layers = [
+        Layer::Value(obj(&[("db_password", s("s3cr3t-layer"))])),
+        Layer::args(["--api-token=t0ken-layer"]),
+        Layer::file("config/app.toml"),
+        Layer::env("APP_"),
+    ];
+    let shown = format!("{layers:?}");
+    assert!(!shown.contains("s3cr3t-layer"), "{shown}");
+    assert!(!shown.contains("t0ken-layer"), "{shown}");
+    assert!(shown.contains("<redacted>"), "{shown}");
+    assert!(
+        shown.contains("app.toml") && shown.contains("APP_"),
+        "{shown}"
+    );
+}
+
+#[cfg(feature = "cli")]
+#[test]
+fn cli_layers_match_merge_cli() {
+    use ferroly::cli::{Arg, Command};
+
+    let cmd = Command::new("svc")
+        .flag(Arg::new("port").long("port").default("8080"))
+        .flag(Arg::new("db.host").long("db-host"));
+    let m = cmd.parse(strings(&["--db-host", "cli-host"])).unwrap();
+    let file = obj(&[("port", s("7000")), ("db", obj(&[("host", s("file"))]))]);
+
+    let chained = Config::builder()
+        .merge_cli_defaults(&m)
+        .merge_value(file.clone())
+        .merge_cli(&m)
+        .build();
+    let listed = Config::from_layers([
+        Layer::CliDefaults(m.clone()),
+        Layer::Value(file),
+        Layer::Cli(m),
+    ])
+    .unwrap();
+
+    assert_eq!(listed.value(), chained.value());
+    assert_eq!(
+        listed.get::<u16>("port").unwrap(),
+        7000,
+        "a default never beats a file"
+    );
+    assert_eq!(listed.get::<String>("db.host").unwrap(), "cli-host");
+    assert_eq!(listed.source("db.host"), Some(&Source::Cli));
+}
+
+// ---- mounted secrets directories ----------------------------------------------
+
+#[test]
+fn secret_dir_loads_one_file_per_key_like_a_kubernetes_volume() {
+    let dir = temp_dir("secret-dir");
+    // Kubernetes keeps the real files under a hidden, timestamped directory
+    // and exposes each key as a symlink into `..data`; emulate the hidden
+    // part everywhere and the symlink where the platform allows it.
+    std::fs::create_dir_all(dir.join("..2026_11_15").join("nested")).unwrap();
+    std::fs::write(dir.join("..2026_11_15").join("token"), "hidden").unwrap();
+    std::fs::write(dir.join(".hidden"), "no").unwrap();
+    std::fs::create_dir_all(dir.join("subdir")).unwrap();
+    std::fs::write(dir.join("db.password"), "s3cret\n\n").unwrap();
+    std::fs::write(dir.join("api__token"), "tok\r\n").unwrap();
+    std::fs::write(dir.join("Plain"), "no newline").unwrap();
+    std::fs::write(dir.join("bad..name"), "skipped").unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::write(dir.join("..2026_11_15").join("linked"), "via link\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("..2026_11_15").join("linked"), dir.join("linked"))
+            .unwrap();
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join("dangling")).unwrap();
+    }
+
+    let defaults = obj(&[("db", obj(&[("password", s("default"))]))]);
+    let cfg = Config::from_layers([Layer::Value(defaults), Layer::secret_dir(&dir)]).unwrap();
+
+    // Exactly one trailing newline is removed (`\n` or `\r\n`).
+    assert_eq!(cfg.get::<String>("db.password").unwrap(), "s3cret\n");
+    assert_eq!(cfg.get::<String>("api.token").unwrap(), "tok");
+    assert_eq!(cfg.get::<String>("Plain").unwrap(), "no newline");
+    assert!(!cfg.contains("token"), "hidden entries are skipped");
+    assert!(!cfg.contains("hidden"));
+    assert!(!cfg.contains("subdir"));
+    assert!(!cfg.contains("bad"));
+    #[cfg(unix)]
+    {
+        assert_eq!(cfg.get::<String>("linked").unwrap(), "via link");
+        assert!(!cfg.contains("dangling"));
+    }
+    let path = dir.join("db.password").display().to_string();
+    assert_eq!(cfg.source("db.password"), Some(&Source::SecretDir(path)));
+
+    // Always masked, whatever the key is called.
+    let dump = cfg.to_redacted_string_with(|_| false);
+    assert!(!dump.contains("s3cret"), "{dump}");
+    assert!(!dump.contains("no newline"), "{dump}");
+    assert!(dump.contains("secret file"), "{dump}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn secret_dir_missing_oversized_and_non_utf8_files() {
+    let dir = temp_dir("secret-dir-errors");
+    let missing = dir.join("absent");
+    assert!(matches!(
+        Config::builder().merge_secret_dir(&missing),
+        Err(ConfigError::Io(_))
+    ));
+    let cfg = Config::from_layers([Layer::optional_secret_dir(&missing)]).unwrap();
+    assert!(cfg.sources().next().is_none());
+
+    std::fs::write(dir.join("binary"), [0xff, 0xfe, 0x00]).unwrap();
+    let err = Config::builder().merge_secret_dir(&dir).unwrap_err();
+    assert!(err.to_string().contains("UTF-8"), "{err}");
+    std::fs::remove_file(dir.join("binary")).unwrap();
+
+    std::fs::write(dir.join("huge"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    let err = Config::builder().merge_secret_dir(&dir).unwrap_err();
+    assert!(err.to_string().contains("1 MiB"), "{err}");
+    // The message names the file, never its content.
+    assert!(!err.to_string().contains("xxxx"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- change detection ------------------------------------------------------------
+
+#[test]
+fn watch_files_reloads_when_a_file_changes_and_keeps_the_old_config_on_error() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = temp_dir("watch");
+    let file = dir.join("app.json");
+    std::fs::write(&file, r#"{"port": 1}"#).unwrap();
+    let loaded = file.clone();
+    let shared =
+        SharedConfig::with_loader(move || Ok(Config::builder().merge_file(&loaded)?.build()))
+            .unwrap();
+    let (tx, rx) = mpsc::channel();
+    let watcher = shared
+        .watch_files([file.clone()], Duration::from_millis(20), move |r| {
+            let _ = tx.send(r.map(|c| c.get::<u16>("port").unwrap()));
+        })
+        .unwrap();
+
+    // Nothing changed: no reload.
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    assert_eq!(shared.generation(), 0);
+
+    // Same length, so the content hash (not just the size) catches it.
+    std::fs::write(&file, r#"{"port": 2}"#).unwrap();
+    let seen = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.unwrap(), 2);
+    assert_eq!(shared.get::<u16>("port").unwrap(), 2);
+    assert_eq!(shared.generation(), 1);
+
+    // A broken edit is reported and the running config stays.
+    std::fs::write(&file, "{ not json").unwrap();
+    let seen = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(seen.is_err());
+    assert_eq!(shared.get::<u16>("port").unwrap(), 2);
+
+    watcher.stop();
+    std::fs::write(&file, r#"{"port": 3}"#).unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    assert_eq!(shared.get::<u16>("port").unwrap(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn watch_files_waits_for_a_change_to_settle() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    // CORE-3: a truncating writer is observed half done. The prefix is still
+    // valid YAML, so without a settle time a config with `b` missing would
+    // be swapped in. The writer below keeps every state (half or whole) for
+    // a fraction of the interval, so a poll lands on several half-written
+    // states; only the final, settled file may be loaded.
+    let dir = temp_dir("watch-settle");
+    let file = dir.join("app.yaml");
+    std::fs::write(&file, "a: 0\nb: 0\n").unwrap();
+    let loaded = file.clone();
+    let seen: Arc<Mutex<Vec<Option<u16>>>> = Arc::default();
+    let record = seen.clone();
+    let shared = SharedConfig::with_loader(move || {
+        let cfg = Config::builder().merge_file(&loaded)?.build();
+        record.lock().unwrap().push(cfg.get::<u16>("b").ok());
+        Ok(cfg)
+    })
+    .unwrap();
+    let interval = Duration::from_millis(300);
+    let watcher = shared
+        .watch_files([file.clone()], interval, |_| {})
+        .unwrap();
+
+    const ROUNDS: u16 = 12;
+    let step = interval / 5;
+    for i in 1..=ROUNDS {
+        std::fs::write(&file, format!("a: {i}\n")).unwrap();
+        std::thread::sleep(step);
+        std::fs::write(&file, format!("a: {i}\nb: {i}\n")).unwrap();
+        std::thread::sleep(step);
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while shared.get::<u16>("b").ok() != Some(ROUNDS) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(interval * 3);
+    watcher.stop();
+    assert_eq!(shared.get::<u16>("b").unwrap(), ROUNDS);
+    // Every load saw a whole file: a half-written one was never loaded.
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().all(Option::is_some), "loads: {seen:?}");
+    assert_eq!(seen.last(), Some(&Some(ROUNDS)));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn watch_files_notices_a_change_made_before_it_was_called() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // CORE-4: the file changes between the load and `watch_files`.
+    let dir = temp_dir("watch-baseline");
+    let file = dir.join("app.json");
+    std::fs::write(&file, r#"{"port": 1}"#).unwrap();
+    let loaded = file.clone();
+    let shared =
+        SharedConfig::with_loader(move || Ok(Config::builder().merge_file(&loaded)?.build()))
+            .unwrap();
+    // Make sure the edit's modification time is past the load.
+    std::thread::sleep(Duration::from_millis(50));
+    std::fs::write(&file, r#"{"port": 2}"#).unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    let watcher = shared
+        .watch_files([file.clone()], Duration::from_millis(20), move |r| {
+            let _ = tx.send(r.map(|c| c.get::<u16>("port").unwrap()));
+        })
+        .unwrap();
+    let seen = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.unwrap(), 2);
+    assert_eq!(shared.get::<u16>("port").unwrap(), 2);
+    // Nothing else changed: no further reload.
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    watcher.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn reloads_never_overlap() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    // CORE-5: the first reload blocks inside the loader; a second one must
+    // wait for it instead of running the loader alongside.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let running = Arc::new(AtomicUsize::new(0));
+    let most = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered) = mpsc::channel::<usize>();
+    let (release, released) = mpsc::channel::<()>();
+    let released = Arc::new(Mutex::new(released));
+    let entered_tx = Mutex::new(entered_tx);
+    let (c, r, m, rel) = (
+        calls.clone(),
+        running.clone(),
+        most.clone(),
+        released.clone(),
+    );
+    let shared = SharedConfig::with_loader(move || {
+        let call = c.fetch_add(1, Ordering::SeqCst);
+        let now = r.fetch_add(1, Ordering::SeqCst) + 1;
+        m.fetch_max(now, Ordering::SeqCst);
+        if call > 0 {
+            let _ = entered_tx.lock().unwrap().send(call);
+            // Block until the test lets this reload finish.
+            let _ = rel.lock().unwrap().recv_timeout(Duration::from_secs(10));
+        }
+        r.fetch_sub(1, Ordering::SeqCst);
+        let value = obj(&[("call", Value::UInt(call as u64))]);
+        Ok(Config::builder().merge_value(value).build())
+    })
+    .unwrap();
+
+    let first = shared.clone();
+    let a = std::thread::spawn(move || first.reload().unwrap());
+    assert_eq!(entered.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
+    let second = shared.clone();
+    let b = std::thread::spawn(move || second.reload().unwrap());
+    // The second reload must not reach the loader while the first holds it.
+    assert!(entered.recv_timeout(Duration::from_millis(300)).is_err());
+    // Readers are not blocked meanwhile.
+    assert_eq!(shared.get::<u64>("call").unwrap(), 0);
+
+    release.send(()).unwrap();
+    assert_eq!(a.join().unwrap().get::<u64>("call").unwrap(), 1);
+    assert_eq!(entered.recv_timeout(Duration::from_secs(10)).unwrap(), 2);
+    release.send(()).unwrap();
+    assert_eq!(b.join().unwrap().get::<u64>("call").unwrap(), 2);
+    assert_eq!(most.load(Ordering::SeqCst), 1, "two loaders ran at once");
+    // The reload that read last installed last.
+    assert_eq!(shared.get::<u64>("call").unwrap(), 2);
+    assert_eq!(shared.generation(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_dir_reads_one_kubernetes_revision() {
+    // CORE-8: the visible keys are symlinks into `..data`, itself a symlink
+    // to the current revision. Point the per-key links at a different
+    // revision than `..data` (what a reader sees mid-swap): every key must
+    // come from the revision `..data` names.
+    let dir = temp_dir("secret-dir-revision");
+    for (rev, user, password) in [
+        ("..rev1", "old-user", "old-pw"),
+        ("..rev2", "new-user", "new-pw"),
+    ] {
+        std::fs::create_dir_all(dir.join(rev)).unwrap();
+        std::fs::write(dir.join(rev).join("db.user"), user).unwrap();
+        std::fs::write(dir.join(rev).join("db.password"), password).unwrap();
+    }
+    std::os::unix::fs::symlink("..rev2", dir.join("..data")).unwrap();
+    std::os::unix::fs::symlink("..rev1/db.user", dir.join("db.user")).unwrap();
+    std::os::unix::fs::symlink("..rev2/db.password", dir.join("db.password")).unwrap();
+
+    let cfg = Config::builder().merge_secret_dir(&dir).unwrap().build();
+    assert_eq!(cfg.get::<String>("db.user").unwrap(), "new-user");
+    assert_eq!(cfg.get::<String>("db.password").unwrap(), "new-pw");
+    // Provenance names the visible path, not the revision directory.
+    let path = dir.join("db.user").display().to_string();
+    assert_eq!(cfg.source("db.user"), Some(&Source::SecretDir(path)));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn secret_dir_refuses_a_key_that_is_also_a_section() {
+    // CORE-8: `db` and `db.password` cannot both be kept.
+    let dir = temp_dir("secret-dir-clash");
+    std::fs::write(dir.join("db"), "postgres://x").unwrap();
+    std::fs::write(dir.join("db.password"), "s3cret").unwrap();
+    let err = Config::builder().merge_secret_dir(&dir).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, ConfigError::Io(_)), "{err:?}");
+    assert!(
+        msg.contains("`db`") && msg.contains("`db.password`"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("s3cret") && !msg.contains("postgres"),
+        "{msg}"
+    );
+
+    // Two spellings of the same key are not a clash: the later name wins.
+    std::fs::remove_file(dir.join("db")).unwrap();
+    std::fs::write(dir.join("db__password"), "other").unwrap();
+    let cfg = Config::builder().merge_secret_dir(&dir).unwrap().build();
+    assert_eq!(cfg.get::<String>("db.password").unwrap(), "other");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn env_secret_file_read_is_bounded_even_when_the_size_is_unknown() {
+    use std::io::Write;
+
+    // CORE-7: a pipe reports a length of 0, so a size check up front cannot
+    // stop it; the read itself must stop at 1 MiB.
+    let dir = temp_dir("secret-fifo");
+    let fifo = dir.join("pipe");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    if !made.is_ok_and(|s| s.success()) {
+        eprintln!("mkfifo is not available; skipping");
+        return;
+    }
+    let writer_path = fifo.clone();
+    let writer = std::thread::spawn(move || {
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&writer_path) {
+            // The reader hangs up after the cap; the write then fails.
+            let _ = f.write_all(&vec![b'x'; 2 * 1024 * 1024]);
+        }
+    });
+    std::env::set_var("CFGIT_FIFO_TOKEN_FILE", &fifo);
+    let result = Config::builder().merge_env_with("CFGIT_FIFO_", &EnvOptions::new().secret_files());
+    std::env::remove_var("CFGIT_FIFO_TOKEN_FILE");
+    writer.join().unwrap();
+    match result {
+        Err(ConfigError::Io(msg)) => {
+            assert!(msg.contains("1 MiB"), "{msg}");
+            assert!(!msg.contains("xxxx"), "{msg}");
+        }
+        other => panic!("expected the 1 MiB cap, got {:?}", other.map(|_| ())),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_files_over_the_cap_are_refused_through_a_symlink() {
+    // CORE-7: every secret read (secret directories, `*_FILE`) shares one
+    // bounded reader; a symlink to an oversized file is refused too.
+    let dir = temp_dir("secret-cap-link");
+    let big = dir.join("big");
+    std::fs::write(&big, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    let secrets = dir.join("secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::os::unix::fs::symlink(&big, secrets.join("token")).unwrap();
+    let err = Config::builder().merge_secret_dir(&secrets).unwrap_err();
+    assert!(err.to_string().contains("1 MiB"), "{err}");
+
+    std::env::set_var("CFGIT_CAPLINK_TOKEN_FILE", secrets.join("token"));
+    let result =
+        Config::builder().merge_env_with("CFGIT_CAPLINK_", &EnvOptions::new().secret_files());
+    std::env::remove_var("CFGIT_CAPLINK_TOKEN_FILE");
+    match result {
+        Err(ConfigError::Io(msg)) => assert!(msg.contains("1 MiB"), "{msg}"),
+        other => panic!("expected the 1 MiB cap, got {:?}", other.map(|_| ())),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "lifecycle")]
+#[tokio::test]
+async fn reload_on_follows_the_lifecycle_reload_handle() {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ferroly::lifecycle::ComponentManager;
+
+    let port = Arc::new(AtomicU16::new(1));
+    let source = port.clone();
+    let shared = SharedConfig::with_loader(move || {
+        let value = obj(&[("port", Value::UInt(source.load(Ordering::SeqCst).into()))]);
+        Ok(Config::builder().merge_value(value).build())
+    })
+    .unwrap();
+    let mgr = ComponentManager::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = shared.reload_on(mgr.subscribe_reload(), move |r| {
+        let _ = tx.send(r.map(|c| c.get::<u16>("port").unwrap()));
+    });
+
+    port.store(7, Ordering::SeqCst);
+    mgr.trigger_reload();
+    let seen = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen.unwrap(), 7);
+    assert_eq!(shared.get::<u16>("port").unwrap(), 7);
+    assert_eq!(shared.generation(), 1);
+
+    // The task ends with the manager.
+    drop(mgr);
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("reload_on ends when the reload handle goes away")
+        .unwrap();
 }

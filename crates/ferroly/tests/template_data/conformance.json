@@ -1,0 +1,1346 @@
+{
+ "generator": "Jinja2 3.1.4",
+ "cases": [
+  {
+   "template": "{% set c = 0 %}{% for i in range(3) %}{% set c = c + 1 %}{{ c }}{% endfor %}{{ c }}",
+   "context": {},
+   "expect": "1110"
+  },
+  {
+   "template": "{% for i in range(3) %}{% if i == 0 %}{% set c = 5 %}{% endif %}{{ c }}{% endfor %}",
+   "context": {},
+   "expect": "5"
+  },
+  {
+   "template": "{% for i in range(3) %}{{ c }}{% set c = i %}{% endfor %}",
+   "context": {
+    "c": "o"
+   },
+   "expect": "ooo"
+  },
+  {
+   "template": "{% if true %}{% set x = 1 %}{% endif %}{{ x }}",
+   "context": {},
+   "expect": "1"
+  },
+  {
+   "template": "{% set ns = namespace(i=0) %}{% for x in range(3) %}{% set ns.i = ns.i + x %}{% endfor %}{{ ns.i }}",
+   "context": {},
+   "expect": "3"
+  },
+  {
+   "template": "{% set ns = namespace() %}{% set ns.a = 'q' %}{{ ns.a }}",
+   "context": {},
+   "expect": "q"
+  },
+  {
+   "template": "{{ namespace({'a':1}, b=2).a }}{{ namespace({'a':1}, b=2).b }}",
+   "context": {},
+   "expect": "12"
+  },
+  {
+   "template": "{% set a, b = 1, 2 %}{{ a }}{{ b }}",
+   "context": {},
+   "expect": "12"
+  },
+  {
+   "template": "{% set x %}inner{{ 1 }}{% endset %}[{{ x }}]",
+   "context": {},
+   "expect": "[inner1]"
+  },
+  {
+   "template": "{% macro m(a, b='B') %}[{{ a }}{{ b }}]{% endmacro %}{{ m(1) }}{{ m(1, b=2) }}{{ m(1,2) }}",
+   "context": {},
+   "expect": "[1B][12][12]"
+  },
+  {
+   "template": "{% macro m(a) %}{{ a }}{% endmacro %}{{ m() }}|",
+   "context": {},
+   "expect": "|"
+  },
+  {
+   "template": "{% macro m(a) %}{{ a }}{% endmacro %}{{ m(1, 2) }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{% macro f(n) %}{% if n > 0 %}{{ n }}{{ f(n - 1) }}{% endif %}{% endmacro %}{{ f(3) }}",
+   "context": {},
+   "expect": "321"
+  },
+  {
+   "template": "{% set g = 'top' %}{% macro m() %}{{ g }}{% endmacro %}{% for i in [1] %}{% set g = 'loop' %}{{ m() }}{% endfor %}",
+   "context": {},
+   "expect": "top"
+  },
+  {
+   "template": "{{ [1, 'a', none, true, 1.5, {'k': 'v\"'}] }}",
+   "context": {},
+   "expect": "[1, 'a', None, True, 1.5, {'k': 'v\"'}]"
+  },
+  {
+   "template": "{{ 1e16 }} {{ 1.5e-5 }} {{ 0.1 + 0.2 }} {{ 10 / 4 }} {{ 7 // -2 }} {{ -7 % 3 }} {{ 2 ** 10 }} {{ -1 ** 2 }}",
+   "context": {},
+   "expect": "1e+16 1.5e-05 0.30000000000000004 2.5 -4 2 1024 1"
+  },
+  {
+   "template": "{{ 3.0 }}{{ 1e100 }}{{ 123456789012345678.0 }}{{ 0.0001 }}{{ 0.00001 }}{{ -0.0 }}",
+   "context": {},
+   "expect": "3.01e+1001.2345678901234568e+170.00011e-05-0.0"
+  },
+  {
+   "template": "{{ x }}",
+   "context": {
+    "x": [
+     "it's",
+     "a\"b",
+     "a'b\"c",
+     "tab\there",
+     "\u0001"
+    ]
+   },
+   "expect": "[\"it's\", 'a\"b', 'a\\'b\"c', 'tab\\there', '\\x01']"
+  },
+  {
+   "template": "{{ x }}",
+   "context": {
+    "x": 1.0
+   },
+   "expect": "1.0"
+  },
+  {
+   "template": "{{ x }}",
+   "context": {
+    "x": 9223372036854775813
+   },
+   "expect": "9223372036854775813"
+  },
+  {
+   "template": "{{ true }}{{ True }}{{ none }}{{ None }}{{ false }}",
+   "context": {},
+   "expect": "TrueTrueNoneNoneFalse"
+  },
+  {
+   "template": "{{ {'a': 1} }}{{ {} }}{{ [] }}",
+   "context": {},
+   "expect": "{'a': 1}{}[]"
+  },
+  {
+   "template": "{{ namespace(a=1) }}",
+   "context": {},
+   "expect": "<Namespace {'a': 1}>"
+  },
+  {
+   "template": "{% for i in [1] %}{{ loop }}{% endfor %}",
+   "context": {},
+   "expect": "<LoopContext 1/1>"
+  },
+  {
+   "template": "{{ 'a' 'b' }}",
+   "context": {},
+   "expect": "ab"
+  },
+  {
+   "template": "{{ \"\\u00e9\\t\\x41\\101\\q\" }}",
+   "context": {},
+   "expect": "é\tAA\\q"
+  },
+  {
+   "template": "{{ 'a\\nb' }}|{{ \"it's\" }}|{{ 'say \\\"x\\\"' }}",
+   "context": {},
+   "expect": "a\nb|it's|say \"x\""
+  },
+  {
+   "template": "{{ x.y }}",
+   "context": {},
+   "error": "undefined"
+  },
+  {
+   "template": "{{ x.y }}",
+   "context": {
+    "x": null
+   },
+   "expect": ""
+  },
+  {
+   "template": "{{ none.y }}|{{ none['a'] }}|{{ (none)[1:] }}",
+   "context": {},
+   "expect": "||"
+  },
+  {
+   "template": "{{ undefined_thing + 'a' }}",
+   "context": {},
+   "error": "undefined"
+  },
+  {
+   "template": "{{ 'a' ~ undefined_thing ~ 1 }}",
+   "context": {},
+   "expect": "a1"
+  },
+  {
+   "template": "{{ x.y.z }}",
+   "context": {},
+   "error": "undefined"
+  },
+  {
+   "template": "{{ 'abc'.foo }}|{{ 'abc'.foo is defined }}",
+   "context": {},
+   "expect": "|False"
+  },
+  {
+   "template": "{{ u < 1 }}",
+   "context": {},
+   "error": "undefined"
+  },
+  {
+   "template": "{{ u is not defined }}{{ none is none }}{{ 1 is number }}{{ true is number }}{{ true is boolean }}{{ 'a' is string }}",
+   "context": {},
+   "expect": "TrueTrueTrueTrueTrueTrue"
+  },
+  {
+   "template": "{{ u | length }}{{ u | list }}{{ u | default('d') }}{{ u | trim }}|{% for x in u %}x{% endfor %}",
+   "context": {},
+   "expect": "0[]d|"
+  },
+  {
+   "template": "{{ u[0] }}",
+   "context": {},
+   "error": "undefined"
+  },
+  {
+   "template": "{% if u %}yes{% else %}no{% endif %}",
+   "context": {},
+   "expect": "no"
+  },
+  {
+   "template": "{{ loop.index }}",
+   "context": {},
+   "error": "undefined"
+  },
+  {
+   "template": "{{ 'abc'[1:] }}{{ 'abc'[-1] }}{{ [1,2,3][::-1] }}{{ [1,2,3][5] }}",
+   "context": {},
+   "expect": "bcc[3, 2, 1]"
+  },
+  {
+   "template": "{{ [1,2,3][1:2] }}{{ [1,2,3][-2:] }}{{ [1,2,3][:-1] }}{{ 'hello'[::2] }}",
+   "context": {},
+   "expect": "[2][2, 3][1, 2]hlo"
+  },
+  {
+   "template": "{{ 'é'[0] }}{{ 'héllo'[1:3] }}",
+   "context": {},
+   "expect": "éél"
+  },
+  {
+   "template": "{{ x.0 }}",
+   "context": {
+    "x": [
+     5
+    ]
+   },
+   "expect": "5"
+  },
+  {
+   "template": "{{ x['a'] }}{{ x.a }}{{ x.b }}",
+   "context": {
+    "x": {
+     "a": 1
+    }
+   },
+   "expect": "11"
+  },
+  {
+   "template": "{{ m.get('a') }}{{ m.get('z', 'd') }}{{ m.keys() | list }}{{ m.values() | list }}",
+   "context": {
+    "m": {
+     "a": 1
+    }
+   },
+   "expect": "1d['a'][1]"
+  },
+  {
+   "template": "{{ [1,2,3][1:3:0] }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "  {% if true %}\n  x\n  {% endif %}\n  y\n",
+   "context": {},
+   "expect": "  x\n  y"
+  },
+  {
+   "template": "a\n  {%+ if true %}b{% endif %}",
+   "context": {},
+   "expect": "a\n  b"
+  },
+  {
+   "template": "a {# c #}\nb",
+   "context": {},
+   "expect": "a b"
+  },
+  {
+   "template": "a\n  {# c #}\nb",
+   "context": {},
+   "expect": "a\nb"
+  },
+  {
+   "template": "{% raw %}{{ x }}{% endraw %}\nz",
+   "context": {},
+   "expect": "{{ x }}z"
+  },
+  {
+   "template": "{% raw %}\nx{% endraw %}\ny",
+   "context": {},
+   "expect": "\nxy"
+  },
+  {
+   "template": "{% raw -%}\n  x  {%- endraw %}\ny",
+   "context": {},
+   "expect": "xy"
+  },
+  {
+   "template": "a\n  {% raw %}x{% endraw %}",
+   "context": {},
+   "expect": "a\nx"
+  },
+  {
+   "template": "  {% raw %}x\n  {% endraw %}\nq",
+   "context": {},
+   "expect": "x\nq"
+  },
+  {
+   "template": "{{ 'a' }}\n{{ 'b' }}",
+   "context": {},
+   "expect": "a\nb"
+  },
+  {
+   "template": "x\n",
+   "context": {},
+   "expect": "x"
+  },
+  {
+   "template": "x\n\n",
+   "context": {},
+   "expect": "x\n"
+  },
+  {
+   "template": "{{ x }}\n  {% if true %}y{% endif %}",
+   "context": {
+    "x": 1
+   },
+   "expect": "1\ny"
+  },
+  {
+   "template": "{{ x }}  {% if true %}y{% endif %}",
+   "context": {
+    "x": 1
+   },
+   "expect": "1  y"
+  },
+  {
+   "template": "{% if true -%}\n  \n  {% if true %}y{% endif %}{% endif %}",
+   "context": {},
+   "expect": "y"
+  },
+  {
+   "template": "a\r\nb\r\n{% if true %}\r\nc{% endif %}\r\n",
+   "context": {},
+   "expect": "a\nb\nc"
+  },
+  {
+   "template": "{{ 'a\r\nb' }}",
+   "context": {},
+   "expect": "a\nb"
+  },
+  {
+   "template": "{{- 'x' -}}  \n {{ 'y' }}",
+   "context": {},
+   "expect": "xy"
+  },
+  {
+   "template": "{%- set x = 1 -%}\n\n{{ x }}",
+   "context": {},
+   "expect": "1"
+  },
+  {
+   "template": "{% if true %}\n  {{ 'x' }}\n{% endif %}",
+   "context": {},
+   "expect": "  x\n"
+  },
+  {
+   "template": "{{ 'a' }}  {%- if true %}b{% endif %}",
+   "context": {},
+   "expect": "ab"
+  },
+  {
+   "template": "{# a #}{#- b -#}  x {#+ c +#}\ny",
+   "context": {},
+   "expect": "x \ny"
+  },
+  {
+   "template": "{{ {'a': {'b': 1}} }}",
+   "context": {},
+   "expect": "{'a': {'b': 1}}"
+  },
+  {
+   "template": "{% for a, b in [[1,2],[3,4]] %}{{ a }}{{ b }}{% endfor %}",
+   "context": {},
+   "expect": "1234"
+  },
+  {
+   "template": "{% for x in [1,2,3,4] if x is odd %}{{ loop.index }}/{{ loop.length }}{{ loop.last }} {% endfor %}",
+   "context": {},
+   "expect": "1/2False 2/2True "
+  },
+  {
+   "template": "{% for x in [] %}a{% else %}empty{% endfor %}",
+   "context": {},
+   "expect": "empty"
+  },
+  {
+   "template": "{% for x in [1,2] %}{{ x }}{% else %}e{% endfor %}",
+   "context": {},
+   "expect": "12"
+  },
+  {
+   "template": "{% for x in [1,2] %}{{ loop.previtem }}-{{ loop.nextitem }};{% endfor %}",
+   "context": {},
+   "expect": "-2;1-;"
+  },
+  {
+   "template": "{% for i in [1,2,3] %}{{ loop.revindex }}{{ loop.revindex0 }}{{ loop.cycle('a','b') }}{{ loop.depth }}{{ loop.first }}{{ loop.index0 }}{% endfor %}",
+   "context": {},
+   "expect": "32a1True021b1False110a1False2"
+  },
+  {
+   "template": "{% for i in range(5) %}{% if i == 2 %}{% continue %}{% endif %}{% if i == 4 %}{% break %}{% endif %}{{ i }}{% endfor %}",
+   "context": {},
+   "expect": "013"
+  },
+  {
+   "template": "{% for k, v in x.items() %}{{ k }}={{ v }};{% endfor %}",
+   "context": {
+    "x": {
+     "b": 1,
+     "a": 2
+    }
+   },
+   "expect": "b=1;a=2;"
+  },
+  {
+   "template": "{% for k in x %}{{ k }}{% endfor %}",
+   "context": {
+    "x": {
+     "b": 1,
+     "a": 2
+    }
+   },
+   "expect": "ba"
+  },
+  {
+   "template": "{% for c in 'abc' %}{{ c }}-{% endfor %}",
+   "context": {},
+   "expect": "a-b-c-"
+  },
+  {
+   "template": "{% for x in 5 %}{% endfor %}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{% for o in [1,2] %}{% for i in [3,4] %}{{ o }}{{ i }}{{ loop.index }} {% endfor %}{% endfor %}",
+   "context": {},
+   "expect": "131 142 231 242 "
+  },
+  {
+   "template": "{% for x in [1,2] %}{% set outer = loop %}{% for y in [1] %}{{ outer.index }}{% endfor %}{% endfor %}",
+   "context": {},
+   "expect": "12"
+  },
+  {
+   "template": "{% for k, v in x | dictsort %}{{ k }}{% endfor %}",
+   "context": {
+    "x": {
+     "b": 1,
+     "a": 2
+    }
+   },
+   "expect": "ab"
+  },
+  {
+   "template": "{% for a, b in [[1, 2, 3]] %}{% endfor %}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{{ 1 < 2 < 3 }}{{ 'a' in 'cat' }}{{ 1 not in [1] }}{{ not 1 == 2 }}{{ 3 > 2 > 2 }}",
+   "context": {},
+   "expect": "TrueTrueFalseTrueFalse"
+  },
+  {
+   "template": "{{ 1 == 1.0 }}{{ true == 1 }}{{ 'a' < 'b' }}{{ [1,2] < [1,3] }}",
+   "context": {},
+   "expect": "TrueTrueTrueTrue"
+  },
+  {
+   "template": "{{ [1,2] == [1,2] }}{{ {'a':1} == {'a':1} }}{{ 'a' == 1 }}{{ 'x' != false }}",
+   "context": {},
+   "expect": "TrueTrueFalseTrue"
+  },
+  {
+   "template": "{{ 'x' if false }}|{{ 'x' if true else 'y' }}|{{ 'a' if 0 else 'b' if 0 else 'c' }}",
+   "context": {},
+   "expect": "|x|c"
+  },
+  {
+   "template": "{{ not none }}{{ - 2 }}{{ +2 }}{{ 3 - -2 }}",
+   "context": {},
+   "expect": "True-225"
+  },
+  {
+   "template": "{{ 'abc' ~ 1 ~ none ~ true }}",
+   "context": {},
+   "expect": "abc1NoneTrue"
+  },
+  {
+   "template": "{{ 'x' + 1 }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{{ [1,2] + 'a' }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{{ 1 < 'a' }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{{ 5 / 0 }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{{ 3 // 0 }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{{ 2 ** -1 }}{{ 2.0 ** 2 }}{{ 7 % -3 }}{{ 7.5 % 2 }}{{ -7 // 2 }}{{ 7 / 7 }}",
+   "context": {},
+   "expect": "0.54.0-21.5-41.0"
+  },
+  {
+   "template": "{{ 'a' * 3 }}{{ [1] * 2 }}{{ 3 * 'b' }}{{ 'a' * -1 }}|{{ 0.1 * 3 }}",
+   "context": {},
+   "expect": "aaa[1, 1]bbb|0.30000000000000004"
+  },
+  {
+   "template": "{{ 1 + 1.5 }}{{ 3 * 1.0 }}{{ 2 ** 0.5 }}{{ 2 ** 100 }}",
+   "context": {},
+   "expect": "2.53.01.41421356237309511267650600228229401496703205376"
+  },
+  {
+   "template": "{{ 1 + true }}",
+   "context": {},
+   "expect": "2"
+  },
+  {
+   "template": "{{ 1 or 2 }}{{ 0 or 'x' }}{{ 1 and 0 }}{{ '' and 1 }}{{ none or none }}",
+   "context": {},
+   "expect": "1x0None"
+  },
+  {
+   "template": "{{ (1 == 1) != (2 == 3) }}",
+   "context": {},
+   "expect": "True"
+  },
+  {
+   "template": "{{ 'a' in ['a', 'b'] }}{{ 'k' in {'k': 1} }}{{ 'z' in u }}",
+   "context": {},
+   "expect": "TrueTrueFalse"
+  },
+  {
+   "template": "{{ [1, 2] + [3] }}",
+   "context": {},
+   "expect": "[1, 2, 3]"
+  },
+  {
+   "template": "{{ 'x' + message['content'] | trim + 'y' }}",
+   "context": {
+    "message": {
+     "content": "  hi  "
+    }
+   },
+   "expect": "xhiy"
+  },
+  {
+   "template": "{{ -x | abs }}",
+   "context": {
+    "x": 3
+   },
+   "expect": "3"
+  },
+  {
+   "template": "{{ (1, 2) | list }}{{ () | length }}",
+   "context": {},
+   "expect": "[1, 2]0"
+  },
+  {
+   "template": "{{ [1, 2,] }}{{ {'a': 1,} }}",
+   "context": {},
+   "expect": "[1, 2]{'a': 1}"
+  },
+  {
+   "template": "{{ x is sequence }}{{ x is iterable }}{{ x is mapping }}",
+   "context": {
+    "x": "s"
+   },
+   "expect": "TrueTrueFalse"
+  },
+  {
+   "template": "{{ x is iterable }}{{ y is iterable }}{{ z is sequence }}{{ z is mapping }}",
+   "context": {
+    "x": 1,
+    "y": [],
+    "z": {}
+   },
+   "expect": "FalseTrueTrueTrue"
+  },
+  {
+   "template": "{{ 'a' is in 'abc' }}{{ 2 is in [1,2] }}",
+   "context": {},
+   "expect": "TrueTrue"
+  },
+  {
+   "template": "{{ x is true }}{{ y is false }}",
+   "context": {
+    "x": true,
+    "y": 0
+   },
+   "expect": "TrueFalse"
+  },
+  {
+   "template": "{{ 1 is integer }}{{ 1.0 is float }}{{ true is integer }}",
+   "context": {},
+   "expect": "TrueTrueFalse"
+  },
+  {
+   "template": "{{ 'abc' is lower }}{{ 4 is divisibleby 2 }}{{ 3 is even }}{{ 3 is odd }}{{ 'ABC' is upper }}",
+   "context": {},
+   "expect": "TrueTrueFalseTrueTrue"
+  },
+  {
+   "template": "{{ none is defined }}{{ x is none }}{{ x is not none }}",
+   "context": {
+    "x": null
+   },
+   "expect": "TrueTrueFalse"
+  },
+  {
+   "template": "{{ 'user' is equalto 'user' }}{{ 1 is eq 2 }}{{ 3 is gt 2 }}{{ 3 is ge 3 }}{{ 1 is lt 2 }}{{ 1 is ne 1 }}",
+   "context": {},
+   "expect": "TrueFalseTrueTrueTrueFalse"
+  },
+  {
+   "template": "{{ none is sameas none }}{{ true is sameas true }}{{ x is callable }}{{ range is callable }}",
+   "context": {
+    "x": 1
+   },
+   "expect": "TrueTrueFalseTrue"
+  },
+  {
+   "template": "{{ x is defined and x }}",
+   "context": {
+    "x": 0
+   },
+   "expect": "0"
+  },
+  {
+   "template": "{{ 'x' | tojson }}{{ {'b':1,'a':[1,2]} | tojson }}{{ {'b':1,'a':[1,{}]} | tojson(indent=2) }}",
+   "context": {},
+   "expect": "\"x\"{\"b\": 1, \"a\": [1, 2]}{\n  \"b\": 1,\n  \"a\": [\n    1,\n    {}\n  ]\n}"
+  },
+  {
+   "template": "{{ x | tojson }}",
+   "context": {
+    "x": {
+     "a": {
+      "b": [
+       1,
+       2.5,
+       null,
+       true,
+       "s"
+      ]
+     }
+    }
+   },
+   "expect": "{\"a\": {\"b\": [1, 2.5, null, true, \"s\"]}}"
+  },
+  {
+   "template": "{{ 'é😀\\t\"<&>' | tojson }}",
+   "context": {},
+   "expect": "\"é😀\\t\\\"<&>\""
+  },
+  {
+   "template": "{{ [1,[2,[3]]] | tojson(indent=1) }}",
+   "context": {},
+   "expect": "[\n 1,\n [\n  2,\n  [\n   3\n  ]\n ]\n]"
+  },
+  {
+   "template": "{{ x | tojson(separators=(',', ':')) }}",
+   "context": {
+    "x": {
+     "a": [
+      1,
+      2
+     ]
+    }
+   },
+   "expect": "{\"a\":[1,2]}"
+  },
+  {
+   "template": "{{ x | tojson(sort_keys=true) }}{{ x | tojson(ensure_ascii=true) }}",
+   "context": {
+    "x": {
+     "b": "é",
+     "a": 2
+    }
+   },
+   "expect": "{\"a\": 2, \"b\": \"é\"}{\"b\": \"\\u00e9\", \"a\": 2}"
+  },
+  {
+   "template": "{{ '  a  ' | trim }}|{{ 'a,b,,c'.split(',') }}|{{ ' a  b '.split() }}|{{ 'hello world'.title() }}|{{ 'hELLO'.capitalize() }}",
+   "context": {},
+   "expect": "a|['a', 'b', '', 'c']|['a', 'b']|Hello World|Hello"
+  },
+  {
+   "template": "{{ 'abc' | list }}{{ {'a':1} | list }}{{ 'abc' | first }}{{ [] | first }}|{{ none | default('d') }}|{{ u | default('d') }}|{{ '' | default('d', true) }}|{{ u | d }}",
+   "context": {},
+   "expect": "['a', 'b', 'c']['a']a|None|d|d|"
+  },
+  {
+   "template": "{{ 'line1\nline2\n\nline3' | indent(2) }}",
+   "context": {},
+   "expect": "line1\n  line2\n\n  line3"
+  },
+  {
+   "template": "{{ 'line1\nline2\n\nline3' | indent(2, true, true) }}",
+   "context": {},
+   "expect": "  line1\n  line2\n  \n  line3"
+  },
+  {
+   "template": "{{ 'x' | indent }}|{{ 'a\nb' | indent('> ') }}|{{ 'a\n' | indent(first=true) }}",
+   "context": {},
+   "expect": "x|a\n> b|    a\n"
+  },
+  {
+   "template": "{{ '42' | int }}{{ '4.5' | int }}{{ 'x' | int }}{{ 3.9 | int }}{{ '0x1A' | int(base=16) }}{{ true | int }}",
+   "context": {},
+   "expect": "42403261"
+  },
+  {
+   "template": "{{ 1.5 | int }}{{ -3.5|int }}{{ '  12 '|int }}{{ '1_000'|int }}{{ '0b11'|int(base=0) }}{{ 'q' | int(7) }}",
+   "context": {},
+   "expect": "1-312100037"
+  },
+  {
+   "template": "{{ 10 | float }}{{ 'x' | float }}{{ '1.5' | float }}",
+   "context": {},
+   "expect": "10.00.01.5"
+  },
+  {
+   "template": "{{ [3,1,2] | sort }}{{ [1,2,2] | unique | list }}{{ [1,2] | sum }}{{ [1,2] | max }}{{ 'abc' | reverse }}",
+   "context": {},
+   "expect": "[1, 2, 3][1, 2]32cba"
+  },
+  {
+   "template": "{{ [1, 2, 3] | min }}{{ ['b','A','a'] | sort }}{{ ['b','A','a'] | sort(case_sensitive=true) }}{{ [3,1] | sort(reverse=true) }}",
+   "context": {},
+   "expect": "1['A', 'a', 'b']['A', 'a', 'b'][3, 1]"
+  },
+  {
+   "template": "{{ users | sort(attribute='n') | map(attribute='n') | join(',') }}",
+   "context": {
+    "users": [
+     {
+      "n": "b"
+     },
+     {
+      "n": "a"
+     }
+    ]
+   },
+   "expect": "a,b"
+  },
+  {
+   "template": "{{ users | selectattr('a') | map(attribute='n') | join(',') }}",
+   "context": {
+    "users": [
+     {
+      "a": 1,
+      "n": "x"
+     },
+     {
+      "a": 0,
+      "n": "y"
+     },
+     {
+      "n": "z"
+     }
+    ]
+   },
+   "expect": "x"
+  },
+  {
+   "template": "{{ users | map(attribute='n', default='q') | list }}",
+   "context": {
+    "users": [
+     {
+      "n": "x"
+     },
+     {}
+    ]
+   },
+   "expect": "['x', 'q']"
+  },
+  {
+   "template": "{{ users | rejectattr('a') | list }}",
+   "context": {
+    "users": [
+     {
+      "a": 1
+     },
+     {
+      "a": 0
+     }
+    ]
+   },
+   "expect": "[{'a': 0}]"
+  },
+  {
+   "template": "{{ users | selectattr('r', 'equalto', 'u') | list | length }}",
+   "context": {
+    "users": [
+     {
+      "r": "u"
+     },
+     {
+      "r": "a"
+     }
+    ]
+   },
+   "expect": "1"
+  },
+  {
+   "template": "{{ [1,2,3] | select('odd') | list }}{{ [1,2,3] | reject('odd') | list }}{{ ['a','b'] | map('upper') | list }}{{ [0, 1, ''] | select | list }}",
+   "context": {},
+   "expect": "[1, 3][2]['A', 'B'][1]"
+  },
+  {
+   "template": "{{ x | string }}",
+   "context": {
+    "x": {
+     "a": [
+      1,
+      "b"
+     ]
+    }
+   },
+   "expect": "{'a': [1, 'b']}"
+  },
+  {
+   "template": "{{ none | string }}{{ true | string }}{{ 1.0 | string }}{{ 1 | string | length }}",
+   "context": {},
+   "expect": "NoneTrue1.01"
+  },
+  {
+   "template": "{{ 'abc' | center(7) }}|{{ 'ab' | center(7) }}",
+   "context": {},
+   "expect": "  abc  |   ab  "
+  },
+  {
+   "template": "{% set x = [1,2] %}{{ x | first }}{{ x | last }}{{ x | count }}{{ x | length }}",
+   "context": {},
+   "expect": "1222"
+  },
+  {
+   "template": "{{ 'abc' | replace('b', 'X') }}{{ 'aaa' | replace('a', 'b', 2) }}{{ 'a' | replace('', '-') }}",
+   "context": {},
+   "expect": "aXcbba-a-"
+  },
+  {
+   "template": "{{ ' x '|trim('x ') }}{{ 'abc' | trim('ac') }}",
+   "context": {},
+   "expect": "b"
+  },
+  {
+   "template": "{{ 2.5 | round }}{{ 3.5 | round }}{{ 2.567 | round(2) }}{{ 2.1 | round(method='ceil') }}{{ 2.9 | round(0, 'floor') }}{{ 5 | round }}",
+   "context": {},
+   "expect": "2.04.02.573.02.05"
+  },
+  {
+   "template": "{{ 'one two' | wordcount }}{{ 'é' | upper }}{{ 'AbC' | lower }}{{ 'abc' | capitalize }}{{ 'ABC def' | title }}",
+   "context": {},
+   "expect": "2ÉabcAbcAbc Def"
+  },
+  {
+   "template": "{% for k, v in x | dictsort %}{{ k }}{{ v }}{% endfor %}",
+   "context": {
+    "x": {
+     "b": 1,
+     "a": 2
+    }
+   },
+   "expect": "a2b1"
+  },
+  {
+   "template": "{% for k, v in x | dictsort(by='value') %}{{ k }}{{ v }}{% endfor %}",
+   "context": {
+    "x": {
+     "b": 1,
+     "a": 2
+    }
+   },
+   "expect": "b1a2"
+  },
+  {
+   "template": "{{ 'x' | e }}{{ '<a href=\"x\">&\\'' | escape }}{{ 'x' | safe }}",
+   "context": {},
+   "expect": "x&lt;a href=&#34;x&#34;&gt;&amp;&#39;x"
+  },
+  {
+   "template": "{{ [1,2] | reverse | list }}",
+   "context": {},
+   "expect": "[2, 1]"
+  },
+  {
+   "template": "{{ 5 | abs }}{{ -5.5 | abs }}",
+   "context": {},
+   "expect": "55.5"
+  },
+  {
+   "template": "{% for k, v in {'a': 1, 'b': 2} | items %}{{ k }}{{ v }}{% endfor %}{{ {'a': 1} | items | list | length }}",
+   "context": {},
+   "expect": "a1b21"
+  },
+  {
+   "template": "{{ [1, 'a'] | join }}{{ [1,2] | join('-') }}{{ users | join(', ', attribute='n') }}",
+   "context": {
+    "users": [
+     {
+      "n": "x"
+     },
+     {
+      "n": "y"
+     }
+    ]
+   },
+   "expect": "1a1-2x, y"
+  },
+  {
+   "template": "{{ x | attr('a') }}",
+   "context": {
+    "x": {
+     "a": "v"
+    }
+   },
+   "expect": ""
+  },
+  {
+   "template": "{{ [1, 2.5] | sum }}{{ [[1], [2]] | sum(start=[]) }}",
+   "context": {},
+   "expect": "3.5[1, 2]"
+  },
+  {
+   "template": "{{ ['A', 'a', 'b'] | unique | list }}{{ ['A', 'a'] | unique(case_sensitive=true) | list }}",
+   "context": {},
+   "expect": "['A', 'b']['A', 'a']"
+  },
+  {
+   "template": "{{ [] | max }}|{{ [] | sum }}",
+   "context": {},
+   "expect": "|0"
+  },
+  {
+   "template": "{{ 1 | length }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{{ 'abc'.startswith(('x','a')) }}{{ 'a-b-c'.replace('-', '+', 1) }}{{ '%' }}{{ 'abc'.endswith('c') }}{{ 'abc'.startswith('a', 1) }}",
+   "context": {},
+   "expect": "Truea+b-c%TrueFalse"
+  },
+  {
+   "template": "{{ ', '.join(['a','b']) }}",
+   "context": {},
+   "expect": "a, b"
+  },
+  {
+   "template": "{{ ''.join(['a', 1]) }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{{ 'A B'.lower() }}{{ 'ab'.upper() }}{{ '  x '.lstrip() }}|{{ '  x '.rstrip() }}|{{ 'xxaxx'.strip('x') }}|{{ ' y '.strip() }}",
+   "context": {},
+   "expect": "a bABx |  x|a|y"
+  },
+  {
+   "template": "{{ 'a b c'.split(' ', 1) }}{{ 'a\nb\r\nc'.splitlines() }}{{ 'a b c'.rsplit(None, 1) }}{{ 'a,b,c'.rsplit(',', 1) }}",
+   "context": {},
+   "expect": "['a', 'b c']['a', 'b', 'c']['a b', 'c']['a,b', 'c']"
+  },
+  {
+   "template": "{{ 'hello'.find('l') }}{{ 'hello'.count('l') }}{{ 'hello'.find('z') }}",
+   "context": {},
+   "expect": "22-1"
+  },
+  {
+   "template": "{{ 'They\\'re bill\\'s friends from the UK'.title() }}",
+   "context": {},
+   "expect": "They'Re Bill'S Friends From The Uk"
+  },
+  {
+   "template": "{{ '123'.isdigit() }}{{ 'ab'.isalpha() }}{{ ' '.isspace() }}{{ 'ab'.islower() }}{{ 'AB'.isupper() }}{{ 'a1'.isalnum() }}",
+   "context": {},
+   "expect": "TrueTrueTrueTrueTrueTrue"
+  },
+  {
+   "template": "{{ [1, 2, 1].count(1) }}{{ [1, 2].index(2) }}",
+   "context": {},
+   "expect": "21"
+  },
+  {
+   "template": "{{ 'x'.zzz() }}",
+   "context": {},
+   "error": "undefined"
+  },
+  {
+   "template": "{{ range(1, 10, 3) | list }}{{ range(5, 0, -2) | list }}{{ range(3) | list }}{{ range(0) | list }}",
+   "context": {},
+   "expect": "[1, 4, 7][5, 3, 1][0, 1, 2][]"
+  },
+  {
+   "template": "{{ dict(a=1, b=2) }}",
+   "context": {},
+   "expect": "{'a': 1, 'b': 2}"
+  },
+  {
+   "template": "{{ raise_exception('boom') }}",
+   "context": {},
+   "error": "raised",
+   "message": "boom"
+  },
+  {
+   "template": "{% if x %}{{ raise_exception('bad: ' ~ x) }}{% endif %}",
+   "context": {
+    "x": 3
+   },
+   "error": "raised",
+   "message": "bad: 3"
+  },
+  {
+   "template": "{#- comment #}a{# multi\nline #}b",
+   "context": {},
+   "expect": "ab"
+  },
+  {
+   "template": "{% raw %}{% if %}{{ }}{% endraw %}",
+   "context": {},
+   "expect": "{% if %}{{ }}"
+  },
+  {
+   "template": "{{ x }}",
+   "context": {
+    "x": "{{ not_a_var }} {% if %}"
+   },
+   "expect": "{{ not_a_var }} {% if %}"
+  },
+  {
+   "template": "{{ 'a' }}{{ \"b\" }}{{ 'c\\'d' }}{{ \"e\\\"f\" }}",
+   "context": {},
+   "expect": "abc'de\"f"
+  },
+  {
+   "template": "{{ [1,2,3][-1] }}{{ messages[1:][0] }}",
+   "context": {
+    "messages": [
+     "a",
+     "b"
+    ]
+   },
+   "expect": "3b"
+  },
+  {
+   "template": "{{ ([] * 100000000000000000)|length }}{{ (100000000000000000 * [])|length }}{{ [1, 2] * 0 }}{{ '' * 100000000000000000 }}|",
+   "context": {},
+   "expect": "00[]|"
+  },
+  {
+   "template": "{{ [3, 1.5, 2, true, -1000000000.0, 100000000000000000000]|sort }}",
+   "context": {},
+   "expect": "[-1000000000.0, True, 1.5, 2, 3, 100000000000000000000]"
+  },
+  {
+   "template": "{{ [1, 'a']|sort }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{{ [none, none]|sort }}{{ [[none, 1], [none, 0]]|sort }}",
+   "context": {},
+   "expect": "[None, None][[None, 0], [None, 1]]"
+  },
+  {
+   "template": "{{ [[2, 1], [1, 2], [1]]|sort }}{{ [[1, 'a'], [0, 3]]|sort }}",
+   "context": {},
+   "expect": "[[1], [1, 2], [2, 1]][[0, 3], [1, 'a']]"
+  },
+  {
+   "template": "{{ [1, 2, 3][1::170141183460469231731687303715884105727] }}{{ [1, 2, 3][::-170141183460469231731687303715884105727] }}{{ 'abc'[170141183460469231731687303715884105727:] }}|",
+   "context": {},
+   "expect": "[2][3]|"
+  },
+  {
+   "template": "{{ range(5, 1, -170141183460469231731687303715884105727 - 1)|list }}{{ range(-170141183460469231731687303715884105727, 0, 170141183460469231731687303715884105727)|list }}",
+   "context": {},
+   "expect": "[5][-170141183460469231731687303715884105727]"
+  },
+  {
+   "template": "{{ messages|map(attribute='function.name', default='q')|list }}",
+   "context": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "S"
+     },
+     {
+      "role": "user",
+      "content": " hi "
+     },
+     {
+      "role": "assistant",
+      "content": "yo",
+      "tool_calls": [
+       {
+        "id": "abc",
+        "function": {
+         "name": "f",
+         "arguments": {
+          "a": 1
+         }
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "['q', 'q', 'q']"
+  },
+  {
+   "template": "{{ messages|map(attribute='tool_calls.0.id', default='-')|list }}",
+   "context": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "S"
+     },
+     {
+      "role": "user",
+      "content": " hi "
+     },
+     {
+      "role": "assistant",
+      "content": "yo",
+      "tool_calls": [
+       {
+        "id": "abc",
+        "function": {
+         "name": "f",
+         "arguments": {
+          "a": 1
+         }
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "['-', '-', 'abc']"
+  },
+  {
+   "template": "{{ messages|map(attribute='role', default=none)|list }}{{ messages|map(attribute='role.x', default={'x': 5})|list }}",
+   "context": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "S"
+     },
+     {
+      "role": "user",
+      "content": " hi "
+     },
+     {
+      "role": "assistant",
+      "content": "yo",
+      "tool_calls": [
+       {
+        "id": "abc",
+        "function": {
+         "name": "f",
+         "arguments": {
+          "a": 1
+         }
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "['system', 'user', 'assistant'][{'x': 5}, {'x': 5}, {'x': 5}]"
+  },
+  {
+   "template": "{% for m in messages %}{% macro g() %}{{ m.role }}{{ loop.index }}{% endmacro %}{{ g() }}{% endfor %}",
+   "context": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "S"
+     },
+     {
+      "role": "user",
+      "content": " hi "
+     },
+     {
+      "role": "assistant",
+      "content": "yo",
+      "tool_calls": [
+       {
+        "id": "abc",
+        "function": {
+         "name": "f",
+         "arguments": {
+          "a": 1
+         }
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "system1user2assistant3"
+  },
+  {
+   "template": "{% for m in messages %}{% macro g(n) %}{{ n }}{% if n > 0 %}{{ g(n - 1) }}{% endif %}{% endmacro %}{{ g(1) }}{% endfor %}",
+   "context": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "S"
+     },
+     {
+      "role": "user",
+      "content": " hi "
+     },
+     {
+      "role": "assistant",
+      "content": "yo",
+      "tool_calls": [
+       {
+        "id": "abc",
+        "function": {
+         "name": "f",
+         "arguments": {
+          "a": 1
+         }
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "101010"
+  },
+  {
+   "template": "{% macro outer(a) %}{% macro inner() %}{{ a }}{% endmacro %}{{ inner() }}{% endmacro %}{{ outer(7) }}{{ outer('x') }}",
+   "context": {},
+   "expect": "7x"
+  },
+  {
+   "template": "{% set x = 1 %}{% macro g() %}{{ x }}{% endmacro %}{% set x = 2 %}{{ g() }}",
+   "context": {},
+   "expect": "2"
+  },
+  {
+   "template": "{{ 01 }}",
+   "context": {},
+   "error": "parse"
+  },
+  {
+   "template": "{{ 1__0 }}",
+   "context": {},
+   "error": "parse"
+  },
+  {
+   "template": "{{ 1_ }}",
+   "context": {},
+   "error": "parse"
+  },
+  {
+   "template": "{{ 0x1__f }}",
+   "context": {},
+   "error": "parse"
+  },
+  {
+   "template": "{{ 1_e5 }}",
+   "context": {},
+   "error": "parse"
+  },
+  {
+   "template": "{{ 0_0 }}{{ 00 }}{{ 0x_1f }}{{ 1e1_0 }}{{ 01.5 }}{{ 1_0.0_1 }}{{ 0b1_0 }}{{ 0o7_7 }}",
+   "context": {},
+   "expect": "003110000000000.01.510.01263"
+  },
+  {
+   "template": "{{ 1|round(-400) }}{{ 1.0|round(-400) }}{{ -5.0|round(-400) }}{{ 15|round(-1) }}{{ 25|round(-1) }}{{ 35|round(-1) }}",
+   "context": {},
+   "expect": "00.0-0.0202040"
+  },
+  {
+   "template": "{{ 0 ** -1 }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{{ 0.0 ** -1 }}",
+   "context": {},
+   "error": "type"
+  },
+  {
+   "template": "{{ '--5'|int }}{{ '+-5'|int }}{{ ' -0x5'|int(0, 16) }}",
+   "context": {},
+   "expect": "00-5"
+  },
+  {
+   "template": "{{ undefinedv|int }}",
+   "context": {},
+   "error": "undefined"
+  },
+  {
+   "template": "{{ undefinedv|float }}",
+   "context": {},
+   "error": "undefined"
+  },
+  {
+   "template": "{{ undefinedv|indent }}",
+   "context": {},
+   "error": "undefined"
+  }
+ ]
+}

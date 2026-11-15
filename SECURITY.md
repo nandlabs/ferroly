@@ -2,14 +2,33 @@
 
 ## Supported Versions
 
-Ferroly is pre-1.0. Security fixes are applied to the latest released version on
-[crates.io](https://crates.io/crates/ferroly) and the `main` branch. Please make
-sure you are on the latest version before reporting.
+Ferroly is pre-1.0, and only the newest release line receives security fixes.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| latest  | :white_check_mark: |
-| older   | :x:                |
+| Version                      | Supported          |
+| ---------------------------- | ------------------ |
+| 0.6.x (the newest release)   | :white_check_mark: |
+| `main`                       | :white_check_mark: |
+| 0.5.x and older              | :x:                |
+
+Where fixes land:
+
+- **`main` first.** Every fix is merged to `main` and released in the next
+  version, which is tagged `v<version>` in this repository.
+- **crates.io from the tag.** A release reaches
+  [crates.io](https://crates.io/crates/ferroly) when its tag is published (the
+  `Publish to crates.io` workflow, which runs only from `main` and waits for a
+  maintainer's approval); a daily `crates.io drift` check fails while any release
+  tag newer than the newest published one, or the version on `main`, is missing
+  there. Check the newest version there against the repository's newest `v*` tag.
+  At the time of writing 0.4.0 and 0.5.0 are tagged but not yet on crates.io
+  (which stops at 0.3.2). If crates.io is behind, depend on the tag directly until
+  it catches up:
+  `ferroly = { git = "https://github.com/nandlabs/ferroly", tag = "v0.6.0" }`.
+- **Old crates.io versions are not patched.** In particular, 0.3.2 and earlier
+  have known vulnerabilities that were fixed in later releases (see
+  `CHANGELOG.md`). Upgrade rather than wait for a backport.
+
+Please check that you are on the newest release, or on `main`, before reporting.
 
 ## Reporting a Vulnerability
 
@@ -44,8 +63,9 @@ XML / YAML codecs, SHA-1 handshake, etc.), the security surface lives largely in
 this repository rather than in dependencies. Reports concerning any of these
 in-house implementations are especially welcome.
 
-TLS is provided by [`rustls`](https://github.com/rustls/rustls) (with the `ring`
-crypto provider); vulnerabilities in the underlying TLS/crypto stack should be
+TLS is provided by [`rustls`](https://github.com/rustls/rustls), with the `ring`
+crypto provider by default (the `tls-ring` feature) or whichever rustls
+`CryptoProvider` the application installs; vulnerabilities in the underlying TLS/crypto stack should be
 reported upstream to those projects, though we appreciate a heads-up so we can
 bump the pinned versions.
 

@@ -273,7 +273,7 @@ mod openai {
         assert_eq!(items[0].as_ref().unwrap().text(), "par");
         let err = items.last().unwrap().as_ref().unwrap_err();
         assert!(
-            matches!(err, GenAiError::Api { status: 500, message } if message.contains("server had an error")),
+            matches!(err, GenAiError::Api { status: 500, message, .. } if message.contains("server had an error")),
             "{err:?}"
         );
 
@@ -548,7 +548,9 @@ mod openai {
             other => panic!("expected Overloaded, got {other:?}"),
         }
         match next().await.unwrap_err() {
-            GenAiError::Api { status, message } => {
+            GenAiError::Api {
+                status, message, ..
+            } => {
                 assert_eq!(status, 400);
                 assert!(message.len() < 2_200, "body was capped: {}", message.len());
                 assert!(message.ends_with("[truncated]"));
@@ -781,10 +783,16 @@ mod openai {
         });
         let opts = ProviderOptions::with_base_url(&server.url).observer(recorder.clone());
         let p = OpenAiProvider::new(KEY, Some(opts));
+        // A model of the compiled-in catalog, so the cost comes from its prices.
+        let request = || {
+            CompletionRequest::builder("gpt-6.1-terra")
+                .message(Message::user("hi"))
+                .build()
+        };
 
-        p.complete(simple()).await.unwrap();
-        p.complete(simple()).await.unwrap_err();
-        collect_stream(p.complete_stream(simple()).await.unwrap())
+        p.complete(request()).await.unwrap();
+        p.complete(request()).await.unwrap_err();
+        collect_stream(p.complete_stream(request()).await.unwrap())
             .await
             .unwrap();
         // The stream's end is reported by its reader task.
@@ -802,14 +810,14 @@ mod openai {
         let (info, ok) = &ends[0];
         assert_eq!(
             (info.provider.as_str(), info.model.as_str()),
-            ("openai", "gpt-4o")
+            ("openai", "gpt-6.1-terra")
         );
         assert_eq!(info.operation, Operation::Chat);
         assert_eq!(ok.outcome_label(), "ok");
         assert_eq!(ok.finish_reason, Some(FinishReason::Stop));
         assert_eq!(ok.usage.as_ref().unwrap().total_tokens, Some(1500));
-        // 1000 in @ $2.50/M + 500 out @ $10/M
-        assert!((ok.cost_usd.unwrap() - 0.0075).abs() < 1e-9);
+        // 1000 in @ $1/M + 500 out @ $5/M
+        assert!((ok.cost_usd.unwrap() - 0.0035).abs() < 1e-9);
 
         let (_, failed) = &ends[1];
         assert_eq!(failed.error_kind, Some("auth"));
@@ -818,8 +826,8 @@ mod openai {
         let (info, streamed) = &ends[2];
         assert_eq!(info.operation, Operation::ChatStream);
         assert!(streamed.time_to_first_chunk.is_some());
-        // 2M in @ $2.50/M + 1M out @ $10/M
-        assert!((streamed.cost_usd.unwrap() - 15.0).abs() < 1e-9);
+        // 2M in @ $1/M + 1M out @ $5/M
+        assert!((streamed.cost_usd.unwrap() - 7.0).abs() < 1e-9);
 
         let payloads = recorder.payloads.lock().unwrap();
         assert_eq!(payloads[0].0, PayloadDirection::Request);
@@ -1268,7 +1276,9 @@ mod claude {
             GenAiError::ContextLengthExceeded { .. }
         ));
         match p.complete(simple()).await.unwrap_err() {
-            GenAiError::Api { status, message } => {
+            GenAiError::Api {
+                status, message, ..
+            } => {
                 assert_eq!(status, 400);
                 assert_eq!(
                     message,
@@ -1442,7 +1452,7 @@ mod ollama {
         let items = drain(p.complete_stream(simple()).await.unwrap()).await;
         let err = items.last().unwrap().as_ref().unwrap_err();
         assert!(
-            matches!(err, GenAiError::Api { status: 500, message } if message.contains("terminated")),
+            matches!(err, GenAiError::Api { status: 500, message, .. } if message.contains("terminated")),
             "{err:?}"
         );
 
@@ -1549,7 +1559,9 @@ mod ollama {
         let p = OllamaProvider::new(Some(opts));
 
         match p.complete(simple()).await.unwrap_err() {
-            GenAiError::Api { status, message } => {
+            GenAiError::Api {
+                status, message, ..
+            } => {
                 assert_eq!(status, 404);
                 assert_eq!(message, "model 'nope' not found");
             }
@@ -1852,5 +1864,277 @@ mod openai_limits {
             matches!(&err, GenAiError::Transport(m) if m.contains("limit")),
             "{err:?}"
         );
+    }
+}
+
+// ---- Documents, structured API errors, retry safety -------------------------
+
+// These compare the three providers side by side, so they need all three.
+#[cfg(all(feature = "openai", feature = "claude", feature = "ollama"))]
+mod documents_and_errors {
+    use super::*;
+    use ferroly::clients::RetryPolicy;
+    use ferroly::genai::{
+        ClaudeProvider, CompletionRequest, GenAiProvider, OllamaProvider, OpenAiProvider,
+        ProviderOptions,
+    };
+
+    const PDF: &[u8] = b"%PDF-";
+    const PDF_B64: &str = "JVBERi0=";
+
+    fn with_documents(model: &str) -> CompletionRequest {
+        let mut message = Message::user("Summarize");
+        message
+            .add_document_part(PDF.to_vec(), "application/pdf", Some("report.pdf".into()))
+            .add_document_part(b"hello".to_vec(), "text/plain; charset=utf-8", None);
+        CompletionRequest::builder(model).message(message).build()
+    }
+
+    fn pdf_as_image(model: &str) -> CompletionRequest {
+        let mut message = Message::user("Summarize");
+        message.parts.push(MessagePart::Image {
+            data: PDF.to_vec(),
+            mime_type: "application/pdf".into(),
+        });
+        CompletionRequest::builder(model).message(message).build()
+    }
+
+    fn hi(model: &str) -> CompletionRequest {
+        CompletionRequest::builder(model)
+            .message(Message::user("hi"))
+            .build()
+    }
+
+    fn opts(server: &Server) -> Option<ProviderOptions> {
+        Some(ProviderOptions::with_base_url(&server.url))
+    }
+
+    fn first_content(server: &Server) -> Value {
+        let body = server.request(0).json();
+        body.get("messages")
+            .unwrap()
+            .get_index(0)
+            .unwrap()
+            .get("content")
+            .unwrap()
+            .clone()
+    }
+
+    /// A PDF is a Claude `document` block with a base64 source, a text file
+    /// a `document` block with a text source.
+    #[tokio::test]
+    async fn claude_sends_document_blocks() {
+        let server = Server::one(Reply::json(
+            200,
+            r#"{"id":"m","model":"c","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#,
+        ))
+        .await;
+        ClaudeProvider::new("sk-ant-test-0123456789", opts(&server))
+            .complete(with_documents("claude-opus-5-5"))
+            .await
+            .unwrap();
+        let expected = format!(
+            r#"[{{"type":"text","text":"Summarize"}},{{"type":"document","source":{{"type":"base64","media_type":"application/pdf","data":"{PDF_B64}"}},"title":"report.pdf"}},{{"type":"document","source":{{"type":"text","media_type":"text/plain","data":"hello"}}}}]"#
+        );
+        assert_eq!(first_content(&server), j(&expected));
+    }
+
+    /// A PDF is an OpenAI `file` content part carrying a data URL; a text
+    /// document is a text part.
+    #[tokio::test]
+    async fn openai_sends_a_file_part() {
+        let server = Server::one(Reply::json(
+            200,
+            r#"{"model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+        ))
+        .await;
+        OpenAiProvider::new("sk-test-0123456789", opts(&server))
+            .complete(with_documents("gpt-6.1-terra"))
+            .await
+            .unwrap();
+        let expected = format!(
+            r#"[{{"type":"text","text":"Summarize"}},{{"type":"file","file":{{"filename":"report.pdf","file_data":"data:application/pdf;base64,{PDF_B64}"}}}},{{"type":"text","text":"hello"}}]"#
+        );
+        assert_eq!(first_content(&server), j(&expected));
+    }
+
+    /// Ollama has no document input: a text document joins the message text
+    /// and a PDF is refused before anything is sent.
+    #[tokio::test]
+    async fn ollama_inlines_text_and_refuses_pdf() {
+        let server = Server::one(Reply::json(
+            200,
+            r#"{"model":"llama3","message":{"role":"assistant","content":"ok"},"done":true}"#,
+        ))
+        .await;
+        let p = OllamaProvider::new(opts(&server));
+        let mut message = Message::user("Summarize");
+        message.add_document_part(b"hello".to_vec(), "text/markdown", None);
+        p.complete(
+            CompletionRequest::builder("llama3")
+                .message(message)
+                .build(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_content(&server).as_str(), Some("Summarize\n\nhello"));
+
+        let err = p.complete(with_documents("llama3")).await.unwrap_err();
+        assert!(
+            matches!(&err, GenAiError::Config(m) if m.contains("application/pdf")),
+            "{err:?}"
+        );
+        assert_eq!(server.hits(), 1, "the refused request was never sent");
+    }
+
+    /// OpenAI refuses a non-image `FileRef` before sending, rather than
+    /// passing the bare URI to the model as text.
+    #[tokio::test]
+    async fn openai_refuses_a_non_image_file_ref() {
+        use ferroly::genai::Role;
+        let server = Server::start(Vec::new()).await;
+        let request = CompletionRequest::builder("gpt-6.1-terra")
+            .message(Message::file_ref(
+                Role::User,
+                "m1",
+                "https://example.com/report.pdf",
+                "application/pdf",
+            ))
+            .build();
+        let err = OpenAiProvider::new("sk-test-0123456789", opts(&server))
+            .complete(request)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, GenAiError::Config(m) if m.contains("application/pdf")),
+            "{err:?}"
+        );
+        assert_eq!(server.hits(), 0);
+    }
+
+    /// An image part with a non-image MIME type is refused by every provider
+    /// before the upload, instead of being sent as an `image` block.
+    #[tokio::test]
+    async fn non_image_mime_in_an_image_part_is_refused() {
+        let server = Server::start(Vec::new()).await;
+        let errors = [
+            ClaudeProvider::new("sk-ant-test-0123456789", opts(&server))
+                .complete(pdf_as_image("claude-opus-5-5"))
+                .await
+                .unwrap_err(),
+            OpenAiProvider::new("sk-test-0123456789", opts(&server))
+                .complete(pdf_as_image("gpt-6.1-terra"))
+                .await
+                .unwrap_err(),
+            OllamaProvider::new(opts(&server))
+                .complete(pdf_as_image("llama3"))
+                .await
+                .unwrap_err(),
+        ];
+        for err in errors {
+            assert!(
+                matches!(&err, GenAiError::Config(m) if m.contains("MessagePart::Document")),
+                "{err:?}"
+            );
+        }
+        assert_eq!(server.hits(), 0);
+    }
+
+    /// Structural #5: an `Api` error carries the provider's error type and
+    /// the `Retry-After` delay, for each provider's error shape.
+    #[tokio::test]
+    async fn api_errors_carry_type_and_retry_after() {
+        let server = Server::start(vec![
+            Reply::with_headers(
+                500,
+                &[("retry-after", "2")],
+                "application/json",
+                r#"{"error":{"message":"The server had an error","type":"server_error","code":null}}"#,
+            ),
+            Reply::with_headers(
+                500,
+                &[("retry-after-ms", "1500")],
+                "application/json",
+                r#"{"type":"error","error":{"type":"api_error","message":"Internal server error"}}"#,
+            ),
+            Reply::json(404, r#"{"error":"model 'nope' not found"}"#),
+        ])
+        .await;
+        let err = OpenAiProvider::new("sk-test-0123456789", opts(&server))
+            .complete(hi("m"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GenAiError::Api { status: 500, .. }),
+            "{err:?}"
+        );
+        assert_eq!(err.error_type(), Some("server_error"));
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(2)));
+
+        let err = ClaudeProvider::new("sk-ant-test-0123456789", opts(&server))
+            .complete(hi("c"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GenAiError::Api { status: 500, .. }),
+            "{err:?}"
+        );
+        assert_eq!(err.error_type(), Some("api_error"));
+        assert_eq!(err.retry_after(), Some(Duration::from_millis(1500)));
+
+        let err = OllamaProvider::new(opts(&server))
+            .complete(hi("nope"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GenAiError::Api { status: 404, .. }),
+            "{err:?}"
+        );
+        assert_eq!(err.error_type(), None);
+        assert_eq!(err.retry_after(), None);
+    }
+
+    /// G4: once the connection was up, a transport failure may follow a
+    /// processed (billed) request, so even with retries configured the
+    /// completion is not sent again.
+    #[tokio::test]
+    async fn transport_failure_after_sending_is_not_retried() {
+        let server = Server::start(vec![
+            Reply::raw_then_close(b"NOT-HTTP garbage\r\n\r\n"),
+            Reply::json(
+                200,
+                r#"{"model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+            ),
+        ])
+        .await;
+        let options = ProviderOptions::with_base_url(&server.url)
+            .retry(RetryPolicy::fixed(3, Duration::from_millis(1)));
+        let err = OpenAiProvider::new("sk-test-0123456789", Some(options))
+            .complete(hi("m"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenAiError::Transport(_)), "{err:?}");
+        assert!(!err.is_transient());
+        assert_eq!(server.hits(), 1, "the completion was not re-sent");
+    }
+
+    /// Nothing reaches a port nobody listens on: that is a `Connect` error,
+    /// which is safe to retry.
+    #[tokio::test]
+    async fn refused_connection_is_a_connect_error() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let options = ProviderOptions::with_base_url(format!("http://127.0.0.1:{port}"))
+            .retry(RetryPolicy::fixed(2, Duration::from_millis(1)));
+        let err = OpenAiProvider::new("sk-test-0123456789", Some(options))
+            .complete(hi("m"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenAiError::Connect(_)), "{err:?}");
+        assert!(err.is_transient());
+        assert_eq!(err.kind_label(), "connect");
     }
 }

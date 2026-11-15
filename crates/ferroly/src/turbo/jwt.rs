@@ -3,9 +3,7 @@
 
 use std::sync::Arc;
 
-use ferroly::auth::{
-    Algorithm, Jwks, JwtError, RemoteJwks, Scopes, Secret, Validation, MIN_SECRET_LEN,
-};
+use ferroly::auth::{Algorithm, Jwks, JwtError, RemoteJwks, Scopes, Secret, Validation};
 use ferroly::codec::Value;
 use ferroly::http::{BoxFuture, HttpResponse, StatusCode};
 
@@ -60,12 +58,22 @@ impl Ctx {
 
 /// The bearer token of the request: the credentials of an
 /// `Authorization: Bearer <token>` header (scheme matched
-/// case-insensitively).
+/// case-insensitively). `None` as well when the request carries more than
+/// one `Authorization` header: which one counts would be ambiguous (a proxy
+/// in front may have checked the other).
 pub fn bearer_token(ctx: &Ctx) -> Option<&str> {
+    if repeated_authorization(ctx) {
+        return None;
+    }
     let header = ctx.header("authorization")?;
     let (scheme, token) = header.split_once(' ')?;
     let token = token.trim();
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
+/// Whether the request carries more than one `Authorization` header.
+pub(crate) fn repeated_authorization(ctx: &Ctx) -> bool {
+    ctx.header_all("authorization").nth(1).is_some()
 }
 
 enum Verifier {
@@ -94,7 +102,13 @@ enum Verifier {
 /// On success the verified claims are stored for the handler
 /// ([`Ctx::claims`]). A missing or invalid token is answered `401` with a
 /// `WWW-Authenticate: Bearer` challenge; the response never says *why* a
-/// token was rejected.
+/// token was rejected. A request with more than one `Authorization` header
+/// is answered `401` too, even when the authenticator is
+/// [`optional`](Self::optional). When the token cannot be checked at all —
+/// the remote key set cannot be fetched ([`JwtError::KeyFetch`]) or no
+/// rustls crypto provider is installed ([`JwtError::NoCryptoProvider`]) —
+/// the answer is `503`, so an outage is not reported to clients as invalid
+/// tokens.
 ///
 /// ```
 /// use ferroly::auth::Validation;
@@ -102,7 +116,7 @@ enum Verifier {
 /// use ferroly::turbo::{require_scopes, JwtAuth, Router};
 ///
 /// let auth = JwtAuth::hs256(
-///     "a-shared-secret-of-at-least-16-bytes",
+///     "a-shared-secret-of-at-least-32-bytes",
 ///     Validation::new().issuer("https://issuer.example").audience("orders-api"),
 /// );
 ///
@@ -148,7 +162,7 @@ impl JwtAuth {
     /// HS256 tokens under a shared `secret`, validated against `validation`
     /// ([`decode_hs256_with`](ferroly::auth::decode_hs256_with)).
     /// [`Validation::new`] requires `exp`, and the secret must be at least
-    /// [`MIN_SECRET_LEN`] bytes — a shorter one rejects every token and is
+    /// 32 bytes (RFC 7518) — a shorter one rejects every token and is
     /// reported by [`Router::validate`].
     pub fn hs256(secret: impl Into<Vec<u8>>, validation: Validation) -> Self {
         JwtAuth::hmac(Algorithm::Hs256, secret, validation)
@@ -157,7 +171,9 @@ impl JwtAuth {
     /// Tokens signed with the given HMAC algorithm (`HS256`, `HS384`,
     /// `HS512`) under a shared `secret`
     /// ([`decode_hmac_with`](ferroly::auth::decode_hmac_with)). The token's
-    /// `alg` header must equal `alg`; it never selects the algorithm.
+    /// `alg` header must equal `alg`; it never selects the algorithm. The
+    /// secret must be at least [`Algorithm::min_secret_len`] bytes (32 / 48
+    /// / 64).
     pub fn hmac(alg: Algorithm, secret: impl Into<Vec<u8>>, validation: Validation) -> Self {
         JwtAuth::with(Verifier::Hmac {
             alg,
@@ -167,8 +183,8 @@ impl JwtAuth {
     }
 
     /// Tokens signed by one of the public keys in a fixed key set
-    /// ([`Jwks::verify`]) — RS256 / ES256 and the other algorithms the keys
-    /// support.
+    /// ([`Jwks::verify`]) — RS\*, PS\*, ES\* or EdDSA, whatever the keys
+    /// accept.
     pub fn jwks(keys: Jwks, validation: Validation) -> Self {
         JwtAuth::with(Verifier::Keys { keys, validation })
     }
@@ -184,6 +200,11 @@ impl JwtAuth {
     /// [`decode_hs256`](ferroly::auth::decode_hs256): `exp` and `nbf` are
     /// checked only when present, and any non-empty secret is accepted. Kept
     /// for [`Router::jwt_auth`]; prefer [`hs256`](Self::hs256).
+    #[deprecated(
+        since = "0.6.0",
+        note = "use `JwtAuth::hs256(secret, Validation::new())`, which requires `exp` and a \
+                32-byte secret"
+    )]
     pub fn legacy_hs256(secret: impl Into<Vec<u8>>) -> Self {
         JwtAuth::with(Verifier::LegacyHs256(Secret::new(secret)))
     }
@@ -200,10 +221,16 @@ impl JwtAuth {
     /// A configuration that cannot accept any token, if there is one.
     fn config_problem(&self) -> Option<String> {
         match &*self.verifier {
-            Verifier::Hmac { alg, secret, .. } if secret.len() < MIN_SECRET_LEN => Some(format!(
-                "JWT {} secret is shorter than {MIN_SECRET_LEN} bytes; every token will be rejected",
-                alg.as_str()
-            )),
+            Verifier::Hmac { alg, secret, .. }
+                if alg.min_secret_len().is_some_and(|min| secret.len() < min) =>
+            {
+                Some(format!(
+                    "JWT {} secret is shorter than {} bytes (RFC 7518); every token will be \
+                     rejected",
+                    alg.as_str(),
+                    alg.min_secret_len().unwrap_or_default()
+                ))
+            }
             Verifier::Hmac { alg, .. } if !alg.is_hmac() => Some(format!(
                 "JWT algorithm {} is not an HMAC algorithm; every token will be rejected",
                 alg.as_str()
@@ -214,6 +241,12 @@ impl JwtAuth {
             Verifier::Keys { keys, .. } if keys.is_empty() => {
                 Some("JWT key set is empty; every token will be rejected".to_string())
             }
+            Verifier::Keys { keys, .. } if ferroly::auth::lacks_crypto_provider(keys) => {
+                Some(format!(
+                    "JWT key set holds RSA/EC keys, but {}",
+                    JwtError::NoCryptoProvider
+                ))
+            }
             _ => None,
         }
     }
@@ -221,6 +254,7 @@ impl JwtAuth {
     /// Verifies `token` and returns its claims.
     pub async fn verify(&self, token: &str) -> Result<Claims, JwtError> {
         let claims = match &*self.verifier {
+            #[allow(deprecated)] // the legacy verifier is the deprecated function
             Verifier::LegacyHs256(secret) => ferroly::auth::decode_hs256(token, secret.expose())?,
             Verifier::Hmac {
                 alg,
@@ -238,10 +272,17 @@ impl JwtAuth {
         self,
     ) -> impl Fn(&Ctx) -> BoxFuture<'static, Option<HttpResponse>> + Send + Sync + 'static {
         move |ctx: &Ctx| {
+            let ambiguous = repeated_authorization(ctx);
             let token = bearer_token(ctx).map(str::to_string);
             let extensions = ctx.extensions();
             let auth = self.clone();
             Box::pin(async move {
+                if ambiguous {
+                    return Some(unauthorized(
+                        "401 invalid token",
+                        "Bearer error=\"invalid_request\"",
+                    ));
+                }
                 let Some(token) = token else {
                     return if auth.optional {
                         None
@@ -253,6 +294,13 @@ impl JwtAuth {
                     Ok(claims) => {
                         extensions.insert(claims);
                         None
+                    }
+                    // The token could not be checked: not the client's fault.
+                    Err(JwtError::KeyFetch(_) | JwtError::NoCryptoProvider) => {
+                        Some(HttpResponse::text(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "503 authentication unavailable",
+                        ))
                     }
                     Err(_) => Some(unauthorized(
                         "401 invalid token",
@@ -284,14 +332,23 @@ impl Router {
     /// token carries it, and a secret of any length is accepted.
     ///
     /// That behaviour is kept so existing deployments — and the tokens they
-    /// have issued — keep working. For new code use
+    /// have issued — keep working, but it is **deprecated**: use
     /// [`jwt_auth_with`](Self::jwt_auth_with), which requires `exp` and a
-    /// secret of at least 16 bytes by default. Requires the `auth` feature.
+    /// secret of at least 32 bytes (RFC 7518) by default. An empty secret
+    /// rejects every token and is reported by [`Router::validate`]. Requires
+    /// the `auth` feature.
     ///
     /// The verified claims are available to handlers through
     /// [`Ctx::claims`].
+    #[deprecated(
+        since = "0.6.0",
+        note = "use `jwt_auth_with(secret, Validation::new())`, which requires `exp` and a \
+                32-byte secret"
+    )]
     pub fn jwt_auth(self, secret: impl Into<Vec<u8>>) -> Self {
-        self.jwt(JwtAuth::legacy_hs256(secret))
+        #[allow(deprecated)]
+        let auth = JwtAuth::legacy_hs256(secret);
+        self.jwt(auth)
     }
 
     /// Sets an HS256-JWT authenticator that validates claims against
@@ -306,7 +363,7 @@ impl Router {
     ///
     /// let _router = Router::new()
     ///     .jwt_auth_with(
-    ///         "a-shared-secret-of-at-least-16-bytes",
+    ///         "a-shared-secret-of-at-least-32-bytes",
     ///         Validation::new().issuer("https://issuer.example").audience("orders-api"),
     ///     )
     ///     .get("/me", |ctx| async move {
@@ -331,8 +388,9 @@ impl Router {
     }
 
     /// Sets an authenticator that verifies tokens against a remote JWKS
-    /// endpoint (RS256 / ES256 …), such as an identity provider's
-    /// `/.well-known/jwks.json`. Shorthand for [`jwt`](Self::jwt) with
+    /// endpoint (RS\*, PS\*, ES\*, EdDSA), such as an identity provider's
+    /// `/.well-known/jwks.json`, or one found by OIDC discovery
+    /// ([`RemoteJwks::from_issuer`]). Shorthand for [`jwt`](Self::jwt) with
     /// [`JwtAuth::remote_jwks`].
     ///
     /// ```no_run

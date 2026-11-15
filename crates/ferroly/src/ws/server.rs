@@ -581,7 +581,10 @@ async fn handshake(inner: &Inner, sock: TcpStream, peer: SocketAddr) -> Option<U
         tls: config.tls.is_some(),
         peer_certificates: Vec::new(),
     };
-    let conn: Conn = match &config.tls {
+    // Snapshot the TLS configuration now, so a reload affects exactly the
+    // connections accepted after it.
+    let tls = config.tls.as_ref().map(|tls| tls.current());
+    let conn: Conn = match &tls {
         Some(tls) => match timeout_at(deadline, accept_tls(sock, tls)).await {
             Ok(Ok((conn, certificates))) => {
                 info.peer_certificates = certificates;

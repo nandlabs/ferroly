@@ -1,0 +1,363 @@
+name: Publish to crates.io
+
+# Publishes `ferroly-derive`, then `ferroly`, for an existing `v<version>` tag.
+#
+# Two ways in, both running this file as it is on `main`:
+#   - `tag-on-merge.yml`, which calls this workflow after it creates the tag on
+#     a merge to main;
+#   - "Run workflow" (workflow_dispatch) on `main` with an existing tag, to
+#     publish or re-publish a release whose run failed or never happened.
+# There is deliberately no `push: tags` trigger: for a tag push GitHub runs the
+# workflow file *from the tagged commit*, so a tag on any commit could bring its
+# own copy of this file with the checks below removed. `verify` refuses to run
+# from anything but `main`, and the `crates-io` environment only deploys from
+# `main` (CONTRIBUTING.md, "Repository settings").
+#
+# `verify` checks the tag and runs `cargo publish --dry-run`, with no
+# credentials, and checks that the `crates-io` environment requires a reviewer.
+# Only then does `publish` start: it runs in that environment, so every upload
+# waits for a maintainer's approval, and it uploads exactly the commit `verify`
+# checked (by SHA, not by tag name, so moving the tag in between changes
+# nothing).
+#
+# Authentication, in the `crates-io` environment:
+#   - default: the environment secret `CARGO_REGISTRY_TOKEN`, a crates.io token
+#     scoped to `publish-update` on `ferroly` and `ferroly-derive` only;
+#   - trusted publishing: set the environment variable
+#     `CRATES_IO_TRUSTED_PUBLISHING` to `true` and the job exchanges a GitHub
+#     OIDC token for a short-lived crates.io token instead (no stored secret).
+# CONTRIBUTING.md ("Publishing to crates.io") has the setup for both.
+#
+# Re-running is safe: a version that is already in the index is skipped.
+# Afterwards `crates-io-drift.yml` checks that the tag is on crates.io.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The existing tag to publish (v<version>)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: "The tag to publish (v<version>)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag }}
+
+jobs:
+  verify:
+    name: Verify the tag and dry-run the upload
+    # Forks have no business publishing these crates.
+    if: github.repository == 'nandlabs/ferroly'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Read the `crates-io` environment's protection rules.
+      actions: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      sha: ${{ steps.check.outputs.sha }}
+      crates: ${{ steps.dry-run.outputs.crates }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
+      - name: Check the tag, the versions and the changelog
+        id: check
+        run: |
+          set -euo pipefail
+
+          # This file, and with it every check below, must be main's. (The
+          # `crates-io` environment enforces the same; this says why.)
+          if [ "${GITHUB_REF:-}" != refs/heads/main ]; then
+            echo "::error::Run this workflow from main, not ${GITHUB_REF:-an unknown ref}: the checks are main's"
+            exit 1
+          fi
+
+          SEMVER_TAG='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if ! [[ "$RELEASE_TAG" =~ $SEMVER_TAG ]]; then
+            echo "::error::'$RELEASE_TAG' is not a v<semver> tag"
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#v}"
+          SHA="$(git rev-parse HEAD)"
+
+          # The version check is the copy in this workflow's own commit on
+          # main, not the tagged tree's (which may predate it, or not be on
+          # main at all).
+          CHECK="$RUNNER_TEMP/check-release-version.sh"
+          git show "$GITHUB_SHA:.github/scripts/check-release-version.sh" > "$CHECK"
+          bash "$CHECK" "$VERSION"
+
+          # Only commits that reached main are released.
+          git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::$RELEASE_TAG ($SHA) is not on main"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "OK: $RELEASE_TAG is $SHA on main, with ferroly and ferroly-derive at $VERSION."
+
+      - name: cargo publish --dry-run
+        id: dry-run
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # --- index helpers (identical in the publish job) ---
+          # The sparse-index file of a crate (https://doc.rust-lang.org/cargo/reference/registry-index.html#index-files).
+          index_url() {
+            local name
+            name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+            case "${#name}" in
+              1) echo "${CRATES_INDEX:-https://index.crates.io}/1/$name" ;;
+              2) echo "${CRATES_INDEX:-https://index.crates.io}/2/$name" ;;
+              3) echo "${CRATES_INDEX:-https://index.crates.io}/3/${name:0:1}/$name" ;;
+              *) echo "${CRATES_INDEX:-https://index.crates.io}/${name:0:2}/${name:2:2}/$name" ;;
+            esac
+          }
+          # Exit 0 when <crate> <version> is in the index (yanked or not),
+          # 1 when it is not, 2 when the index could not be read. The body is
+          # read to a file first: `curl | grep -q` under pipefail fails when
+          # grep matches early and curl gets SIGPIPE.
+          in_index() {
+            local body code
+            body="$(mktemp)"
+            code="$(curl -sS --retry 3 --retry-all-errors -o "$body" -w '%{http_code}' "$(index_url "$1")" || true)"
+            case "$code" in
+              200)
+                if grep -qF "\"vers\":\"$2\"" "$body"; then rm -f "$body"; return 0; fi
+                rm -f "$body"; return 1 ;;
+              404) rm -f "$body"; return 1 ;;  # the crate does not exist yet
+              *)
+                rm -f "$body"
+                echo "::warning::could not read the index for $1 (HTTP ${code:-none})" >&2
+                return 2 ;;
+            esac
+          }
+          # --- end index helpers ---
+
+          # Dry-run only the crates that still need uploading. When both do,
+          # one multi-package dry-run packages ferroly-derive into a local
+          # overlay registry and verifies ferroly against it, so ferroly is
+          # checked fully before its derive crate exists on crates.io
+          # (multi-package publishing needs cargo 1.90+; this job uses stable).
+          args=()
+          pending=""
+          for crate in ferroly-derive ferroly; do
+            rc=0; in_index "$crate" "$VERSION" || rc=$?
+            case "$rc" in
+              0) echo "$crate $VERSION is already published; skipping it." ;;
+              1) args+=(-p "$crate"); pending="$pending $crate" ;;
+              *) echo "::error::could not read the crates.io index for $crate"; exit 1 ;;
+            esac
+          done
+          echo "crates=${pending# }" >> "$GITHUB_OUTPUT"
+          if [ "${#args[@]}" -eq 0 ]; then
+            echo "Both crates are already published at $VERSION; nothing to do."
+            exit 0
+          fi
+          echo "To publish:$pending"
+          cargo publish --dry-run --locked "${args[@]}"
+
+      # GitHub creates a missing environment on first use, with no reviewers
+      # and no branch rule. Refuse to hand the upload to one like that.
+      - name: Check that the crates-io environment is protected
+        if: steps.dry-run.outputs.crates != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          API="${GITHUB_API_URL:-https://api.github.com}/repos/$GITHUB_REPOSITORY/environments/crates-io"
+          get() {
+            local code
+            code="$(curl -sS --retry 3 --retry-all-errors -o "$2" -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" "$1" || true)"
+            case "$code" in
+              200) return 0 ;;
+              404) echo "::error::The crates-io environment does not exist. Create and protect it first (CONTRIBUTING.md, \"Repository settings\")."; exit 1 ;;
+              *) echo "::error::could not read $1 (HTTP ${code:-none})"; exit 1 ;;
+            esac
+          }
+          env_json="$RUNNER_TEMP/environment.json"
+          policies_json="$RUNNER_TEMP/branch-policies.json"
+          get "$API" "$env_json"
+          echo '{"branch_policies": []}' > "$policies_json"
+          if python3 -I -c 'import json, sys; p = json.load(open(sys.argv[1])).get("deployment_branch_policy") or {}; sys.exit(0 if p.get("custom_branch_policies") else 1)' "$env_json"; then
+            get "$API/deployment-branch-policies?per_page=100" "$policies_json"
+          fi
+          python3 -I - "$env_json" "$policies_json" <<'PY'
+          import json, sys
+          env = json.load(open(sys.argv[1]))
+          policies = json.load(open(sys.argv[2])).get("branch_policies", [])
+          errors = []
+          reviewers = [r for r in env.get("protection_rules") or []
+                       if r.get("type") == "required_reviewers" and r.get("reviewers")]
+          if not reviewers:
+              errors.append("has no required reviewers, so an upload would not wait for approval")
+          branch = env.get("deployment_branch_policy")
+          rules = sorted((p.get("type", "branch"), p.get("name")) for p in policies)
+          if not branch or not branch.get("custom_branch_policies"):
+              errors.append("deploys from any branch: set 'Deployment branches and tags' to the branch main only")
+          elif rules != [("branch", "main")]:
+              errors.append(f"deploys from {rules}; allow the branch main only (no tag rules)")
+          for e in errors:
+              print(f"::error::The crates-io environment {e} (CONTRIBUTING.md, \"Repository settings\").")
+          sys.exit(1 if errors else 0)
+          PY
+          echo "OK: crates-io requires a reviewer and deploys from main only."
+
+  publish:
+    name: cargo publish
+    needs: verify
+    # Nothing left to upload (a re-run after a full publish): skip the job, and
+    # with it the approval prompt.
+    if: needs.verify.outputs.crates != ''
+    runs-on: ubuntu-latest
+    # Mint an OIDC token for crates.io trusted publishing (unused otherwise).
+    permissions:
+      contents: read
+      id-token: write
+    # One upload per tag at a time (a merge and a re-run, say).
+    concurrency:
+      group: publish-${{ inputs.tag }}
+      cancel-in-progress: false
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/ferroly
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
+    steps:
+      # The commit `verify` checked, whatever the tag points at now.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+      - name: Check that the tag still points at the verified commit
+        run: |
+          set -euo pipefail
+          # An annotated tag is listed twice; its `^{}` line is the commit.
+          refs="$(git ls-remote --tags origin)"
+          now="$(printf '%s\n' "$refs" | awk -v r="refs/tags/$RELEASE_TAG^{}" '$2 == r { print $1 }')"
+          if [ -z "$now" ]; then
+            now="$(printf '%s\n' "$refs" | awk -v r="refs/tags/$RELEASE_TAG" '$2 == r { print $1 }')"
+          fi
+          if [ "$now" != "$VERIFIED_SHA" ]; then
+            echo "::error::$RELEASE_TAG was $VERIFIED_SHA when verified and is now ${now:-gone}. Nothing was uploaded; run the workflow again to verify the tag as it is now."
+            exit 1
+          fi
+          echo "$RELEASE_TAG is still $VERIFIED_SHA."
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
+
+      # Trusted publishing: a short-lived token, revoked when the job ends.
+      - name: Authenticate with crates.io (trusted publishing)
+        id: auth
+        if: vars.CRATES_IO_TRUSTED_PUBLISHING == 'true'
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - name: Publish ferroly-derive, then ferroly
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::No crates.io credentials: set the CARGO_REGISTRY_TOKEN secret in the crates-io environment, or enable trusted publishing (CRATES_IO_TRUSTED_PUBLISHING=true)"
+            exit 1
+          fi
+
+          # --- index helpers (identical in the verify job) ---
+          # The sparse-index file of a crate (https://doc.rust-lang.org/cargo/reference/registry-index.html#index-files).
+          index_url() {
+            local name
+            name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+            case "${#name}" in
+              1) echo "${CRATES_INDEX:-https://index.crates.io}/1/$name" ;;
+              2) echo "${CRATES_INDEX:-https://index.crates.io}/2/$name" ;;
+              3) echo "${CRATES_INDEX:-https://index.crates.io}/3/${name:0:1}/$name" ;;
+              *) echo "${CRATES_INDEX:-https://index.crates.io}/${name:0:2}/${name:2:2}/$name" ;;
+            esac
+          }
+          # Exit 0 when <crate> <version> is in the index (yanked or not),
+          # 1 when it is not, 2 when the index could not be read. The body is
+          # read to a file first: `curl | grep -q` under pipefail fails when
+          # grep matches early and curl gets SIGPIPE.
+          in_index() {
+            local body code
+            body="$(mktemp)"
+            code="$(curl -sS --retry 3 --retry-all-errors -o "$body" -w '%{http_code}' "$(index_url "$1")" || true)"
+            case "$code" in
+              200)
+                if grep -qF "\"vers\":\"$2\"" "$body"; then rm -f "$body"; return 0; fi
+                rm -f "$body"; return 1 ;;
+              404) rm -f "$body"; return 1 ;;  # the crate does not exist yet
+              *)
+                rm -f "$body"
+                echo "::warning::could not read the index for $1 (HTTP ${code:-none})" >&2
+                return 2 ;;
+            esac
+          }
+          # --- end index helpers ---
+
+          # Poll until the index serves <crate> <version>; a failed read is
+          # retried like a miss.
+          wait_for_index() {
+            local i rc
+            for i in $(seq 1 "${INDEX_POLLS:-60}"); do
+              rc=0; in_index "$1" "$2" || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                echo "$1 $2 is in the index."
+                return 0
+              fi
+              sleep "${INDEX_POLL_SECONDS:-10}"
+            done
+            echo "::error::$1 $2 did not appear in the crates.io index within $(( ${INDEX_POLLS:-60} * ${INDEX_POLL_SECONDS:-10} )) seconds"
+            return 1
+          }
+
+          # Checked again here: the approval may have come long after `verify`.
+          # `--no-verify`: `verify` already built this commit, without the
+          # token; building it again here would run every build script and
+          # proc macro with CARGO_REGISTRY_TOKEN in the environment.
+          for crate in ferroly-derive ferroly; do
+            rc=0; in_index "$crate" "$VERSION" || rc=$?
+            case "$rc" in
+              0) echo "$crate $VERSION is already published; skipping."; continue ;;
+              1) ;;
+              *) echo "::error::could not read the crates.io index for $crate; nothing more was uploaded. Run the workflow again."; exit 1 ;;
+            esac
+            cargo publish -p "$crate" --locked --no-verify
+            # ferroly resolves ferroly-derive from the index, so wait for it.
+            wait_for_index "$crate" "$VERSION"
+          done
+
+  drift:
+    name: The tag is on crates.io
+    needs: [verify, publish]
+    # Also after a skipped publish (everything was already on crates.io).
+    if: >-
+      always() && needs.verify.result == 'success' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/crates-io-drift.yml
+    with:
+      tag: ${{ inputs.tag }}

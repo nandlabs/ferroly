@@ -59,7 +59,8 @@ impl ErrorClass {
     }
 
     /// The dependency asked the caller to come back after `delay` (a
-    /// `Retry-After`): retry after exactly that long, and count it against
+    /// `Retry-After`): retry after at least that long (never sooner than the
+    /// policy's backoff), and count it against
     /// the breaker (it is overloaded).
     pub const fn retry_after(delay: Duration) -> Self {
         ErrorClass {

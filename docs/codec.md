@@ -181,6 +181,7 @@ pub fn from_value_strict<T: Decode>(value: &Value) -> Result<T, CodecError>;
 | `encode_i64(&mut self, v: i64)` | Emit a signed integer. |
 | `encode_u64(&mut self, v: u64)` | Emit an unsigned integer. |
 | `encode_f64(&mut self, v: f64)` | Emit a floating-point number. |
+| `encode_f32(&mut self, v: f32)` | Emit a single-precision float. Defaulted: widens to `f64` and calls `encode_f64`, so existing encoders are unchanged. |
 | `encode_str(&mut self, v: &str)` | Emit a string. |
 | `encode_bytes(&mut self, v: &[u8])` | Emit a byte string. |
 | `begin_seq(&mut self, len: usize)` | Begin a sequence of `len` items. |
@@ -201,6 +202,7 @@ pub fn from_value_strict<T: Decode>(value: &Value) -> Result<T, CodecError>;
 | `read_seq<F>(&mut self, f: F) -> Result<(), _>` | Read a sequence, invoking `f` at each element. |
 | `read_map<F>(&mut self, f: F) -> Result<(), _>` | Read a map, invoking `f` with each key positioned at its value. |
 | `skip_value(&mut self) -> Result<(), _>` | Skip the next value (an unknown field). |
+| `decode_i128` / `decode_u128(&mut self)` | Pull a 128-bit integer, strictly. Defaulted (through `decode_value`); the JSON parser overrides them to read a wide integer literal from its digits, exactly. |
 
 `emit_value(e, &value)` walks any `Value` into any `Encoder` — the fallback for
 `encode_to`'s default and the implementation of `Encode for Value`.
@@ -228,7 +230,7 @@ Extras per format:
 | Function | Formats | Purpose |
 | --- | --- | --- |
 | `try_encode(&T) -> Result<String, CodecError>` | `json`, `xml`, `toml` | fail instead of writing a fallback for a value the format cannot represent |
-| `encode_pretty(&T) -> String` | `json` | indented output |
+| `encode_pretty(&T) -> String` | `json`, `xml` | indented output (YAML and TOML are always one entry per line) |
 | `to_string(&Value)` / `to_string_pretty(&Value)` | `json` | render a `Value` compactly / indented |
 | `from_slice(&[u8])` / `from_slice_with(&[u8], Limits)` | `json` | parse bytes into a `Value` |
 
@@ -241,7 +243,12 @@ All four parsers skip a leading UTF-8 byte-order mark.
 
 ```rust
 pub enum Format { Json, Xml, Yaml, Toml }
-impl Format { pub fn from_content_type(content_type: &str) -> Option<Format>; }
+impl Format {
+    pub fn from_content_type(content_type: &str) -> Option<Format>;
+    /// Decode T from a Value this format parsed, with the format's rules
+    /// (strict for JSON/TOML, lenient for XML/YAML).
+    pub fn decode_value<T: Decode>(self, value: &Value) -> Result<T, CodecError>;
+}
 
 pub fn resolve(content_type: &str) -> Result<Format, CodecError>;
 pub fn encode<T: Encode + ?Sized>(content_type: &str, value: &T) -> Result<Vec<u8>, CodecError>;
@@ -258,6 +265,7 @@ pub struct Limits {
     pub max_depth: usize,        // default 128
     pub max_input_bytes: usize,  // default 64 MiB
     pub max_entries: usize,      // default 10_000_000
+    pub reject_duplicate_keys: bool, // default false
 }
 impl Limits {
     pub const DEFAULT: Limits;
@@ -268,6 +276,7 @@ impl Limits {
     pub fn with_max_depth(self, n: usize) -> Self;
     pub fn with_max_input_bytes(self, n: usize) -> Self;
     pub fn with_max_entries(self, n: usize) -> Self;
+    pub fn with_reject_duplicate_keys(self, reject: bool) -> Self;
 }
 ```
 
@@ -287,10 +296,24 @@ pub enum CodecError {
     Message(String),
     LimitExceeded(String),
     Unrepresentable(String),
+    TypeMismatch { expected: &'static str, found: &'static str },
+    At { path: Vec<PathSegment>, source: Box<CodecError> },
+}
+
+pub enum PathSegment { Key(String), Index(usize) }
+
+impl CodecError {
+    pub fn expected(what: &'static str) -> Self;
+    pub fn type_mismatch(expected: &'static str, found: &Value) -> Self;
+    pub fn in_field(self, key: &str) -> Self;
+    pub fn in_index(self, index: usize) -> Self;
+    pub fn path(&self) -> &[PathSegment];
+    pub fn path_string(&self) -> String;
+    pub fn root_cause(&self) -> &CodecError;
 }
 ```
 
-See [Error handling](#error-handling).
+See [Error handling](#error-handling) and [Field paths](#field-paths).
 
 ## The `Value` model in depth
 
@@ -354,7 +377,7 @@ hand with `.into()`:
 | --- | --- |
 | `i8, i16, i32, i64, isize` | `Value::Int` |
 | `u8, u16, u32, u64, usize` | `Value::UInt` |
-| `f32, f64` | `Value::Float` |
+| `f32, f64` | `Value::Float` (an `f32` via its shortest text, so `0.1f32` gives `Float(0.1)`; see [Floats](#floats)) |
 | `bool` | `Value::Bool` |
 | `String`, `&str` | `Value::Str` |
 | `Vec<Value>` | `Value::Array` |
@@ -389,8 +412,8 @@ Standard-library coverage out of the box:
 | --- | --- |
 | `bool` | boolean |
 | `i8`..`i64`, `isize`, `u8`..`u64`, `usize` | integer |
-| `i128`, `u128` | integer when it fits 64 bits, otherwise a decimal string |
-| `f32`, `f64` | number |
+| `i128`, `u128` | integer when it fits 64 bits, otherwise a decimal string; `json::decode` also reads a wider integer literal exactly (see [below](#strict-and-lenient-decoding)) |
+| `f32`, `f64` | number; an `f32` as its own shortest text (see [Floats](#floats)) |
 | `char`, `String`, `str` | string (`char` requires exactly one character) |
 | `&T` (so `&str`, `&[T]`, `&Struct`) | as `T` (encode only) |
 | `Option<T>` | `null` or `T` |
@@ -401,13 +424,96 @@ Standard-library coverage out of the box:
 | `Box<T>`, `Rc<T>`, `Arc<T>` | as `T`; `Box<str>` / `Rc<str>` / `Arc<str>` as strings |
 | `Cow<'_, T>` (e.g. `Cow<str>`, `Cow<[T]>`) | as `T`; decodes to `Cow::Owned` |
 | `std::time::Duration` | `{"secs": u64, "nanos": u32}`; also decodes from a bare number of seconds |
+| `std::time::SystemTime` | RFC 3339 string in UTC (`"2026-11-15T08:30:00.5Z"`); decodes from any RFC 3339 date-time, a `{"secs": i64, "nanos": u32}` object or a number of seconds since the epoch. Outside years 0000–9999 it encodes as that object |
+| `codec::DateTime` | RFC 3339 string keeping its UTC offset (`"2026-11-15T09:30:00+01:00"`) |
 | `PathBuf`, `Path` (encode only) | string (a non-UTF-8 path is encoded lossily) |
 | `IpAddr`, `Ipv4Addr`, `Ipv6Addr`, `SocketAddr`, `SocketAddrV4`, `SocketAddrV6` | string in the standard text form |
 | `()` | `null` |
 | `Value` | itself (a clone) |
 
-Not covered: `SystemTime` and other date/time types, non-string map keys, and
-`NonZero*` integers. Byte slices encode as arrays of integers, not base64.
+Not covered: other date/time types (dates without a time, local times without
+an offset, time zones), non-string map keys, and `NonZero*` integers. Byte
+slices encode as arrays of integers, not base64.
+
+### Date-times
+
+`codec::DateTime` is an RFC 3339 date-time: an instant with nanosecond
+precision plus the UTC offset it was written with. It parses `T`, `t` or a
+space between date and time, `Z`/`z` or `±hh:mm` (`-00:00` reads as UTC) and
+any number of fraction digits (beyond nine they are truncated); a leap second
+`:60` reads as the next minute's first instant. It writes `T`, `Z` for a zero
+offset, and only the fraction digits needed. Its local date lies in years
+0000–9999, so every value round-trips through its own string: `with_offset`
+and `to_utc` return `None` when the shifted date would leave that range (only
+within a day of either end), and `to_system_time` returns `None` when the
+platform's `SystemTime` cannot hold the instant (WASI has no times before
+1970). Equality compares instant and offset; use `same_instant` to ignore the
+offset.
+
+```rust
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use ferroly::codec::{json, DateTime};
+
+let at = DateTime::parse("2026-11-15T09:30:00.25+01:00").unwrap();
+assert_eq!((at.year(), at.month(), at.day(), at.hour()), (2026, 11, 15, 9));
+assert_eq!(at.to_utc().unwrap().to_string(), "2026-11-15T08:30:00.25Z");
+assert_eq!(at.to_system_time(), Some(UNIX_EPOCH + Duration::new(1_794_731_400, 250_000_000)));
+
+let t: SystemTime = json::decode(r#""2026-11-15T09:30:00+01:00""#).unwrap();
+assert_eq!(json::encode(&t), r#""2026-11-15T08:30:00Z""#);
+```
+
+TOML date-time values arrive as strings, so a `DateTime` or `SystemTime` field
+decodes from TOML too (and is validated there).
+
+### Floats
+
+Every float is written as the **shortest decimal that reads back as the same
+value of its own type**, in plain notation (no exponent), with a trailing `.0`
+on integer-valued floats so they stay floats. For an `f32` that is its own
+shortest form, not that of its `f64` widening:
+
+```rust
+use ferroly::codec::{json, toml, yaml, Encode};
+
+assert_eq!(json::encode(&0.1f32), "0.1"); // not 0.10000000149011612
+assert_eq!(json::encode(&1.0e-7f32), "0.0000001");
+assert_eq!(json::encode(&250.0f32), "250.0");
+assert_eq!(json::encode(&0.1f64), "0.1");
+assert_eq!(json::encode(&f64::from(0.1f32)), "0.10000000149011612");
+
+#[derive(Encode)]
+struct Embedding { embedding: Vec<f32> }
+let e = Embedding { embedding: vec![0.1, -0.020566292] };
+assert_eq!(json::encode(&e), r#"{"embedding":[0.1,-0.020566292]}"#);
+assert_eq!(yaml::encode(&e), "embedding:\n  - 0.1\n  - -0.020566292\n");
+assert_eq!(toml::encode(&e), "embedding = [0.1, -0.020566292]\n");
+```
+
+The JSON encoder writes an `f32` through `Encoder::encode_f32`. On the `Value`
+path (`0.1f32.encode()`, which YAML, TOML and XML use) an `f32` becomes the
+`f64` nearest its shortest text, `Value::Float(0.1)`, so those formats print
+the short form too; converting that `f64` back with `as f32` gives the original
+value, and every finite `f32` reads back bit-for-bit (the test suite checks
+all 2^32 bit patterns). Decoders read numbers as `f64` and narrow them, so
+both paths read their text back that way before keeping it, and a value whose
+shortest text would misread falls back to the digits of its exact `f64`
+widening, as before. On current toolchains exactly one magnitude does,
+`7.038531e-26`. Decoding is unchanged: `0.10000000149011612` and `0.1`
+decode to the same `f32`. Non-finite `f32` values follow the same per-format
+rules as `f64`.
+
+The short form has a cost: each `f32` is formatted and then parsed back. On
+an M-series machine (release build) that is roughly 75 ns per value on both
+paths: `json::encode` of a million embedding-style `f32`s takes about 73 ms
+(the same values widened to `f64` take about 137 ms, because their text is
+longer), and `f32::encode()` / `Value::from(f32)` take about 74 ms per million
+where an `f64` is a plain copy (under 1 ms). The `Value` cost is what YAML,
+TOML and XML pay for each `f32` they encode, and what any code that builds
+`Value`s from `f32`s pays. Two consequences of the conversion:
+`Value::from(x)` is not `Value::Float(f64::from(x))`, and `as_f64()` on it
+returns the shortest decimal, which can differ from the exact `f32` by up to
+half an `f32` unit in the last place.
 
 ### Strict and lenient decoding
 
@@ -431,7 +537,17 @@ Both modes share these rules:
   [`OutOfRange`](#error-handling).
 - A float decodes into an integer type **only** when it is a whole number that
   fits: `3.0` → `3`, but `1.9` is `Expected("integer")` and `1e300` is
-  `OutOfRange`. Nothing is truncated or saturated.
+  `OutOfRange`. Nothing is truncated or saturated. A negative integer for an
+  unsigned type is `Expected("unsigned integer")`.
+- An integer literal wider than 64 bits is already a (rounded) float in a
+  `Value`, so `i128` / `u128` reject a float at or beyond 2^53 in magnitude
+  rather than decode a possibly wrong number. The streaming `json::decode`
+  reads such a literal from its digits and decodes it exactly
+  (`json::decode::<i128>("-9223372036854775809")` is that number); through a
+  `Value` (`json::from_str`, YAML, `Format::decode_value`, turbo's
+  `ctx.read_valid`, and inside an untagged enum or a `flatten` field, which
+  buffer their content as a `Value`) send the value as a decimal string, which
+  is also how `i128` / `u128` encode it.
 - An integer decodes into a float type.
 - Leniency is about strings only: a bool is never a number, a number is never a
   string.
@@ -547,6 +663,7 @@ enforced wherever a value is built:
 | `max_depth` | 128 | container nesting. In TOML this includes dotted keys and table headers (`a.b.c = 1` is depth 3), not only nested arrays and inline tables. |
 | `max_input_bytes` | 64 MiB | the input size, checked before parsing starts |
 | `max_entries` | 10,000,000 | array elements plus object members in one document (XML: elements; TOML: keys, tables, and array elements) — the memory a small input can expand into |
+| `reject_duplicate_keys` | `false` | when on, an object that repeats a key is a parse error (see [Duplicate keys](#duplicate-keys)) |
 
 Exceeding one yields `CodecError::LimitExceeded`. The plain entry points use
 `Limits::default()`; pass your own to the `*_with` variants:
@@ -582,6 +699,31 @@ Guarantees for every parser, on any input:
 
 The streaming JSON decoder (`json::decode`) is covered by the same budget as the
 tree parser (`json::from_str`).
+
+### Duplicate keys
+
+By default a repeated object key is kept and lookups (`Value::get`, struct
+decoding) resolve to the **last** occurrence. With
+`Limits::with_reject_duplicate_keys(true)` it is a `CodecError::Parse` with
+the position of the second occurrence instead. The policy per format:
+
+| Format | Default | With `reject_duplicate_keys` |
+| --- | --- | --- |
+| JSON (`from_str` and the streaming `decode`, including skipped keys) | last wins | error |
+| YAML (block and flow mappings) | last wins | error |
+| TOML | always an error (the TOML spec forbids it) | error |
+| XML | repeated sibling elements are an array, not duplicate keys | not applicable |
+
+Turn it on for untrusted input: when two components resolve a duplicate
+differently (first-wins vs last-wins), a crafted document can mean different
+things to each. It is off by default to keep existing behaviour.
+
+```rust
+use ferroly::codec::{json, Limits};
+
+let strict = Limits::new().with_reject_duplicate_keys(true);
+assert!(json::from_str_with(r#"{"role":"user","role":"admin"}"#, strict).is_err());
+```
 
 ## JSON codec
 
@@ -669,6 +811,9 @@ them with an attribute, and the parser honours it:
 | `type="array"` | an explicit array whose items are the element's children (written as `<item>`) | an empty array, an array holding arrays, an array whose only item is `null`, and a top-level array |
 | `type="object"` | an empty object | `{}` |
 | `xml:space="preserve"` | the standard XML attribute: the text is taken verbatim (not trimmed), and empty text is `""` rather than `null`. Inherited by child elements, as XML specifies. | `""` and strings with leading or trailing whitespace |
+
+`xml::encode_pretty` writes the same document indented, one child element per line;
+text content is untouched, so it decodes to the same data.
 
 So `{"m": [[1, 2], [3]], "tags": [], "note": ""}` encodes as:
 
@@ -1007,7 +1152,10 @@ The default trait methods `Encode::encode` and `Decode::decode` go through the
 
 - `Encoder` is a push-based output sink that owns all punctuation and separators
   (`begin_map` / `map_entry` / `end_map`, `begin_seq` / `seq_entry` / `end_seq`,
-  and the scalar `encode_*` methods).
+  and the scalar `encode_*` methods). `encode_f32` has a default that widens to
+  `f64` and calls `encode_f64`, so an encoder written before it existed is
+  unchanged; the JSON encoder overrides it to write the shortest `f32` text
+  (see [Floats](#floats)).
 - `Decoder` is a pull-based source: `read_map` / `read_seq` drive a callback per
   entry, `decode_string` pulls a string with one allocation, `peek_null` /
   `decode_null` handle optionals, and `skip_value` discards unknown fields. A
@@ -1075,14 +1223,16 @@ implements `std::error::Error` and `Display`, derives `Clone`, `PartialEq`,
 | Variant | Constructor | Raised when |
 | --- | --- | --- |
 | `UnsupportedContentType(String)` | — | `resolve` / dispatch got an unknown MIME type |
-| `Parse(String)` | `CodecError::parse(msg)` | syntax error while parsing JSON/XML/YAML/TOML; the message ends with `at line L, column C` |
-| `Expected(&'static str)` | `CodecError::expected(what)` | a value of the wrong shape (e.g. object expected, or a fractional float for an integer) |
+| `Parse(String)` | `CodecError::parse(msg)` | syntax error while parsing JSON/XML/YAML/TOML; the message ends with `at line L, column C`. Never located (see [Field paths](#field-paths)), so a hand-written `Decode` rejecting a field's value should use `expected` or `Message` instead |
+| `Expected(&'static str)` | `CodecError::expected(what)` | a value of the right type but the wrong shape or content: a fractional float for an integer, a negative number for an unsigned one, an array of the wrong length, an object without exactly one key for an externally tagged enum, a string that is not an IP address |
 | `MissingField(String)` | `CodecError::missing_field(name)` | a required (non-`Option`) struct field was absent |
 | `UnknownVariant(String)` | `CodecError::unknown_variant(name)` | an enum string matched no variant |
 | `OutOfRange(&'static str)` | `CodecError::out_of_range(ty)` | a number did not fit the target integer type |
 | `Message(String)` | — | a general message |
 | `LimitExceeded(String)` | — | the input exceeded a [`Limits`](#limits-and-untrusted-input) budget (depth, size, or entries) |
 | `Unrepresentable(String)` | `CodecError::unrepresentable(msg)` | a `try_encode` entry point met a value the format cannot represent |
+| `TypeMismatch { expected, found }` | `CodecError::type_mismatch(expected, &value)` | a value of the wrong type; prints `expected unsigned integer, found string`. `found` is the kind the input held: `null`, `bool`, `number`, `string`, `bytes`, `array` or `object`. Raised for every kind (string, integer, unsigned integer, number, bool, array, object, null) by the std impls, the derive and both decoders, on the streaming and the `Value` path alike. On the lenient path a string that does not parse as the wanted scalar (`"many"` for a `u32`) is a `TypeMismatch` with `found: "string"` too |
+| `At { path, source }` | `err.in_field(key)` / `err.in_index(i)` | `source` was raised inside a field, element or map entry; see [Field paths](#field-paths) |
 
 Parse errors from all four formats carry a 1-based line and column (columns
 count characters, not bytes):
@@ -1109,10 +1259,113 @@ assert!(matches!(err, CodecError::MissingField(_)));
 ```
 
 Shape errors raised after parsing (`Expected`, `MissingField`, `OutOfRange`,
-`UnknownVariant`) do not carry a position or the path to the failing field.
+`UnknownVariant`, …) carry no line and column; instead they say *which field*
+failed.
+
+### Field paths
+
+A decode error raised below the root is wrapped in `CodecError::At`, whose
+`path` lists the wire names and indexes leading to it, outermost first.
+`Display` prefixes the message with the path, rendered `a.b[2].c` (a key that
+is not a plain word of ASCII letters, digits, `_` and `-` is quoted:
+`limits["max.depth"]`). An error raised at the root has no path and prints as
+it always has.
+
+```rust
+use ferroly::codec::{json, CodecError, Decode};
+
+#[derive(Decode, Debug)]
+struct Message { role: String, content: String }
+
+#[derive(Decode, Debug)]
+#[ferroly(rename_all = "camelCase")]
+struct ChatRequest { model: String, messages: Vec<Message>, max_tokens: Option<u32> }
+
+let err = json::decode::<ChatRequest>(
+    r#"{"model":"m","messages":[{"role":"user","content":"hi"},{"role":7,"content":"x"}]}"#,
+).unwrap_err();
+assert_eq!(err.to_string(), "messages[1].role: expected string, found number");
+assert_eq!(err.path_string(), "messages[1].role");
+// An HTTP API can report the top-level parameter:
+assert_eq!(err.path()[0].to_string(), "messages");
+
+// Paths use wire names (after `rename` / `rename_all`).
+let err = json::decode::<ChatRequest>(r#"{"model":"m","messages":[],"maxTokens":"8"}"#)
+    .unwrap_err();
+assert_eq!(err.path_string(), "maxTokens");
+assert_eq!(err.to_string(), "maxTokens: expected unsigned integer, found string");
+assert!(matches!(err.root_cause(), CodecError::TypeMismatch { found: "string", .. }));
+
+// A missing field is reported at its parent.
+let err = json::decode::<ChatRequest>(r#"{"model":"m","messages":[{"role":"user"}]}"#)
+    .unwrap_err();
+assert_eq!(err.to_string(), "messages[0]: missing field: content");
+```
+
+Where the segments come from:
+
+| Shape | Segment |
+| --- | --- |
+| named struct field | the key the input used: the wire name after `rename` / `rename_all`, or the alias if one matched |
+| tuple struct / tuple variant field | its index, `[i]` |
+| newtype struct, `Box` / `Rc` / `Arc`, `Option` | none (transparent) |
+| externally tagged variant | the variant key: `{"Circle":{"r":"x"}}` fails at `Circle.r` |
+| internally tagged or untagged variant | none; an internally tagged variant's fields sit beside the tag, and an untagged enum that matches no variant fails where it sits |
+| `flatten` field | none; its fields are reported by their own names |
+| `Vec`, `[T; N]`, tuples, `HashSet`, `BTreeSet` | the element index, `[i]`; but on the lenient `Value` path a lone value standing in for a one-element sequence adds no index, so `{"items":{"x":"no"}}` fails at `items.x` there and at `items` (`expected array, found object`) on the strict paths |
+| `HashMap<String, _>`, `BTreeMap<String, _>` | the entry key |
+
+The path is built only on failure (`map_err` as the error propagates), and
+`in_field` on an error that already has a path adds a segment to it rather than
+another `At` layer, so a successful decode allocates nothing extra.
+`Parse`, `LimitExceeded` and `UnsupportedContentType` describe the input as a
+whole (a parse error already has its line and column), so they never get a
+path and keep matching as before. A hand-written `Decode` impl can locate its
+own errors the same way, with `err.in_field(key)` / `err.in_index(i)`. For
+that reason such an impl should report a field value it rejects with
+`CodecError::expected(..)` or `CodecError::Message(..)`, not
+`CodecError::parse(..)`: a `Parse` error is returned unchanged by `in_field`
+and would arrive with no path.
+
+Keys come from the input, so the rendered path (`Display` and `path_string`)
+is safe to log: control characters, Unicode line separators and bidirectional
+controls inside a quoted key are escaped (`["a\nb"]`, `\u{1b}`), and a key
+longer than 64 characters is cut and ends in `…`. `path()` keeps every key
+exactly as it arrived; `PathSegment`'s own `Display` prints it raw.
+
+`CodecError::At`'s fields are public. A hand-built value with an empty path
+prints just its source, and one nested inside another renders as a single
+joined path (`in_field` merges the layers); `path()` returns only the outer
+layer's segments for such a value.
+
+### Migration notes (0.6)
+
+- **Errors inside a field are wrapped in `At`.** Code that matched the variant
+  of a nested error directly (`Err(CodecError::MissingField(_))`) should match
+  `err.root_cause()` instead. `Display` gains the path prefix
+  (`a.b[1]: expected unsigned integer, found string`).
+- **Type errors are `TypeMismatch` for every kind.** A value of the wrong type
+  used to be `Expected("string")`, `Expected("integer")`,
+  `Expected("unsigned integer")`, `Expected("number")`, `Expected("bool")`,
+  `Expected("array")`, `Expected("object")` or `Expected("null")`; it is now
+  `TypeMismatch { expected, found }` with the same `expected` wording, on both
+  decode paths and at the root as well as inside a field. `Display` keeps the
+  old text and adds the kind found: `expected unsigned integer` becomes
+  `expected unsigned integer, found string`. Match
+  `CodecError::TypeMismatch { expected: "integer", .. }` where you matched
+  `CodecError::Expected("integer")`. `Expected` remains for a value of the
+  right type that does not fit (`1.9` for an integer, `-1` for an unsigned
+  one, an array of the wrong length).
+- **Malformed JSON is always `Parse`.** The streaming decoder used to report
+  some malformed tokens where a string, array, object or `null` was wanted as
+  a type error (`{"name": nope}` gave `name: expected string`); it now lexes
+  the token first and returns the `Parse` error with its line and column, as
+  the `Value` path does.
 
 Schema validation ([schema.md](schema.md)) uses a different, collect-all error
-type ([`Violation`](schema.md)) rather than `CodecError`.
+type ([`Violation`](schema.md#api-reference)) rather than `CodecError`, and
+compiling a schema up front reports a
+[`SchemaError`](schema.md#compile-once-validate-many).
 
 ## Limitations
 
@@ -1128,30 +1381,36 @@ type ([`Violation`](schema.md)) rather than `CodecError`.
 - **TOML**: date-times decode as strings and are not validated; a top-level
   value must be a table (struct); `None`/`Null` fields are omitted rather than
   represented, and a `null` inside an array cannot be represented.
-- **Integers beyond 64 bits** in JSON or YAML input become `Float` and lose
-  precision. `i128` / `u128` fields avoid this by travelling as decimal strings.
+- **Integers beyond 64 bits** in JSON or YAML input become `Float` in a `Value`
+  and lose precision. An `i128` / `u128` target never takes the rounded value:
+  `json::decode` reads the literal exactly, and the `Value` path rejects a
+  float at or beyond 2^53. `i128` / `u128` encode wide values as decimal
+  strings.
 - **Derive limits**: map keys must be strings; a `PhantomData` field must be
   marked `#[ferroly(skip)]`; a flattened catch-all map also receives the keys of a
   flattened struct beside it. See the [derive page](derive.md).
 - `Value::Object` is a `Vec`, so key lookup (`get`, `pointer`) is linear — ideal
   for the small objects typical of config and API payloads, not for huge maps.
   (Parsing and `merge` are indexed and stay near-linear.)
-- **Duplicate object keys resolve last-wins** in JSON and
-  YAML — `Value::get` and struct decoding both return the last occurrence. TOML
-  rejects duplicates, and XML collapses repeated tags into an array.
+- **Duplicate object keys resolve last-wins** in JSON and YAML by default —
+  `Value::get` and struct decoding both return the last occurrence;
+  `Limits::reject_duplicate_keys` makes them an error. TOML always rejects
+  duplicates, and XML collapses repeated tags into an array. See
+  [Duplicate keys](#duplicate-keys).
 - **Non-finite floats** (`NaN`/`±Inf`) have no JSON form and encode as `null`
-  there (`json::try_encode` errors). YAML, TOML, and XML can carry them.
+  there (`json::try_encode` errors). YAML, TOML, and XML can carry them. This
+  holds for `f32` and `f64` alike.
 - **`Value::Bytes` does not round-trip as `Bytes`** — it encodes as an array of
   integers (JSON/YAML/TOML) or space-separated numbers (XML). Base64-encode
   binary data into a `Str` yourself if you need fidelity.
-- Decode errors after parsing do not report the path to the failing field.
 - Decoding is from a fully buffered input and encoding to a `String`; there is
   no reader- or writer-based API.
 
 ## See also
 
 - [derive](derive.md) — internals of `Encode` / `Decode` / `FerrolyError`.
-- [schema](schema.md) — validate a `Value` against a JSON-Schema subset.
+- [schema](schema.md) — validate a `Value` against a JSON-Schema subset,
+  including linear-time regex `pattern` checks.
 - [config](config.md) — layered configuration built on the codecs.
 - [genai](genai.md) — provider payloads encoded through this codec.
 - [errutils](errutils.md) — error utilities complementing `CodecError`.

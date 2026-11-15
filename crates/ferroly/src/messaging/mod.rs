@@ -63,6 +63,8 @@ mod observer;
 mod options;
 mod provider;
 mod queue;
+#[cfg(feature = "obs")]
+mod traced;
 
 /// A boxed, `Send` future — the object-safe async desugaring.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -81,3 +83,5 @@ pub use observer::LogObserver;
 pub use observer::{DropReason, Observer};
 pub use options::{Backoff, ExpiryAction, ListenerOptions, LocalOptions, OnFull, SendOptions};
 pub use provider::{split_address, topic_matches, Producer, Provider, ProviderRegistry, Receiver};
+#[cfg(feature = "obs")]
+pub use traced::Traced;

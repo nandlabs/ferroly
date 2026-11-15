@@ -1,0 +1,117 @@
+// A proto3 file exercising every construct the generator supports.
+syntax = "proto3";
+
+package sample.v1;
+
+import "sample/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option java_package = "dev.ferroly.sample";
+option (custom.file_opt) = { name: "x" nested { a: 1 } };
+
+// The kind of a search corpus.
+enum Corpus {
+  CORPUS_UNSPECIFIED = 0;
+  CORPUS_WEB = 1;
+  // Pictures.
+  CORPUS_IMAGES = 2;
+  CORPUS_LEGACY = 3 [deprecated = true];
+  reserved 10 to 20;
+  reserved "CORPUS_OLD";
+}
+
+// Every scalar type, with implicit presence.
+message Scalars {
+  double f_double = 1;
+  float f_float = 2;
+  int32 f_int32 = 3;
+  int64 f_int64 = 4;
+  uint32 f_uint32 = 5;
+  uint64 f_uint64 = 6;
+  sint32 f_sint32 = 7;
+  sint64 f_sint64 = 8;
+  fixed32 f_fixed32 = 9;
+  fixed64 f_fixed64 = 10;
+  sfixed32 f_sfixed32 = 11;
+  sfixed64 f_sfixed64 = 12;
+  bool f_bool = 13;
+  string f_string = 14;
+  bytes f_bytes = 15;
+}
+
+/* A search request.
+ * Block comments become docs too. */
+message SearchRequest {
+  string query = 1;
+  // Explicit presence.
+  optional int32 page_number = 2;
+  int32 results_per_page = 3 [deprecated = true];
+  Corpus corpus = 4;
+  repeated int32 ids = 5;
+  repeated sint64 deltas = 6 [packed = false];
+  repeated string tags = 7;
+  map<string, int32> counts = 8;
+  map<int64, sample.common.Label> labels = 9;
+  map<string, Corpus> corpora = 10;
+  google.protobuf.Timestamp sent_at = 11;
+  string type = 12;
+  optional Corpus fallback = 13;
+
+  reserved 15, 100 to max;
+  reserved "foo", "bar";
+
+  // Where the result goes.
+  oneof destination {
+    string email = 20;
+    sint32 slot = 21;
+    sample.common.Label label = 22;
+    Corpus channel = 23;
+  }
+
+  // A nested message.
+  message Filter {
+    string field = 1;
+    // A nested enum.
+    enum Op {
+      OP_UNSPECIFIED = 0;
+      OP_EQ = 1;
+      OP_NE = 2;
+    }
+    Op op = 2;
+    repeated Filter and = 3;
+  }
+
+  repeated Filter filters = 14;
+}
+
+// A recursive message: needs a box.
+message Tree {
+  string name = 1;
+  Tree left = 2;
+  Tree right = 3;
+  repeated Tree children = 4;
+  oneof extra {
+    Tree only = 5;
+    int64 weight = 6;
+  }
+}
+
+// Search results.
+message SearchResponse {
+  repeated Result results = 1;
+  message Result {
+    string url = 1;
+    sample.common.Label label = 2;
+  }
+}
+
+// A service with every streaming shape.
+service SearchService {
+  // One request, one response.
+  rpc Search (SearchRequest) returns (SearchResponse);
+  rpc Watch (SearchRequest) returns (stream SearchResponse.Result);
+  rpc Upload (stream sample.common.Label) returns (SearchResponse) {
+    option deprecated = true;
+  }
+  rpc Chat (stream SearchRequest) returns (stream SearchResponse) {}
+}

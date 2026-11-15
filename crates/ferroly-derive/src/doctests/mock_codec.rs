@@ -55,6 +55,15 @@ pub mod codec {
         pub fn unknown_variant(name: impl Into<String>) -> Self {
             CodecError::UnknownVariant(name.into())
         }
+        pub fn type_mismatch(expected: &'static str, _found: &Value) -> Self {
+            CodecError::Expected(expected)
+        }
+        pub fn in_field(self, _key: &str) -> Self {
+            self
+        }
+        pub fn in_index(self, _index: usize) -> Self {
+            self
+        }
     }
 
     pub trait Encoder: Sized {

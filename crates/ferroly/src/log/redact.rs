@@ -153,7 +153,7 @@ impl Redactor {
 
     /// The value to print for field `name`: the mask when the name matches,
     /// otherwise the value with any sensitive nested fields masked.
-    pub(super) fn apply<'a>(&self, name: &str, value: &'a Value) -> Cow<'a, Value> {
+    pub(crate) fn apply<'a>(&self, name: &str, value: &'a Value) -> Cow<'a, Value> {
         if self.patterns.is_empty() {
             return Cow::Borrowed(value);
         }

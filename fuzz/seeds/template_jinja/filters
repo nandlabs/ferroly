@@ -1,0 +1,1 @@
+{{ x | select('number') | list | sort | reverse | join(',') }}{{ m | tojson(indent=2) }}{{ s | trim | replace('é', 'e') | title | center(20) }}{{ x | map('string') | unique | list | length }}{{ 'a\nb' | indent(2, true) }}

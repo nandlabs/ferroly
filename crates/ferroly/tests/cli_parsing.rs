@@ -4,7 +4,7 @@
 //! flags, repeated/counted flags, validation, groups, help text and shell
 //! completion.
 
-use ferroly::cli::{Arg, ArgValue, CliError, Command, Group, Shell, ValueSource};
+use ferroly::cli::{Arg, ArgValue, CliError, Command, DynamicArity, Group, Shell, ValueSource};
 
 fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
@@ -669,7 +669,7 @@ fn bash_completion_covers_flags_subcommands_and_choices() {
     assert!(script.contains("app,serve) cmd=\"app__serve\""), "{script}");
     assert!(script.contains("app,run) cmd=\"app__serve\""), "{script}");
     assert!(script.contains("app__serve,status) cmd=\"app__serve__status\""));
-    assert!(script.contains("compgen -W \"json yaml\""), "{script}");
+    assert!(script.contains("opts=('json' 'yaml')"), "{script}");
     // Global flags are offered inside subcommands; local ones are not.
     let serve = script.split("        app__serve)\n").nth(1).unwrap();
     let serve = serve
@@ -691,4 +691,752 @@ fn zsh_completion_describes_flags_and_subcommands() {
     assert!(script.contains("'serve:Run the server'"), "{script}");
     assert!(script.contains("'--port'"), "{script}");
     assert!(script.contains("app,serve) cmd=\"app__serve\""), "{script}");
+}
+
+#[test]
+fn fish_completion_tracks_subcommands_and_offers_choices() {
+    let cmd = app().flag(
+        Arg::new("format")
+            .long("format")
+            .help("Output format")
+            .choices(["json", "yaml"]),
+    );
+    let script = cmd.completions(Shell::Fish);
+    assert!(
+        script.starts_with("# fish completion for app\n"),
+        "{script}"
+    );
+    assert!(script.contains("function __app_complete_cmd\n"), "{script}");
+    assert!(
+        script.contains("set -l words (commandline -opc)"),
+        "{script}"
+    );
+    // Subcommand transitions, aliases included.
+    assert!(
+        script.contains("if test \"$cmd,$w\" = 'app,serve'\n            set cmd app__serve"),
+        "{script}"
+    );
+    assert!(
+        script.contains("else if test \"$cmd,$w\" = 'app,run'\n            set cmd app__serve"),
+        "{script}"
+    );
+    assert!(script.contains("'app__serve,status'"), "{script}");
+    let root = "complete -c 'app' -n 'test (__app_complete_cmd) = app'";
+    assert!(
+        script.contains(&format!(
+            "{root} -l 'format' -x -a '\\'json\\' \\'yaml\\'' -d 'Output format'\n"
+        )),
+        "{script}"
+    );
+    assert!(
+        script.contains(&format!("{root} -l 'verbose' -s 'v'\n")),
+        "{script}"
+    );
+    assert!(
+        script.contains(&format!("{root} -f -a '\\'serve\\'' -d 'Run the server'\n")),
+        "{script}"
+    );
+    assert!(
+        script.contains(&format!("{root} -l 'version' -d 'Print version'\n")),
+        "{script}"
+    );
+    // Global flags reach the subcommand, local ones do not.
+    let serve = "complete -c 'app' -n 'test (__app_complete_cmd) = app__serve'";
+    assert!(
+        script.contains(&format!("{serve} -l 'config' -r -F\n")),
+        "{script}"
+    );
+    assert!(
+        script.contains(&format!("{serve} -l 'port' -s 'p' -r -F\n")),
+        "{script}"
+    );
+    assert!(!script.contains(&format!("{serve} -l 'local'")), "{script}");
+}
+
+#[test]
+fn powershell_completion_tracks_subcommands_and_offers_choices() {
+    let cmd = app().flag(
+        Arg::new("format")
+            .long("format")
+            .help("Owner's format")
+            .choices(["json", "yaml"]),
+    );
+    let script = cmd.completions(Shell::PowerShell);
+    assert!(
+        script.contains(
+            "Register-ArgumentCompleter -Native -CommandName 'app', 'app.exe' -ScriptBlock {\n"
+        ),
+        "{script}"
+    );
+    assert!(
+        script.contains("param($wordToComplete, $commandAst, $cursorPosition)"),
+        "{script}"
+    );
+    assert!(
+        script.contains("'app,serve' { $cmd = 'app__serve' }"),
+        "{script}"
+    );
+    assert!(
+        script.contains("'app,run' { $cmd = 'app__serve' }"),
+        "{script}"
+    );
+    assert!(
+        script.contains("'app__serve,status' { $cmd = 'app__serve__status' }"),
+        "{script}"
+    );
+    assert!(
+        script
+            .contains("if (@('--format') -ccontains $prev) { $values = @('json', 'yaml'); break }"),
+        "{script}"
+    );
+    // A value without choices falls back to path completion.
+    assert!(
+        script.contains("if (@('--config') -ccontains $prev) { return }"),
+        "{script}"
+    );
+    // Single quotes in help text are doubled.
+    assert!(
+        script.contains("$words += ,@('--format', 'ParameterName', 'Owner''s format')"),
+        "{script}"
+    );
+    assert!(
+        script.contains("$words += ,@('serve', 'ParameterValue', 'Run the server')"),
+        "{script}"
+    );
+    // Braces balance (a cheap syntax sanity check without a PowerShell).
+    let open = script.matches('{').count();
+    let close = script.matches('}').count();
+    assert_eq!(open, close, "{script}");
+}
+
+// ---- #98: command-line order (occurrences, indices_of, subcommand_index) ---
+
+fn embed_tool() -> Command {
+    Command::new("tool")
+        .flag(Arg::new("config").long("config").global())
+        .subcommand(
+            Command::new("embed")
+                .flag(Arg::new("input").short('i').long("input").multiple())
+                .flag(Arg::new("tokens").short('t').long("tokens").multiple())
+                .flag(Arg::new("verbose").short('v').count())
+                .flag(Arg::new("quiet").short('q').boolean())
+                .positional(Arg::new("rest").variadic()),
+        )
+}
+
+#[test]
+fn occurrences_keep_the_order_across_repeatable_flags() {
+    // The example of the issue, verbatim.
+    let argv = args(&[
+        "embed",
+        "--input",
+        "first",
+        "--tokens=1,2,3",
+        "--input",
+        "second",
+        "--tokens",
+        "7",
+    ]);
+    let m = embed_tool().parse(argv).unwrap();
+    let (_, sub) = m.subcommand().unwrap();
+
+    let ordered: Vec<(&str, &str)> = sub.occurrences().collect();
+    assert_eq!(
+        ordered,
+        [
+            ("input", "first"),
+            ("tokens", "1,2,3"),
+            ("input", "second"),
+            ("tokens", "7")
+        ]
+    );
+    assert_eq!(sub.indices_of("input"), &[2, 5]);
+    assert_eq!(sub.indices_of("tokens"), &[3, 7]);
+    assert_eq!(m.subcommand_index(), Some(0));
+    // The parent level parsed no flag of its own.
+    assert_eq!(m.occurrences().count(), 0);
+}
+
+#[test]
+fn occurrences_cover_every_spelling_and_stop_at_double_dash() {
+    let argv = args(&[
+        "embed",
+        "-i",
+        "a",    // short, separate value
+        "-ib",  // short, attached value
+        "-t=c", // short, `=` value
+        "-vv",  // clustered counter: two entries
+        "-vq",  // cluster of a counter and a switch
+        "--input=d",
+        "--input",
+        "e",
+        "--",
+        "--input",
+        "f",
+        "-v",
+    ]);
+    let m = embed_tool().parse(argv).unwrap();
+    let (_, sub) = m.subcommand().unwrap();
+    let ordered: Vec<(&str, &str)> = sub.occurrences().collect();
+    assert_eq!(
+        ordered,
+        [
+            ("input", "a"),
+            ("input", "b"),
+            ("tokens", "c"),
+            ("verbose", ""),
+            ("verbose", ""),
+            ("verbose", ""),
+            ("quiet", ""),
+            ("input", "d"),
+            ("input", "e"),
+        ],
+        "nothing after `--` is an occurrence"
+    );
+    assert_eq!(sub.get_count("verbose"), 3);
+    assert_eq!(sub.get_all("rest"), ["--input", "f", "-v"]);
+
+    // A switch's or counter's explicit `=value` is its occurrence value.
+    let m = embed_tool()
+        .parse(args(&["embed", "-q=false", "-v=2"]))
+        .unwrap();
+    let (_, sub) = m.subcommand().unwrap();
+    let ordered: Vec<(&str, &str)> = sub.occurrences().collect();
+    assert_eq!(ordered, [("quiet", "false"), ("verbose", "2")]);
+}
+
+#[test]
+fn indices_of_is_parallel_to_get_all_for_every_kind() {
+    let cmd = Command::new("t")
+        .flag(Arg::new("one").long("one").short('o'))
+        .flag(Arg::new("many").long("many").multiple())
+        .flag(Arg::new("ids").long("ids").delimiter(','))
+        .flag(Arg::new("verbose").short('v').long("verbose").count())
+        .flag(Arg::new("quiet").short('q').long("quiet").boolean())
+        .flag(Arg::new("dflt").long("dflt").default("x"))
+        .positional(Arg::new("first"))
+        .positional(Arg::new("rest").variadic());
+    let argv = args(&[
+        "--one",
+        "a",         // 0, 1
+        "pos1",      // 2
+        "--many=m1", // 3
+        "-oz",       // 4: the single-valued option keeps its last value
+        "--ids",
+        "1,2",       // 5, 6
+        "-vv",       // 7
+        "--many",    // 8
+        "m2",        // 9
+        "-q",        // 10
+        "--verbose", // 11
+        "pos2",      // 12
+        "--ids=3",   // 13
+        "--",        // 14
+        "pos3",      // 15
+    ]);
+    let m = cmd.parse(argv).unwrap();
+
+    let parallel = |name: &str| {
+        assert_eq!(
+            m.indices_of(name).len(),
+            m.get_all(name).len(),
+            "{name}: indices_of and get_all differ in length"
+        );
+    };
+    for name in ["one", "many", "ids", "first", "rest"] {
+        parallel(name);
+    }
+    assert_eq!(m.get_all("one"), ["z"]);
+    assert_eq!(m.indices_of("one"), &[4]);
+    assert_eq!(m.get_all("many"), ["m1", "m2"]);
+    assert_eq!(m.indices_of("many"), &[3, 9]);
+    assert_eq!(m.get_all("ids"), ["1", "2", "3"]);
+    assert_eq!(
+        m.indices_of("ids"),
+        &[6, 6, 13],
+        "a split token repeats its index"
+    );
+    assert_eq!(m.get("first"), Some("pos1"));
+    assert_eq!(m.indices_of("first"), &[2]);
+    assert_eq!(m.get_all("rest"), ["pos2", "pos3"]);
+    assert_eq!(m.indices_of("rest"), &[12, 15]);
+
+    // Switches and counters: one index per occurrence.
+    assert_eq!(m.get_count("verbose"), 3);
+    assert_eq!(m.indices_of("verbose"), &[7, 7, 11]);
+    assert_eq!(m.indices_of("quiet"), &[10]);
+
+    // Defaults (and absent arguments) have no position.
+    assert_eq!(m.get("dflt"), Some("x"));
+    assert!(m.indices_of("dflt").is_empty());
+    assert!(m.indices_of("nope").is_empty());
+}
+
+#[test]
+fn indices_of_covers_global_flags_on_both_sides_of_the_subcommand() {
+    let cmd = Command::new("app")
+        .flag(Arg::new("tag").long("tag").multiple().global())
+        .flag(Arg::new("v").short('v').count().global())
+        .subcommand(Command::new("run").positional(Arg::new("file")));
+    let argv = args(&["--tag", "a", "-v", "run", "--tag=b", "-v", "f.txt"]);
+    let m = cmd.parse(argv.clone()).unwrap();
+    assert_eq!(m.get_all("tag"), ["a", "b"]);
+    assert_eq!(m.indices_of("tag"), &[1, 4]);
+    assert_eq!(m.indices_of("v"), &[2, 5]);
+    let (_, run) = m.subcommand().unwrap();
+    assert_eq!(
+        run.indices_of("tag"),
+        &[1, 4],
+        "the global value is handed down"
+    );
+    assert_eq!(run.indices_of("file"), &[6]);
+    assert_eq!(argv[run.indices_of("file")[0]], "f.txt");
+    // Each level lists the flags written at that level.
+    assert_eq!(
+        m.occurrences().collect::<Vec<_>>(),
+        [("tag", "a"), ("v", "")]
+    );
+    assert_eq!(
+        run.occurrences().collect::<Vec<_>>(),
+        [("tag", "b"), ("v", "")]
+    );
+}
+
+#[test]
+fn a_value_that_looks_like_a_flag_has_the_right_index() {
+    let argv = args(&["embed", "--input", "--tokens", "--tokens", "7", "-i", "-v"]);
+    let m = embed_tool().parse(argv.clone()).unwrap();
+    let (_, sub) = m.subcommand().unwrap();
+    assert_eq!(sub.get_all("input"), ["--tokens", "-v"]);
+    assert_eq!(sub.indices_of("input"), &[2, 6]);
+    assert_eq!(sub.get_all("tokens"), ["7"]);
+    assert_eq!(sub.indices_of("tokens"), &[4]);
+    assert_eq!(
+        sub.get_count("verbose"),
+        0,
+        "`-v` was a value, not the counter"
+    );
+    assert_eq!(
+        sub.occurrences().collect::<Vec<_>>(),
+        [("input", "--tokens"), ("tokens", "7"), ("input", "-v")]
+    );
+    for (name, idx) in [("input", 2), ("input", 6), ("tokens", 4)] {
+        assert!(sub.get_all(name).contains(&argv[idx]));
+    }
+}
+
+#[test]
+fn subcommand_index_skips_a_flag_value_equal_to_the_subcommand_name() {
+    let argv = args(&["--config", "embed", "embed", "--input", "x", "tail"]);
+    let m = embed_tool().parse(argv.clone()).unwrap();
+    assert_eq!(m.get("config"), Some("embed"));
+    assert_eq!(m.subcommand_name(), Some("embed"));
+    let i = m.subcommand_index().unwrap();
+    assert_eq!(i, 2);
+    assert_eq!(&argv[i + 1..], args(&["--input", "x", "tail"]).as_slice());
+    let (_, sub) = m.subcommand().unwrap();
+    assert_eq!(sub.indices_of("input"), &[4]);
+    assert_eq!(sub.indices_of("rest"), &[5]);
+    assert_eq!(sub.subcommand_index(), None);
+
+    // `--config=embed` and an alias resolve the same way.
+    let aliased = Command::new("tool")
+        .flag(Arg::new("config").long("config"))
+        .subcommand(Command::new("embed").alias("e"));
+    let m = aliased.parse(args(&["--config=embed", "e"])).unwrap();
+    assert_eq!(m.subcommand_index(), Some(1));
+    assert_eq!(m.subcommand_name(), Some("embed"));
+
+    // No subcommand, no index.
+    assert_eq!(aliased.parse(args(&[])).unwrap().subcommand_index(), None);
+}
+
+// ---- #94: dynamic `--<section>.<key>` flags --------------------------------
+
+fn dynamic_app() -> Command {
+    let sections = ["engine", "server"];
+    Command::new("app")
+        .flag(Arg::new("config").long("config"))
+        .flag(Arg::new("verbose").short('v').boolean())
+        .dynamic_flags(move |name| {
+            name.split_once('.')
+                .is_some_and(|(s, _)| sections.contains(&s))
+        })
+        .subcommand(Command::new("serve").flag(Arg::new("port").long("port")))
+}
+
+fn dynamic(list: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+    list.iter()
+        .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
+        .collect()
+}
+
+#[test]
+fn dynamic_flags_are_collected_in_order_around_a_subcommand() {
+    let m = dynamic_app()
+        .parse(args(&[
+            "--engine.threads",
+            "4",
+            "--config",
+            "app.yaml",
+            "serve",
+            "--server.port=9000",
+            "--port",
+            "1",
+            "--engine.deterministic",
+        ]))
+        .unwrap();
+    assert_eq!(
+        m.dynamic(),
+        dynamic(&[
+            ("engine.threads", Some("4")),
+            ("server.port", Some("9000")),
+            ("engine.deterministic", None),
+        ])
+    );
+    assert_eq!(m.get("config"), Some("app.yaml"));
+    let (name, serve) = m.subcommand().unwrap();
+    assert_eq!(name, "serve");
+    assert_eq!(serve.get("port"), Some("1"));
+    assert_eq!(
+        serve.dynamic(),
+        dynamic(&[
+            ("server.port", Some("9000")),
+            ("engine.deterministic", None)
+        ]),
+        "a subcommand's matches hold its own level and below"
+    );
+    // Dynamic flags are not declared arguments.
+    assert!(!m.contains("engine.threads"));
+    assert_eq!(
+        m.occurrences().collect::<Vec<_>>(),
+        [("config", "app.yaml")]
+    );
+}
+
+#[test]
+fn dynamic_flag_value_rules() {
+    let m = dynamic_app()
+        .parse(args(&[
+            "--engine.a",
+            "-v", // starts with `-`: `a` is a switch
+            "--engine.b",
+            "-1", // a negative number is a value
+            "--engine.c",
+            "--engine.d=--x", // `=` takes anything
+            "--engine.e",
+            "serve", // a subcommand name is not taken as a value
+            "--engine.f",
+            "--",
+        ]))
+        .unwrap();
+    assert!(m.get_bool("verbose"));
+    assert_eq!(
+        m.dynamic(),
+        dynamic(&[
+            ("engine.a", None),
+            ("engine.b", Some("-1")),
+            ("engine.c", None),
+            ("engine.d", Some("--x")),
+            ("engine.e", None),
+            ("engine.f", None),
+        ])
+    );
+    assert_eq!(m.subcommand_name(), Some("serve"));
+
+    // `--key=serve` forces the value.
+    let m = dynamic_app().parse(args(&["--engine.mode=serve"])).unwrap();
+    assert_eq!(m.dynamic(), dynamic(&[("engine.mode", Some("serve"))]));
+    assert_eq!(m.subcommand_name(), None);
+}
+
+#[test]
+fn dynamic_flags_still_refuse_non_matching_flags_with_a_suggestion() {
+    for (argv, flag, suggestion) in [
+        (args(&["--confg", "x"]), "--confg", "--config"),
+        (
+            args(&["--engine.threads=4", "--confg", "x"]),
+            "--confg",
+            "--config",
+        ),
+        // In a subcommand, which inherits the predicate.
+        (
+            args(&["serve", "--server.port=1", "--prot=x"]),
+            "--prot",
+            "--port",
+        ),
+    ] {
+        let err = dynamic_app().parse(argv.clone()).unwrap_err();
+        assert_eq!(
+            err,
+            CliError::UnknownFlag {
+                flag: flag.into(),
+                suggestion: Some(suggestion.into()),
+            },
+            "{argv:?}"
+        );
+    }
+    let err = dynamic_app()
+        .parse(args(&["--cache.size", "1"]))
+        .unwrap_err();
+    assert!(matches!(err, CliError::UnknownFlag { ref flag, .. } if flag == "--cache.size"));
+    let err = dynamic_app().parse(args(&["-x"])).unwrap_err();
+    assert!(
+        matches!(err, CliError::UnknownFlag { ref flag, .. } if flag == "-x"),
+        "short flags are never dynamic"
+    );
+}
+
+#[test]
+fn declared_flags_and_help_win_over_dynamic_flags() {
+    let everything = Command::new("app")
+        .version("1.0")
+        .flag(Arg::new("engine.x").long("engine.x").boolean())
+        .dynamic_flags(|_| true)
+        .subcommand(Command::new("serve"));
+
+    let m = everything
+        .parse(args(&["--engine.x", "--engine.y", "v"]))
+        .unwrap();
+    assert!(m.get_bool("engine.x"));
+    assert_eq!(m.dynamic(), dynamic(&[("engine.y", Some("v"))]));
+
+    // `--help` / `--version` are unaffected, at every level, and the help
+    // text is the same as without dynamic flags.
+    let plain = Command::new("app")
+        .version("1.0")
+        .flag(Arg::new("engine.x").long("engine.x").boolean())
+        .subcommand(Command::new("serve"));
+    for argv in [args(&["--help"]), args(&["serve", "--help"]), args(&["-h"])] {
+        let got = everything.parse(argv.clone()).unwrap_err();
+        let want = plain.parse(argv.clone()).unwrap_err();
+        assert!(matches!(got, CliError::HelpRequested(_)), "{argv:?}");
+        assert_eq!(got, want, "{argv:?}");
+    }
+    assert_eq!(everything.help(), plain.help());
+    assert!(matches!(
+        everything.parse(args(&["--version"])).unwrap_err(),
+        CliError::VersionRequested(_)
+    ));
+}
+
+#[test]
+fn a_subcommand_may_set_its_own_dynamic_predicate() {
+    let cmd = Command::new("app")
+        .dynamic_flags(|n| n.starts_with("a."))
+        .subcommand(Command::new("run").dynamic_flags(|n| n.starts_with("b.")));
+    let m = cmd.parse(args(&["--a.x=1", "run", "--b.y=2"])).unwrap();
+    assert_eq!(
+        m.dynamic(),
+        dynamic(&[("a.x", Some("1")), ("b.y", Some("2"))])
+    );
+    assert!(cmd.parse(args(&["run", "--a.x=1"])).is_err());
+}
+
+#[test]
+fn without_dynamic_flags_nothing_changes() {
+    let cmd = Command::new("app").flag(Arg::new("config").long("config"));
+    let err = cmd.parse(args(&["--engine.threads", "4"])).unwrap_err();
+    assert!(matches!(err, CliError::UnknownFlag { ref flag, .. } if flag == "--engine.threads"));
+    let m = cmd.parse(args(&["--config", "x"])).unwrap();
+    assert!(m.dynamic().is_empty());
+    assert!(m.dynamic_indices().is_empty());
+}
+
+// ---- dynamic-flag arity, segments and positions (review CLI-1, 5, 7, 8) ----
+
+/// `serve` with a variadic positional, and dynamic flags whose arity is
+/// declared per name.
+fn typed_dynamic_app() -> Command {
+    Command::new("app")
+        .dynamic_flags_with(|name| match name {
+            "engine.det" => Some(DynamicArity::Switch),
+            "engine.name" | "engine.n" => Some(DynamicArity::Value),
+            n if n.starts_with("engine.") => Some(DynamicArity::Optional),
+            _ => None,
+        })
+        .subcommand(Command::new("serve").positional(Arg::new("rest").variadic()))
+}
+
+// CLI-1: what `dynamic_flags` does, pinned.
+#[test]
+fn dynamic_switch_before_a_positional_takes_it() {
+    let cmd = Command::new("app")
+        .dynamic_flags(|n| n.starts_with("engine."))
+        .positional(Arg::new("file"));
+    let m = cmd.parse(args(&["--engine.det", "file.txt"])).unwrap();
+    assert_eq!(m.dynamic(), dynamic(&[("engine.det", Some("file.txt"))]));
+    assert!(m.positionals().is_empty());
+    // `--key=true` avoids it.
+    let m = cmd.parse(args(&["--engine.det=true", "file.txt"])).unwrap();
+    assert_eq!(m.get("file"), Some("file.txt"));
+}
+
+// CLI-1
+#[test]
+fn a_switch_arity_never_takes_the_next_token() {
+    let m = typed_dynamic_app()
+        .parse(args(&["serve", "--engine.det", "x", "y"]))
+        .unwrap();
+    assert_eq!(m.dynamic(), dynamic(&[("engine.det", None)]));
+    let (_, serve) = m.subcommand().unwrap();
+    assert_eq!(serve.get_all("rest"), ["x", "y"]);
+
+    // Before the subcommand: a mistyped subcommand is reported as one.
+    let err = typed_dynamic_app()
+        .parse(args(&["--engine.det", "srve"]))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CliError::UnknownCommand { ref name, suggestion: Some(ref s) }
+                if name == "srve" && s == "serve"
+        ),
+        "{err:?}"
+    );
+
+    // `=value` reads the boolean words of a declared switch, normalised.
+    let m = typed_dynamic_app()
+        .parse(args(&["--engine.det=0", "serve", "--engine.det=YES"]))
+        .unwrap();
+    assert_eq!(
+        m.dynamic(),
+        dynamic(&[("engine.det", Some("false")), ("engine.det", Some("true"))])
+    );
+    let err = typed_dynamic_app()
+        .parse(args(&["--engine.det=maybe"]))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        CliError::InvalidValue {
+            name: "engine.det".into(),
+            value: "maybe".into()
+        }
+    );
+}
+
+// CLI-1
+#[test]
+fn a_value_arity_always_takes_the_next_token() {
+    let m = typed_dynamic_app()
+        .parse(args(&[
+            "--engine.name",
+            "-x", // a single dash is a value
+            "--engine.n",
+            "serve", // so is a subcommand name
+            "serve",
+            "--engine.name=--y",
+        ]))
+        .unwrap();
+    assert_eq!(
+        m.dynamic(),
+        dynamic(&[
+            ("engine.name", Some("-x")),
+            ("engine.n", Some("serve")),
+            ("engine.name", Some("--y")),
+        ])
+    );
+    assert_eq!(m.subcommand_name(), Some("serve"));
+
+    // Never a `--` token, and never nothing: both are a missing value.
+    for argv in [
+        args(&["--engine.name"]),
+        args(&["--engine.name", "--engine.det"]),
+        args(&["--engine.name", "--", "x"]),
+    ] {
+        assert_eq!(
+            typed_dynamic_app().parse(argv.clone()).unwrap_err(),
+            CliError::MissingValue {
+                flag: "--engine.name".into()
+            },
+            "{argv:?}"
+        );
+    }
+
+    // `None` refuses the name; `Optional` keeps the old heuristic.
+    assert!(matches!(
+        typed_dynamic_app()
+            .parse(args(&["--server.port=1"]))
+            .unwrap_err(),
+        CliError::UnknownFlag { .. }
+    ));
+    let m = typed_dynamic_app()
+        .parse(args(&["--engine.other", "v", "--engine.more", "serve"]))
+        .unwrap();
+    assert_eq!(
+        m.dynamic(),
+        dynamic(&[("engine.other", Some("v")), ("engine.more", None)])
+    );
+}
+
+// CLI-5
+#[test]
+fn dynamic_flag_with_an_empty_segment_is_unknown() {
+    for flag in [
+        "--engine.=1",
+        "--engine..a=1",
+        "--.engine=1",
+        "--engine.",
+        "--=1",
+    ] {
+        let err = dynamic_app().parse(args(&[flag])).unwrap_err();
+        assert!(
+            matches!(err, CliError::UnknownFlag { .. }),
+            "{flag}: {err:?}"
+        );
+    }
+    // Even with a predicate that accepts everything.
+    let all = Command::new("app").dynamic_flags(|_| true);
+    assert!(all.parse(args(&["--a..b=1"])).is_err());
+    assert_eq!(
+        all.parse(args(&["--a.b=1"])).unwrap().dynamic(),
+        dynamic(&[("a.b", Some("1"))])
+    );
+}
+
+// CLI-7
+#[test]
+fn a_lone_dash_is_a_dynamic_value() {
+    let m = dynamic_app()
+        .parse(args(&["--engine.input", "-", "--engine.n", "-v"]))
+        .unwrap();
+    assert_eq!(
+        m.dynamic(),
+        dynamic(&[("engine.input", Some("-")), ("engine.n", None)])
+    );
+    assert!(m.get_bool("verbose"));
+}
+
+// CLI-8
+#[test]
+fn dynamic_indices_are_parallel_to_dynamic() {
+    let argv = args(&[
+        "--engine.a",   // 0: a switch (the next token is a flag)
+        "--config",     // 1
+        "c",            // 2
+        "--engine.b",   // 3
+        "4",            // 4: the value's index
+        "serve",        // 5
+        "--engine.c=x", // 6
+        "--port",       // 7
+        "80",           // 8
+        "--engine.d",   // 9: a switch at the end
+    ]);
+    let m = dynamic_app().parse(argv).unwrap();
+    assert_eq!(
+        m.dynamic(),
+        dynamic(&[
+            ("engine.a", None),
+            ("engine.b", Some("4")),
+            ("engine.c", Some("x")),
+            ("engine.d", None),
+        ])
+    );
+    assert_eq!(m.dynamic_indices(), [0, 4, 6, 9]);
+    assert_eq!(m.indices_of("config"), [2]);
+    assert_eq!(m.subcommand_index(), Some(5));
+    // A subcommand's matches hold its own level, with the same numbering.
+    let (_, serve) = m.subcommand().unwrap();
+    assert_eq!(serve.dynamic_indices(), [6, 9]);
+    assert_eq!(serve.indices_of("port"), [8]);
 }

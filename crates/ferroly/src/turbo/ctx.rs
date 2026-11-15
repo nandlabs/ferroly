@@ -417,7 +417,10 @@ impl Ctx {
     ///
     /// An undecodable body is a `400` (or `415`) [`Problem`]; a body that
     /// decodes but breaks the schema is a `422` whose `errors` member lists
-    /// every violation as `{ "path": …, "message": … }`.
+    /// the violations as `{ "path": …, "message": … }`. Validation stops after
+    /// [`DEFAULT_MAX_VIOLATIONS`](schema::DEFAULT_MAX_VIOLATIONS) (100); when
+    /// more were found the problem also carries `"truncated": true`, so a
+    /// hostile body cannot turn into a huge response.
     ///
     /// ```
     /// use ferroly::codec::json;
@@ -440,28 +443,85 @@ impl Ctx {
         let value: Value = self.read().map_err(|e| Problem::from(&e))?;
         match schema::validate(schema, &value) {
             Ok(()) => Ok(value),
-            Err(violations) => {
-                let errors = violations
-                    .into_iter()
-                    .map(|v| {
-                        Value::Object(vec![
-                            ("path".to_string(), Value::Str(v.path)),
-                            ("message".to_string(), Value::Str(v.message)),
-                        ])
-                    })
-                    .collect::<Vec<_>>();
-                Err(Problem::new(StatusCode(422))
-                    .detail("the request body failed validation")
-                    .with("errors", Value::Array(errors)))
-            }
+            Err(violations) => Err(validation_problem(
+                violations,
+                schema::DEFAULT_MAX_VIOLATIONS,
+            )),
+        }
+    }
+
+    /// Like [`validate`](Self::validate), against a schema compiled once with
+    /// [`Schema::compile`](schema::Schema::compile). Prefer this in a handler
+    /// that runs on every request: the schema, including each `pattern`, is
+    /// not compiled again per call. The `422` lists at most the schema's
+    /// [`max_violations`](schema::Schema::max_violations) violations (100
+    /// unless set with
+    /// [`with_max_violations`](schema::Schema::with_max_violations)).
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use ferroly::codec::{json, schema::Schema};
+    /// use ferroly::http::{HttpResponse, StatusCode};
+    /// use ferroly::turbo::Router;
+    ///
+    /// let schema = Arc::new(
+    ///     Schema::compile(&json::from_str(
+    ///         r#"{"type":"object","properties":{"sku":{"type":"string","pattern":"^[A-Z]{3}-[0-9]+$"}}}"#,
+    ///     ).unwrap())
+    ///     .expect("valid schema"),
+    /// );
+    /// let _router = Router::new().post("/items", move |ctx| {
+    ///     let schema = schema.clone();
+    ///     async move {
+    ///         match ctx.validate_with(&schema) {
+    ///             Ok(_) => HttpResponse::text(StatusCode::CREATED, "ok"),
+    ///             Err(problem) => problem.into(),
+    ///         }
+    ///     }
+    /// });
+    /// ```
+    pub fn validate_with(&self, schema: &schema::Schema) -> Result<Value, Problem> {
+        let value: Value = self.read().map_err(|e| Problem::from(&e))?;
+        match schema.validate(&value) {
+            Ok(()) => Ok(value),
+            Err(violations) => Err(validation_problem(violations, schema.max_violations())),
         }
     }
 
     /// [`validate`](Self::validate)s the body against `schema`, then decodes
     /// it into `T`.
+    ///
+    /// The body is parsed once: `T` is decoded from the validated [`Value`]
+    /// with the rules of the body's format (strict for JSON and TOML, lenient
+    /// for XML and YAML), as [`read`](Self::read) would.
+    ///
+    /// One difference follows from decoding a [`Value`]: a JSON integer
+    /// literal wider than 64 bits is already a float there, so an `i128` /
+    /// `u128` field rejects it (a `400`, never a rounded number), where
+    /// [`read`](Self::read) decodes it exactly from its digits. Clients should send such values as decimal strings, which
+    /// is how `i128` / `u128` encode them; or use `read` and validate the
+    /// decoded value yourself.
     pub fn read_valid<T: Decode>(&self, schema: &Value) -> Result<T, Problem> {
-        self.validate(schema)?;
-        self.read().map_err(|e| Problem::from(&e))
+        let value = self.validate(schema)?;
+        self.decode_validated(&value)
+    }
+
+    /// [`validate_with`](Self::validate_with)s the body against a compiled
+    /// `schema`, then decodes it into `T` (parsing the body once, as
+    /// [`read_valid`](Self::read_valid) does, with the same limit on integer
+    /// literals wider than 64 bits).
+    pub fn read_valid_with<T: Decode>(&self, schema: &schema::Schema) -> Result<T, Problem> {
+        let value = self.validate_with(schema)?;
+        self.decode_validated(&value)
+    }
+
+    /// Decodes `T` from the body's already-parsed `value`, by the rules of the
+    /// format [`read`](Self::read) picked.
+    fn decode_validated<T: Decode>(&self, value: &Value) -> Result<T, Problem> {
+        let ct = self.header("content-type").unwrap_or("application/json");
+        ferroly::codec::resolve(ct)
+            .and_then(|format| format.decode_value(value))
+            .map_err(|e| Problem::from(&e))
     }
 
     /// Parses an `application/x-www-form-urlencoded` body. A different
@@ -611,6 +671,32 @@ fn negotiate_content_type(accept: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// The `422` problem for a failed schema validation, listing at most `max`
+/// violations as `{ "path": …, "message": … }`, plus `"truncated": true`
+/// when the validator stopped early or more than `max` were passed in.
+fn validation_problem(violations: Vec<schema::Violation>, max: usize) -> Problem {
+    let mut truncated = false;
+    let mut errors = Vec::with_capacity(violations.len().min(max));
+    for v in violations {
+        if v.is_truncation() || errors.len() >= max {
+            truncated = true;
+            break;
+        }
+        errors.push(Value::Object(vec![
+            ("path".to_string(), Value::Str(v.path)),
+            ("message".to_string(), Value::Str(v.message)),
+        ]));
+    }
+    let problem = Problem::new(StatusCode(422))
+        .detail("the request body failed validation")
+        .with("errors", Value::Array(errors));
+    if truncated {
+        problem.with("truncated", Value::Bool(true))
+    } else {
+        problem
+    }
 }
 
 #[cfg(test)]

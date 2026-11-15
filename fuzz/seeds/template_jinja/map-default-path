@@ -1,0 +1,1 @@
+{{ messages|map(attribute='tool_calls.0.function.name', default='-')|list }}{{ messages|map(attribute='function.name', default='q')|list }}

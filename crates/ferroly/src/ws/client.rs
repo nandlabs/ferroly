@@ -102,7 +102,7 @@ impl WsClient {
             }
             let tls = match &opts.tls {
                 Some(custom) => custom.build()?,
-                None => tls_config(),
+                None => tls_config()?,
             };
             tls_handshake(tcp, &uri.host, &tls).await
         };

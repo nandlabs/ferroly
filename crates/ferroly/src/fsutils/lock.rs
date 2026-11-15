@@ -20,7 +20,9 @@ use super::FsError;
 /// * **Not crash-safe.** If the holder is killed, the file stays and the lock
 ///   looks held forever. Stale locks are never broken automatically (a pid can
 ///   be reused, so "is that process alive" is not a safe test); inspect
-///   [`LockFile::owner`] and call [`LockFile::break_lock`] deliberately.
+///   [`LockFile::owner`] and call [`LockFile::break_lock`] deliberately. Where
+///   it is available, [`FileLock`](super::FileLock) — an OS lock the kernel
+///   releases when the holder dies — avoids this.
 /// * **Not reentrant**, and not tied to a thread: a second `acquire` from the
 ///   same process fails like any other.
 /// * Create-new is atomic on local filesystems; on some network filesystems

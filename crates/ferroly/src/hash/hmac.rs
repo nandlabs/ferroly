@@ -31,6 +31,12 @@ use super::{ct_eq, HashAlgorithm, Md5, Sha1, Sha256, Sha384, Sha512};
 /// The value holds the keyed inner and outer hash states, so cloning a keyed
 /// `Hmac` and feeding the clones is the cheap way to MAC many messages under
 /// one key.
+///
+/// Those states are derived from the key, so they are **wiped on drop**: the
+/// hashers of this module overwrite their state with zeros when dropped, and
+/// `Hmac` relies on that (best-effort, see [`Secret`](super::Secret)). The
+/// padded key block and the digest of an over-long key are wiped as soon as
+/// the states are built.
 #[derive(Clone)]
 pub struct Hmac<H: HashAlgorithm> {
     inner: H,
@@ -57,9 +63,9 @@ impl<H: HashAlgorithm> Hmac<H> {
         if key.len() > H::BLOCK_LEN {
             let mut h = H::new();
             h.update(key);
-            let digest = h.finalize();
-            let digest = digest.as_ref();
-            block[..digest.len()].copy_from_slice(digest);
+            let mut digest = h.finalize();
+            block[..digest.as_ref().len()].copy_from_slice(digest.as_ref());
+            H::wipe_output(&mut digest);
         } else {
             block[..key.len()].copy_from_slice(key);
         }
@@ -77,10 +83,7 @@ impl<H: HashAlgorithm> Hmac<H> {
         outer.update(&block);
 
         // Best-effort wipe of the padded key block.
-        for b in block.iter_mut() {
-            *b = 0;
-        }
-        std::hint::black_box(&block);
+        super::wipe(block.as_mut_slice());
 
         Hmac { inner, outer }
     }
@@ -92,9 +95,10 @@ impl<H: HashAlgorithm> Hmac<H> {
 
     /// Finishes the MAC and returns the tag.
     pub fn finalize(self) -> H::Output {
-        let inner = self.inner.finalize();
+        let mut inner = self.inner.finalize();
         let mut outer = self.outer;
         outer.update(inner.as_ref());
+        H::wipe_output(&mut inner);
         outer.finalize()
     }
 

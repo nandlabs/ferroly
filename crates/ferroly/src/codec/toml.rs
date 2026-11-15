@@ -10,6 +10,31 @@
 //! structs as `[section]` headers and `Vec`-of-structs as `[[section]]` arrays
 //! of tables.
 //!
+//! ```
+//! use ferroly::codec::{toml, Decode, Encode};
+//!
+//! #[derive(Encode, Decode, PartialEq, Debug)]
+//! struct Server { host: String, port: u16, tags: Vec<String> }
+//!
+//! #[derive(Encode, Decode, PartialEq, Debug)]
+//! struct App { name: String, server: Server }
+//!
+//! let app = App {
+//!     name: "demo".into(),
+//!     server: Server { host: "localhost".into(), port: 8080, tags: vec!["a".into()] },
+//! };
+//! let text = toml::encode(&app);
+//! assert_eq!(
+//!     text,
+//!     "name = \"demo\"\n\n[server]\nhost = \"localhost\"\nport = 8080\ntags = [\"a\"]\n"
+//! );
+//! let back: App = toml::decode(&text).unwrap();
+//! assert_eq!(back, app);
+//!
+//! // Typed decoding is strict: a quoted number is not a `u16`.
+//! assert!(toml::decode::<Server>("host = \"h\"\nport = \"80\"\ntags = []").is_err());
+//! ```
+//!
 //! **Date-times are not a native type**: an RFC 3339 date-time, local
 //! date-time, local date, or local time token (`1979-05-27T07:32:00Z`,
 //! `1979-05-27`, `07:32:00`) decodes as its raw text in a [`Value::Str`], and

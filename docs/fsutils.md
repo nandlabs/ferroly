@@ -15,10 +15,15 @@
   `mime_guess`/`infer`. **The result is a hint, not validation.**
 - **Read-only file views** — [`Mmap`](#read-only-file-views-mmap): a safe
   in-memory read, or an `unsafe` zero-copy OS mapping.
+- **Human-readable byte sizes** — [`size`](#human-readable-byte-sizes-size):
+  `format_bytes` (`1.5 MiB`), `format_bytes_si` (`1.5 MB`) and `ByteSize`,
+  which parses `512MiB` / `2G` from flags and configuration.
 - **Atomic writes** — [`write_atomic` / `AtomicFile`](#atomic-writes).
 - **Temporary files and directories** — [`TempDir` / `TempFile`](#temporary-files-and-directories),
   uniquely named and removed on drop.
-- **An advisory lock file** — [`LockFile`](#advisory-lock-file).
+- **File locks** — [`FileLock`](#os-file-lock-filelock), an OS lock the kernel releases
+  when the holder dies, and [`LockFile`](#advisory-lock-file), a create-new file for
+  platforms without one.
 
 Filesystem *existence* helpers are intentionally **not** provided: use
 `std::path::Path` (`exists`, `is_file`, `is_dir`). Directory watching is out of
@@ -29,7 +34,7 @@ in-memory, pluggable backends), see the separate [vfs](vfs.md) module.
 
 ```toml
 [dependencies]
-ferroly = { version = "0.5", features = ["fsutils"] }
+ferroly = { version = "0.6", features = ["fsutils"] }
 ```
 
 ## Quick start
@@ -59,9 +64,13 @@ assert_eq!(detect_content_type(&path)?, "application/json");
 | `sniff(bytes: &[u8]) -> Option<&'static str>` | Sniff a MIME type from an in-memory header. `None` if unrecognized. |
 | `SNIFF_LEN: usize` | How many leading bytes `detect_content_type` reads (512). |
 | `Mmap` | A read-only view of a whole file's bytes. |
+| `size::format_bytes(n)` / `size::format_bytes_si(n)` | `n` bytes as `1.5 MiB` (binary) / `1.5 MB` (decimal). |
+| `size::format_bytes_with(n, Precision)` / `size::format_bytes_si_with(n, Precision)` | The same with a chosen number of decimals. |
+| `size::ByteSize` | A byte count: `FromStr` (`512MiB`, `2G`, `500 MB`), `Display` (binary; `{:#}` decimal; width and alignment honoured), `Encode`/`Decode`/`JsonSchema` with `codec`. |
 | `write_atomic(path, data) -> Result<(), FsError>` | Replace a file in one step. |
 | `AtomicFile` | The streaming form of `write_atomic` (`impl std::io::Write`, then `commit`). |
 | `TempDir`, `TempFile` | Uniquely named scratch directory / file, removed on drop. |
+| `FileLock` | An exclusive OS file lock (`flock` / `LockFileEx`), released when the holder exits or crashes. |
 | `LockFile` | An advisory lock held by a create-new file. |
 
 ### `FsError`
@@ -71,7 +80,7 @@ assert_eq!(detect_content_type(&path)?, "application/json");
 pub enum FsError {
     Io(std::io::Error),   // underlying I/O error (From<std::io::Error>)
     Undetermined(String), // content type not recognized for the given path
-    Locked(String),       // a LockFile at this path is already held
+    Locked(String),       // a FileLock or LockFile at this path is already held
 }
 ```
 
@@ -231,7 +240,7 @@ are two constructors, and the difference is soundness:
 | Constructor | Safe? | Backing | Cost |
 |---|---|---|---|
 | `Mmap::open(path)` | **yes** | the file is read into memory | a full read; memory equal to the file size |
-| `unsafe Mmap::map(path)` | **no** — caller upholds a contract | a real `PROT_READ \| MAP_PRIVATE` OS mapping, pages faulted in lazily | none up front |
+| `unsafe Mmap::map(path)` | **no** — caller upholds a contract | a real OS mapping (`PROT_READ \| MAP_PRIVATE` on Unix, `PAGE_READONLY` / `FILE_MAP_READ` on Windows), pages faulted in lazily | none up front |
 
 ```rust
 use ferroly::fsutils::Mmap;
@@ -267,8 +276,8 @@ the mapped bytes or truncates the file**:
 
 - a write to the file would change bytes behind a live `&[u8]` — undefined
   behavior in Rust;
-- a truncation makes any access to pages past the new end raise `SIGBUS`,
-  killing the process.
+- a truncation makes any access to pages past the new end raise `SIGBUS`
+  (on Windows, `EXCEPTION_IN_PAGE_ERROR`), killing the process.
 
 Ways to uphold it: map files your process created with restrictive permissions
 and never rewrites in place, or immutable artifacts that are only ever replaced
@@ -280,27 +289,136 @@ leaves an existing mapping untouched). If you cannot guarantee it, use
 too large to address on the target. An empty file is returned as an empty,
 unmapped view (a zero-length mapping is invalid).
 
+On **Windows** the same contract applies: the view stays coherent with writes
+made through other handles. The file is opened with a share mode admitting
+every other opener (`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`),
+so a file another process holds open — even for writing — can be mapped, and
+paths are passed to the wide (`…W`) APIs, so any Unicode path works. While a
+view is alive, Windows refuses to truncate a file on a **local** volume
+(`ERROR_USER_MAPPED_FILE`), and may refuse to delete it or rename another file
+over it; drop the `Mmap` first. That protection does not extend to a file on a
+network share (truncated on the server or by another client) or on removable
+media that goes away: there, touching a lost page raises
+`EXCEPTION_IN_PAGE_ERROR`, which kills the process just as `SIGBUS` does. So
+the "must not be truncated" part of the contract applies on Windows too.
+
 ### Where `map` really maps
 
-The `mmap`/`munmap` FFI is hand-declared (the crate takes no `libc`
-dependency), so it is compiled only for targets whose ABI was checked — `off_t`
-is 64-bit, and `PROT_READ = 1`, `MAP_PRIVATE = 2`, `MAP_FAILED = (void*)-1`:
+The FFI is hand-declared (the crate takes no `libc` or `windows-sys`
+dependency), so it is compiled only for targets whose ABI was checked. On Unix
+that is `mmap`/`munmap`, where `off_t` is 64-bit, and `PROT_READ = 1`,
+`MAP_PRIVATE = 2`, `MAP_FAILED = (void*)-1`:
 
 - 64-bit Linux (glibc or musl) and 64-bit Android,
 - 64-bit macOS and iOS,
 - 64-bit FreeBSD, DragonFly, NetBSD and OpenBSD.
 
-The values were cross-checked against the `libc` crate's per-target
-definitions; of these, only macOS is exercised by this crate's own test runs.
-Everywhere else — Windows, every 32-bit target, other Unixes — `Mmap::map`
-reads the file into memory exactly like `Mmap::open`, and `map_supported()`
-returns `false`.
+On **64-bit Windows** (`-msvc` and `-gnu`) it is `CreateFileMappingW` +
+`MapViewOfFile`, released with `UnmapViewOfFile` + `CloseHandle`, declared
+`extern "system"` against the `memoryapi.h` / `handleapi.h` prototypes
+(`PAGE_READONLY = 0x02`, `FILE_MAP_READ = 0x04`). The transcription was checked
+by hand against the SDK headers; a test then pins each declaration to that
+signature, so an accidental edit stops it compiling (it guards against change,
+it does not re-check the headers).
 
-> **`unsafe` in this crate.** This module's `mmap` submodule is the workspace's
-> single `unsafe` region (everything else is built with `unsafe_code = "deny"`).
+The Unix values were cross-checked against the `libc` crate's per-target
+definitions; Linux, macOS and Windows are exercised by CI. Everywhere else —
+every 32-bit target, other Unixes — `Mmap::map` reads the file into memory
+exactly like `Mmap::open`, and `map_supported()` returns `false`.
+
+> **`unsafe` in this crate.** This module's `mmap` submodule (Unix and Windows
+> mappings) and the `flock` /
+> `LockFileEx` calls behind [`FileLock`](#os-file-lock-filelock) are two of the
+> workspace's four audited `unsafe` regions (the others are the Windows CSPRNG
+> call in `hash` and the process-metrics FFI in `metrics`; everything else is
+> built with `unsafe_code = "deny"`).
 > It is audited, but its soundness rests on the contract above: the safe
 > constructor is `Mmap::open`, and `Mmap::map` is `unsafe` precisely because
 > the compiler cannot rule out another process changing the file.
+
+## Human-readable byte sizes: `size`
+
+`ferroly::fsutils::size` formats byte counts for people and parses them back.
+It is pure formatting (no I/O), part of `fsutils`; with the `codec` feature
+`ByteSize` also implements `Encode` / `Decode` / `JsonSchema`.
+
+```rust
+use ferroly::fsutils::size::{format_bytes, format_bytes_si, format_bytes_with, ByteSize, Precision};
+
+assert_eq!(format_bytes(0), "0 B");
+assert_eq!(format_bytes(1023), "1023 B");
+assert_eq!(format_bytes(1536), "1.5 KiB");
+assert_eq!(format_bytes(u64::MAX), "16.0 EiB");
+assert_eq!(format_bytes_si(1_500_000), "1.5 MB");
+assert_eq!(format_bytes_with(1_234_567, Precision::Decimals(2)), "1.18 MiB");
+
+let budget: ByteSize = "512MiB".parse().unwrap();
+assert_eq!(budget.as_u64(), 512 * 1024 * 1024);
+assert_eq!(budget.to_string(), "512.0 MiB");   // binary
+assert_eq!(format!("{budget:#}"), "536.9 MB"); // decimal
+assert_eq!(format!("{budget:.0}"), "512 MiB"); // precision
+assert_eq!(format!("[{:>9}]", ByteSize(1536)), "[  1.5 KiB]"); // width
+```
+
+| System | Units | Function |
+|---|---|---|
+| binary (IEC), powers of 1024 | `B`, `KiB`, `MiB`, `GiB`, `TiB`, `PiB`, `EiB` | `format_bytes`, `format_bytes_with` |
+| decimal (SI), powers of 1000 | `B`, `kB`, `MB`, `GB`, `TB`, `PB`, `EB` | `format_bytes_si`, `format_bytes_si_with` |
+
+Formatting rules: bytes are an integer (`1023 B`); other units get one decimal
+(or `Precision::Decimals(n)`), rounded half to even and computed exactly (no
+floating point); the unit is the largest one not above the value, and a value
+that would round to `1024.0` of a unit (`1000.0` in SI) is shown as `1.0` of the
+next one — `1023.95 KiB` is `1.0 MiB`. `Display` for `ByteSize` honours a
+width, fill and alignment (`{:>10}`, `{:*^12.2}`), left-aligned by default like
+a string, and never truncates.
+
+`ByteSize` parsing (`FromStr`) is case-insensitive and allows whitespace
+between number and unit:
+
+| Input | Bytes |
+|---|---|
+| `1024`, `512B` | as written |
+| `64KiB`, `1.5 MiB`, `1gib` | binary units |
+| `2G`, `512k` | a bare `K`/`M`/`G`/`T` is **binary** (CLI convention) |
+| `500MB`, `2 GB`, `1kB` | decimal units |
+
+Petabytes and exabytes must be spelled out (`PiB`/`PB`, `EiB`/`EB`): a bare
+`P` or `E` is an unknown unit, so a truncated exponent (`1e`, YAML `2E`) is an
+error, not an exbibyte. Exponent notation (`1e6`) is not accepted in a string.
+
+With a unit of `K` or larger, fractions are rounded down to whole bytes
+(`1.5K` = 1536). A plain byte count (no unit, or `B`) must be whole: `"1.5"`
+and `"0.3B"` are `InvalidNumber`, while `"1.0"` is 1. Negative values (`-1K`),
+unknown units (`12XB`), malformed numbers and values over `u64::MAX` are a
+`ParseByteSizeError`, which names the input and has a `kind()` (`Empty`,
+`Negative`, `InvalidNumber`, `UnknownUnit`, `Overflow`).
+
+As a configuration field (feature `codec`), a `ByteSize` decodes from an
+integer number of bytes or from a size string, and encodes as an integer. A
+float decodes only when it is a whole number of bytes (YAML `2.0`); `1.5` is
+rejected as "not a whole number of bytes", the same rule as the string `"1.5"`.
+Its `JsonSchema` is `{"type": ["integer", "string"], "minimum": 0, "pattern":
+…}`: `minimum` applies to the number and `pattern` (the accepted string syntax)
+to the string, so `#[derive(JsonSchema)]` works on a struct with a `ByteSize`
+field, and the schema rejects `true`, `-1` and `"12XB"`. It cannot express the
+`u64::MAX` limit.
+
+```rust
+# #[cfg(feature = "codec")] {
+use ferroly::codec::{yaml, Decode};
+use ferroly::fsutils::size::ByteSize;
+
+#[derive(Decode)]
+struct Cache { max_size: ByteSize }
+
+let cache: Cache = yaml::decode("max_size: 2G").unwrap();
+assert_eq!(cache.max_size, ByteSize::gib(2));
+let cache: Cache = yaml::decode("max_size: 4096").unwrap();
+assert_eq!(cache.max_size.as_u64(), 4096);
+assert!(yaml::decode::<Cache>("max_size: 1.5").is_err());
+# }
+```
 
 ## Atomic writes
 
@@ -350,7 +468,7 @@ What this gives you, and what it does not:
 - A symbolic link at the destination is followed: its target is replaced and
   the link kept.
 - Two writers committing at once do not corrupt the file, but the last rename
-  wins — coordinate them with a [`LockFile`](#advisory-lock-file).
+  wins — coordinate them with a [`FileLock`](#os-file-lock-filelock).
 - The destination's directory must be writable, and a stray temporary file can
   be left behind if the process is killed mid-write.
 
@@ -399,6 +517,77 @@ report.persist(dir.path().join("report.csv"))?;   // keep it under a final name
 # Ok::<(), ferroly::fsutils::FsError>(())
 ```
 
+## OS file lock: `FileLock`
+
+```rust
+impl FileLock {
+    pub fn try_acquire(path: impl AsRef<Path>) -> Result<Option<FileLock>, FsError>;   // None if held
+    pub fn acquire(path: impl AsRef<Path>) -> Result<FileLock, FsError>;               // Err(Locked) if held
+    pub fn acquire_timeout(path: impl AsRef<Path>, timeout: Duration) -> Result<FileLock, FsError>;
+    pub fn acquire_wait(path: impl AsRef<Path>) -> Result<FileLock, FsError>;          // blocks in the kernel
+    pub fn owner(path: impl AsRef<Path>) -> Result<Option<u32>, FsError>;              // last holder's pid
+    pub fn path(&self) -> &Path;
+    pub fn release(self) -> Result<(), FsError>;
+}
+```
+
+An exclusive lock the operating system holds on an open file: `flock(LOCK_EX)` on Unix,
+`LockFileEx` on Windows, called through hand-written `extern` declarations (no `libc`
+crate; `std::fs::File::lock` needs Rust 1.89, above the MSRV). The lock belongs to the
+open file, so **when the holder exits or crashes the kernel releases it** — a dead holder
+never blocks the next one, and there is nothing to break by hand.
+
+```rust
+use ferroly::fsutils::{FileLock, TempDir};
+
+let dir = TempDir::new("my-app")?;
+let path = dir.path().join("job.lock");
+let lock = FileLock::acquire(&path)?;
+assert!(FileLock::try_acquire(&path)?.is_none());   // already held
+assert_eq!(FileLock::owner(&path)?, Some(std::process::id()));
+drop(lock);
+assert!(FileLock::try_acquire(&path)?.is_some());
+# Ok::<(), ferroly::fsutils::FsError>(())
+```
+
+- **The file is created if missing and never deleted.** Deleting it on release would let
+  a waiter that already opened the old file lock it while a newcomer creates and locks a
+  new one — two holders. An unlocked file left behind is harmless.
+- **Unlinking or replacing the file while it is held breaks exclusion**: the holder keeps
+  its lock on the old, nameless file and the next acquirer locks a new one. An acquirer
+  that opened the old file before it went away notices once it gets the lock and retries
+  on the new file, but a holder is never told — keep the file where cleaners (such as a
+  temporary-directory reaper) leave it alone.
+- The holder's **process id is written into the file** after locking, but only when the
+  file is empty or holds nothing but a decimal number (an earlier holder's id). **Other
+  content is left untouched** and `owner` reports `None`, so locking an existing data file
+  does not destroy it. `owner` reports the most recent holder, which is information, not
+  the lock; ask `try_acquire` whether it is held.
+- The last path component **must not be a symbolic link** (on Windows, any reparse
+  point): the file is opened with `O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT` and an
+  acquire through a link fails with `FsError::Io` of kind `InvalidInput`, so a link planted
+  at the lock path cannot redirect the lock onto another file. Directories higher up the
+  path may be links.
+- `acquire_timeout(path, Duration::MAX)` (or any timeout too large to add to the current
+  time) waits without a deadline.
+- **Advisory** and **not reentrant**: a second acquire of the same path fails while the
+  first guard lives, even in the same thread (but see NFS below). A child started with
+  `std::process::Command` does not inherit the lock.
+- `acquire_timeout` polls and `acquire_wait` blocks in the kernel; both **block the calling
+  thread** — from async code, run them on a blocking thread.
+- **Platforms:** Linux, Android, macOS, iOS, tvOS, watchOS, FreeBSD, DragonFly, NetBSD,
+  OpenBSD, illumos and Windows. Elsewhere every acquire fails with `FsError::Io` of kind
+  `Unsupported`; use `LockFile` there.
+- On Windows the locked range is a single byte at offset 2⁶³ − 2, beyond any content,
+  because Windows byte-range locks are mandatory and locking the content would stop other
+  processes from reading the owner's id.
+- On network filesystems the guarantee is the server's; SMB shares honour `LockFileEx`.
+  **On Linux NFS mounts** the kernel emulates `flock` with POSIX byte-range locks, which
+  belong to the process rather than the open file: a second acquire in the same process
+  *succeeds*, and closing *any* descriptor the process has on the file — including the one
+  `owner` opens — releases the lock. On NFS, take the lock at most once per process and do
+  not call `owner` while holding it.
+
 ## Advisory lock file
 
 ```rust
@@ -437,7 +626,8 @@ Know the limits:
 - **Not crash-safe.** If the holder is killed, the file stays and the lock
   looks held forever. Stale locks are never broken automatically (a pid can be
   reused, so "is that process alive" is not a safe test); inspect
-  `LockFile::owner` and call `LockFile::break_lock` deliberately.
+  `LockFile::owner` and call `LockFile::break_lock` deliberately — or use
+  [`FileLock`](#os-file-lock-filelock), which the kernel releases.
 - **Not reentrant**, and not tied to a thread.
 - `acquire_timeout` **blocks the calling thread**, polling with a short growing
   sleep; from async code, run it on a blocking thread.
@@ -448,7 +638,7 @@ Know the limits:
 
 Every fallible function returns `Result<_, FsError>`. I/O failures are
 `FsError::Io`; `detect_content_type` adds `Undetermined` for an unrecognized
-signature, and `LockFile::acquire` / `acquire_timeout` add `Locked`. The
+signature, and `FileLock` / `LockFile` `acquire` / `acquire_timeout` add `Locked`. The
 pure-function variants (`lookup_content_type`, `mime_for_ext`, `sniff`) never
 fail and return `Option`.
 
@@ -458,10 +648,16 @@ fail and return `Option`.
 - **Last-extension-only, first-512-bytes-only** — `lookup_content_type` reads
   the last extension; `detect_content_type` reads at most `SNIFF_LEN` bytes.
 - **`Mmap::open` copies the file**; the zero-copy `Mmap::map` is `unsafe` and
-  only a real mapping on the [listed targets](#where-map-really-maps).
+  only a real mapping on the [listed targets](#where-map-really-maps). On
+  Windows a mapped file on a local volume cannot be truncated, and possibly
+  not deleted or replaced, until the view is dropped; a file on a network
+  share or removable media has no such protection.
+- **Byte sizes are whole bytes up to `u64::MAX`**; no bit units (`Mb`, `Gbit`)
+  and no locale-aware formatting.
 - **No existence/metadata helpers** — use `std::path::Path`.
-- **No directory watching, no OS-level (`flock`/`fcntl`) locks** — the lock
-  file is a convention between cooperating processes.
+- **No directory watching.** File locks are exclusive only (no shared/reader locks)
+  and advisory: `FileLock` is an OS lock between cooperating processes, `LockFile` a
+  convention that a crashed holder leaves held.
 - **Not a filesystem abstraction** — for confined or pluggable file access, use
   [vfs](vfs.md).
 

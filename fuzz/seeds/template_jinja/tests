@@ -1,0 +1,1 @@
+{{ x is sequence }}{{ m is mapping }}{{ s is string }}{{ u is defined }}{{ 4 is divisibleby 2 }}{{ none is none }}{{ x[0] is odd }}

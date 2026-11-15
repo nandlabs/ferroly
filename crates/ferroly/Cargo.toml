@@ -17,9 +17,10 @@ tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
+log-facade = { workspace = true, optional = true }
 
 [features]
-default = ["codec", "errutils"]
+default = ["codec", "errutils", "tls-ring"]
 errutils = []
 codec = []
 config = ["codec"]
@@ -46,39 +47,67 @@ http = [
     "dep:rustls-pki-types",
     "dep:webpki-roots",
 ]
+# `ring` as the rustls crypto backend, used when the application has not
+# installed a process-default CryptoProvider. Turn default features off to bring
+# your own (e.g. aws-lc-rs). Does not enable `http` by itself.
+tls-ring = ["rustls?/ring", "tokio-rustls?/ring"]
 clients = ["http", "hash", "codec", "dep:tokio"]
 genai = ["codec", "clients", "http", "dep:tokio"]
 openai = ["genai"]
 claude = ["genai"]
 ollama = ["genai"]
 all-providers = ["openai", "claude", "ollama"]
+# HTTP/2 (h2 over TLS with ALPN, cleartext h2c with prior knowledge) for
+# the `http` server and client.
+http2 = ["http"]
 turbo = ["http", "codec"]
 rest = ["turbo", "clients", "codec", "lifecycle", "http"]
 ws = ["http", "lifecycle", "hash", "dep:tokio"]
 vectorstore = ["codec"]
-auth = ["codec", "hash"]
+# A sandboxed Jinja2-subset template engine (chat templates and the like).
+template = ["codec"]
+auth = ["codec", "hash", "sig"]
 log = ["codec"]
+# Routes records from the `log` facade crate into `ferroly::log`. The only
+# feature that adds a crate outside the tokio/rustls budget: `log`, which has
+# no dependencies of its own.
+log-bridge = ["log", "dep:log-facade"]
 metrics = []
 messaging = ["codec", "lifecycle", "dep:tokio"]
 vfs = ["dep:tokio", "tokio/rt", "tokio/fs", "tokio/io-util"]
 hash = []
+sig = ["hash"]
+# Content-addressed cache + artifact fetch plumbing; one feature per adapter.
+store = ["http", "hash"]
+store-s3 = ["store", "codec"]
+store-hf = ["store"]
+store-oci = ["store", "codec"]
+protobuf = []
+# gRPC (unary and streaming RPCs, status, metadata, deadlines, a codegen
+# service generator) over the `http2` server and client, with `protobuf`
+# messages. `hash` provides base64 for binary metadata.
+grpc = ["http2", "protobuf", "hash"]
 # The runtime surface re-exports all of tokio, so it is the one feature that
 # enables `tokio/full`.
 rt = ["dep:tokio", "tokio/full"]
 # Adds the paused test clock (`rt::time::{pause, advance, resume}`). Test-only.
 rt-test-util = ["rt", "tokio/test-util"]
 cli = []
-obs = ["codec"]
+# With tokio present (the OTLP exporter, `obs` + `http`), the blocking
+# `Exporter::flush` needs `block_in_place` from tokio's multi-thread runtime.
+obs = ["codec", "tokio?/rt-multi-thread"]
 full = [
     "errutils",
     "codec",
     "cli",
     "log",
+    "log-bridge",
     "config",
     "fsutils",
     "lifecycle",
     "hash",
     "http",
+    "http2",
     "clients",
     "genai",
     "all-providers",
@@ -92,6 +121,15 @@ full = [
     "vfs",
     "metrics",
     "obs",
+    "tls-ring",
+    "sig",
+    "store",
+    "store-s3",
+    "store-hf",
+    "store-oci",
+    "protobuf",
+    "grpc",
+    "template",
 ]
 
 [dev-dependencies]
@@ -107,6 +145,15 @@ required-features = ["codec"]
 [[example]]
 name = "model_router"
 required-features = ["openai"]
+
+# Interop and conformance harnesses run in CI (.github/workflows/interop.yml).
+[[example]]
+name = "grpc_interop"
+required-features = ["grpc"]
+
+[[example]]
+name = "h2spec_server"
+required-features = ["http2"]
 
 [lints]
 workspace = true

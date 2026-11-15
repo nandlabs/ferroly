@@ -29,13 +29,37 @@
 //! The encoder always emits block style and quotes any string that would
 //! otherwise read back as something else, so `encode` → `decode` round-trips.
 //! Typed decoding uses the lenient [`Decode::decode`] path.
+//!
+//! ```
+//! use ferroly::codec::{yaml, Decode, Encode};
+//!
+//! #[derive(Encode, Decode, PartialEq, Debug)]
+//! struct Model { provider: String, name: String, capabilities: Vec<String> }
+//!
+//! #[derive(Encode, Decode, PartialEq, Debug)]
+//! struct Policy { models: Vec<Model> }
+//!
+//! let policy = Policy {
+//!     models: vec![Model {
+//!         provider: "openai".into(),
+//!         name: "tuned".into(),
+//!         capabilities: vec!["text".into(), "chat".into()],
+//!     }],
+//! };
+//! let back: Policy = yaml::decode(&yaml::encode(&policy)).unwrap();
+//! assert_eq!(back, policy);
+//!
+//! // The compact, idiomatic form decodes to the same value.
+//! let compact = "models:\n  - provider: openai\n    name: tuned\n    capabilities: [text, chat]\n";
+//! assert_eq!(yaml::decode::<Policy>(compact).unwrap(), policy);
+//! ```
 
 use std::fmt::{self as stdfmt, Write as _};
 
 use ferroly::codec::{CodecError, Decode, Encode, Limits, Value};
 
 use super::fmt;
-use super::limits::Budget;
+use super::limits::{Budget, DuplicateKeys};
 
 /// Encodes any [`Encode`] type to a YAML string.
 pub fn encode<T: Encode + ?Sized>(value: &T) -> String {
@@ -778,6 +802,7 @@ impl<'a> Parser<'a> {
     fn parse_mapping(&mut self, indent: usize) -> Result<Value, CodecError> {
         self.budget.enter()?;
         let mut entries = Vec::new();
+        let mut dups = DuplicateKeys::new(self.budget.reject_duplicate_keys());
         while let Some(line) = self.structural()? {
             if line.indent < indent || (line.indent == indent && is_seq_entry(line.text)) {
                 break;
@@ -789,6 +814,7 @@ impl<'a> Parser<'a> {
                 Some(pair) => pair,
                 None => return Err(line.err("expected 'key: value'")),
             };
+            dups.check(&key).map_err(|m| line.err(m))?;
             self.budget.entry()?;
             let value = if rest.is_empty() || rest.starts_with('#') {
                 self.idx += 1;
@@ -935,8 +961,10 @@ impl<'a> Parser<'a> {
         self.budget.enter()?;
         sc.pos += 1; // '{'
         let mut entries = Vec::new();
+        let mut dups = DuplicateKeys::new(self.budget.reject_duplicate_keys());
         loop {
             sc.skip_spaces();
+            let key_at = sc.pos;
             let key = match sc.peek() {
                 Some(b'}') => {
                     sc.pos += 1;
@@ -955,6 +983,7 @@ impl<'a> Parser<'a> {
                     plain.to_string()
                 }
             };
+            dups.check(&key).map_err(|m| sc.err_at(key_at, m))?;
             self.budget.entry()?;
             sc.skip_spaces();
             let value = if sc.peek() == Some(b':') {
@@ -1755,6 +1784,26 @@ mod tests {
             err.to_string(),
             "parse error: unknown escape sequence at line 1, column 7"
         );
+    }
+
+    #[test]
+    fn duplicate_keys_can_be_rejected() {
+        let block = "a: 1\nb:\n  x: 1\n  x: 2\n";
+        let flow = "m: {k: 1, k: 2}\n";
+        // Default: last wins.
+        let v = from_str(block).unwrap();
+        assert_eq!(v.pointer("/b/x").and_then(Value::as_i64), Some(2));
+        assert!(from_str(flow).is_ok());
+        let strict = Limits::new().with_reject_duplicate_keys(true);
+        assert_eq!(
+            from_str_with(block, strict).unwrap_err().to_string(),
+            "parse error: duplicate key \"x\" at line 4, column 3"
+        );
+        assert_eq!(
+            from_str_with(flow, strict).unwrap_err().to_string(),
+            "parse error: duplicate key \"k\" at line 1, column 11"
+        );
+        assert!(from_str_with("- a: 1\n- a: 2\n", strict).is_ok());
     }
 
     #[test]

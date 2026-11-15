@@ -234,7 +234,8 @@ pub enum Role { System, User, Assistant, Tool }
 #[non_exhaustive]
 pub enum MessagePart {
     Text(String),
-    Image { data: Vec<u8>, mime_type: String },
+    Image { data: Vec<u8>, mime_type: String },          // image/* only
+    Document { data: Vec<u8>, mime_type: String, name: Option<String> },
     FileRef { uri: String, mime_type: String },
     ToolCall { id: String, name: String, arguments: Value },
     ToolResult { call_id: String, result: Value },
@@ -249,12 +250,13 @@ and an image, or text and several tool calls.
 | ------ | ------ |
 | `Message::user(text)` / `system(text)` / `assistant(text)` | a text message, no id |
 | `Message::text(role, id, text)` | a single `Text` part with an id |
-| `Message::binary(role, id, bytes, mime_type)` | a single `Image` part |
+| `Message::binary(role, id, bytes, mime_type)` | a single `Image` part for an `image/*` MIME type, a `Document` part otherwise |
+| `Message::document(role, bytes, mime_type, name)` | a single `Document` part |
 | `Message::file_ref(role, id, uri, mime_type)` | a single `FileRef` part |
 | `Message::json(role, id, &val)` | text part = the JSON [`Encode`](codec.md) of `val` |
 | `Message::tool_call(id, name, arguments)` | an assistant message requesting one tool call |
 | `Message::tool_result(call_id, result)` | a `Role::Tool` message answering a call |
-| `msg.add_text_part(..)` / `add_binary_part(..)` / `add_tool_call(..)` / `add_tool_result(..)` | append a part (returns `&mut Self`) |
+| `msg.add_text_part(..)` / `add_binary_part(..)` / `add_document_part(..)` / `add_tool_call(..)` / `add_tool_result(..)` | append a part (returns `&mut Self`) |
 | `msg.text_content()` | concatenates all `Text` parts |
 | `msg.tool_calls()` | the tool calls as `(id, name, arguments)` |
 
@@ -264,9 +266,37 @@ on. Providers return such blocks so that a multi-turn conversation can send them
 back **unchanged**: append `response.message` to your history as it is. A block
 is re-sent only to the provider named in it and skipped by every other.
 
-`FileRef` is sent as an image URL to OpenAI; to Claude as a URL image or PDF
-source when the URI is `http(s)://` with an `image/*` or `application/pdf` MIME
-type, and as text otherwise; Ollama ignores it.
+`FileRef` is sent to OpenAI as an image URL when its MIME type is `image/*`
+(or empty); any other MIME type is refused with `GenAiError::Config` before
+anything is sent, as an unreadable inline document is (Chat Completions
+fetches only image URLs, and a bare URL in a text part would not give the
+model the file); to Claude as a URL image or PDF source when
+the URI is `http(s)://` with an `image/*` or `application/pdf` MIME type, and
+as text otherwise; Ollama ignores it.
+
+### Images and inline documents
+
+An **`Image`** part must have an `image/*` MIME type. Any other (a PDF, say)
+is refused with `GenAiError::Config` before anything is sent, instead of
+going out as an image block the API rejects after the upload. Send documents
+as a **`Document`** part:
+
+| Provider | `application/pdf` | `text/*` (UTF-8) | other |
+|---|---|---|---|
+| Claude | `document` block, `base64` source (`name` → `title`) | `document` block, `text` source | `Config` error |
+| OpenAI | `file` content part, `file_data` data URL (`name` → `filename`, default `document.pdf`) | text part | `Config` error |
+| Ollama | `Config` error (no document input) | appended to the message text | `Config` error |
+
+```rust
+use ferroly::genai::{CompletionRequest, Message};
+
+# fn demo(pdf: Vec<u8>) {
+let mut message = Message::user("Summarize the attached report.");
+message.add_document_part(pdf, "application/pdf", Some("report.pdf".into()));
+let request = CompletionRequest::builder("claude-sonnet-5-5").message(message).build();
+# let _ = request;
+# }
+```
 
 ## `Options` and `OptionsBuilder`
 
@@ -615,8 +645,19 @@ and prices change faster than a library is released.
 - Every entry carries the date it was correct on (`ModelInfo::as_of`).
 - The Claude entries (`claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`,
   `claude-haiku-5-5`, `claude-haiku-4-5`) are dated 2026-11-03.
-- The OpenAI entries (`gpt-4o`, `gpt-4o-mini`, `text-embedding-3-small`) are
-  dated 2024-10-01 and will be reported as stale — override them.
+- The OpenAI entries (`gpt-6-astra`, `gpt-5.5`, `gpt-6.1-sol`, `gpt-6.1-terra`,
+  `gpt-6-luna`, `text-embedding-3-small`, `text-embedding-3-large`) are dated
+  2026-11-15, read from OpenAI's model and pricing pages that day (standard
+  tier; `gpt-5.5` at its rate for prompts under 272K tokens). Deprecated and
+  shut-down models (`gpt-5*`, `gpt-4.1*`, `gpt-4o*`, `o3`, `o4-mini`) are no
+  longer listed; add them with `custom_models` if you still use them.
+- **Left out because the published pages did not confirm them:** `ToolUse` on
+  `gpt-6.1-sol` and `gpt-6.1-terra` (their pages say tool calling requires the
+  Responses API) and on `gpt-6-luna` (Chat Completions function calling only
+  with `reasoning_effort: none`); the specs of `gpt-6-sol`, `gpt-5.4*` and
+  other models listed only on the pricing page. `JsonMode` marks the models
+  whose pages list structured outputs; a schema-less `json_object` mode is not
+  separately documented for them.
 - The Ollama entries are placeholders: what exists depends on what your server
   has pulled.
 
@@ -755,8 +796,15 @@ pub enum GenAiError {
     Template(String),
     TemplateNotFound(String),
     Unsupported { provider: String, capability: Capability },
-    Transport(String),                                   // connection, TLS, protocol
-    Api { status: u16, message: String },                // any other non-2xx
+    Transport(String),                                   // after connecting: reset, protocol, size
+    Connect(String),                                     // before sending: refused, DNS, TLS, proxy
+    #[non_exhaustive]
+    Api {                                                // any other non-2xx
+        status: u16,
+        message: String,
+        error_type: Option<String>,                      // the provider's error type / code
+        retry_after: Option<Duration>,                   // Retry-After / retry-after-ms
+    },
     ResponseParse(String),
     Config(String),
     Timeout { phase: TimeoutPhase },                     // Connect | Response | StreamIdle
@@ -785,14 +833,20 @@ body to the most specific variant:
 - `RateLimitInfo` holds every response header whose name contains `ratelimit`,
   verbatim: `limits.get("x-ratelimit-remaining-requests")`.
 - `Api::message` is `"<provider error type>: <message>"` when the provider sent
-  a type.
+  a type; the type is also kept on its own in `Api::error_type` (OpenAI: the
+  error `code`, else its `type`; Claude: `error.type`; Ollama sends none).
+- `Api` is `#[non_exhaustive]`: build one with `GenAiError::api(status,
+  message)` (plus `.with_error_type(..)` / `.with_retry_after(..)`) and match
+  it as `GenAiError::Api { status, .. }`. A retryable `Api` status (`408`,
+  `409`, `429`, `5xx`) is retried after its `retry_after` when it has one.
 
 Helpers on `GenAiError`:
 
 | Method | Returns |
 | ------ | ------- |
 | `status()` | the HTTP status, when there was one |
-| `retry_after()` | the delay the provider asked for |
+| `retry_after()` | the delay the provider asked for (`RateLimited`, `Overloaded`, `Api`) |
+| `error_type()` | the provider's error type of an `Api` error |
 | `is_timeout()` | any `Timeout` |
 | `is_transient()` | the same call may succeed later |
 | `is_caller_error()` | the request itself is at fault |
@@ -815,14 +869,24 @@ match provider.complete(request).await {
 # }
 ```
 
-### Timeouts are not retried
+### Nothing is retried once the request may have been sent
 
 A completion is **not idempotent**: once the request has been sent, the
 provider may have generated — and billed — the answer even if you never see it.
-So a timeout is its own variant, and only `TimeoutPhase::Connect` (nothing was
-sent) counts as transient. A `Response` or `StreamIdle` timeout is not retried
-by the provider's optional retry, and the router neither retries it nor fails
-it over unless you opt in.
+So only failures that happen **before** any request byte is written count as
+transient: `GenAiError::Connect` (connection refused, name resolution, an
+unreachable network, a TLS handshake or proxy `CONNECT` failure) and
+`TimeoutPhase::Connect`. The decision is made by phase, not by the error's
+text: the HTTP client marks failures raised while it resolves the host and
+opens the TCP connection (`HttpError::is_connect_failure`), and only those
+count. A "no route to host" on a connection that was already open, and any
+failure reading the body after a response head arrived, is a `Transport`
+error. A `Transport` error (the connection was up: a reset
+mid-exchange, a malformed or oversized answer) and a `Response` or
+`StreamIdle` timeout are not retried by the provider's optional retry, and the
+router neither retries them nor fails them over unless you opt in
+(`fallback_on_timeout`). An explicit refusal by the provider (`5xx`, `429`,
+an overload) is retried: the provider said it did not do the work.
 
 ### Secrets
 
@@ -1076,7 +1140,7 @@ use ferroly::genai::{CompletionRequest, GenAiError, GenAiProvider, Message, Mock
 #[tokio::test]
 async fn summarizer_retries_once() {
     let mock = MockProvider::new("mock");
-    mock.push_error(GenAiError::Api { status: 503, message: "busy".into() });
+    mock.push_error(GenAiError::api(503, "busy"));
     mock.push_text("a summary");
 
     let request = CompletionRequest::builder("any").message(Message::user("text")).build();
@@ -1199,8 +1263,11 @@ let _ = index.query_filtered("capital cities", 3, Filter::eq("tenant", "acme")).
 - `RagHit { id, score, text, metadata }`.
 - `RagError` is `Embed(GenAiError)` or `Store(VectorStoreError)`.
 
-Chunking is the vector store's concern — see
-[`vectorstore::Chunker`](vectorstore.md).
+Chunking and loading are the vector store's concern — see
+[`vectorstore::Chunker`](vectorstore.md#text-chunking) and the
+[document loaders](vectorstore.md#document-loaders). A loaded `TextChunk`
+converts into a `RagDocument` (`RagDocument::from(chunk)`), keeping its id and
+metadata (source, offsets, Markdown heading).
 
 ## Observability
 
@@ -1285,6 +1352,8 @@ let provider = OpenAiProvider::new(
 ## Prompt templates
 
 The `ferroly::genai::template` module is a small template engine for prompts.
+Its syntax is Handlebars-style; to run Jinja2 templates such as a model's
+`chat_template`, use [`ferroly::template`](template.md).
 
 | Syntax | Meaning |
 | ------ | ------- |
@@ -1419,8 +1488,8 @@ UTF-8 is an error.
 - **APIs not covered:** the OpenAI Responses API, batch APIs, moderation, image
   and audio generation, file uploads, token counting, and server-side tools
   (their blocks are passed through as `ProviderData`, not modelled).
-- **Audio and document input** have no message part of their own; `FileRef`
-  covers URL images and PDFs on Claude and URL images on OpenAI.
+- **Audio input** has no message part. Inline documents are PDFs and text
+  files only (`MessagePart::Document`); Ollama takes text documents only.
 - **No conversation memory, guardrails framework or agent loop** — the building
   blocks are here; the loop is yours.
 - **Tool results have no error flag**; describe a failure in the result text.
@@ -1435,6 +1504,13 @@ UTF-8 is an error.
 - **Streaming:** OpenAI-compatible servers that omit both a finish reason and
   `[DONE]` are reported as a truncated stream.
 - **Templates:** no filters, helpers or whitespace control.
+- **Tested against scripted servers.** Every wire-shape test runs against a
+  local scripted server. `tests/genai_live.rs` is an opt-in live smoke test of
+  the completion and streaming shapes per provider: `#[ignore]`d by default,
+  and each test passes without doing anything unless `ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY` or `OLLAMA_URL` / `OLLAMA_HOST` is set
+  (`cargo test -p ferroly --features full --test genai_live -- --ignored`).
+  It is not run in CI.
 
 ## See also
 

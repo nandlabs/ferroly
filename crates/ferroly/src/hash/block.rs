@@ -8,6 +8,14 @@ pub(crate) struct BlockBuffer<const B: usize> {
     len: usize,
 }
 
+impl<const B: usize> Drop for BlockBuffer<B> {
+    fn drop(&mut self) {
+        super::wipe(&mut self.buf);
+        self.len = 0;
+        std::hint::black_box(&*self);
+    }
+}
+
 impl<const B: usize> BlockBuffer<B> {
     pub(crate) fn new() -> Self {
         BlockBuffer {
@@ -31,9 +39,10 @@ impl<const B: usize> BlockBuffer<B> {
         }
         let mut blocks = data.chunks_exact(B);
         for block in &mut blocks {
-            let mut full = [0u8; B];
-            full.copy_from_slice(block);
-            compress(&full);
+            // Borrowed in place: no stack copy of the input.
+            if let Ok(full) = <&[u8; B]>::try_from(block) {
+                compress(full);
+            }
         }
         let rest = blocks.remainder();
         self.buf[..rest.len()].copy_from_slice(rest);

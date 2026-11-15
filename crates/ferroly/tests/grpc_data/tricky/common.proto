@@ -1,0 +1,7 @@
+// A message from another package, used by `tricky/v1/tricky.proto`.
+syntax = "proto3";
+
+package tricky.common;
+
+// An empty message.
+message Empty {}
