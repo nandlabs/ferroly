@@ -63,7 +63,7 @@ Everything lives under one crate; each area is a **cargo feature** you opt into.
 |---|---|---|
 | [`messaging`](messaging.md) | `messaging` | Provider-agnostic messaging + an in-process bus: queues and topics, typed attributes, subscription filters, delivery context and deferred acks, priority, scheduling, ack / retry / DLQ with reasons, request-reply, graceful drain |
 | [`vfs`](vfs.md) | `vfs` | Virtual filesystem trait; rooted local and in-memory backends, scheme registry, atomic and streaming writes with abort, write preconditions, etags, glob |
-| [`store`](store.md) | `store`, `store-s3`, `store-hf`, `store-oci` | Content-addressed artifact cache (verify-on-write, atomic commit, resume, concurrent-safe) with S3 (SigV4), Hugging Face Hub and OCI registry fetch adapters |
+| [`store`](store.md) | `store-local`, `store`, `store-s3`, `store-hf`, `store-oci` | Synchronous local content-addressed store (layouts, listing, short digests, non-destructive checks, cross-process lock; no tokio or HTTP) and an async artifact cache (verify-on-write, atomic commit, resume, concurrent-safe) with S3 (SigV4), Hugging Face Hub and OCI registry fetch adapters |
 | [`log`](log.md) | `log` | Structured logger: JSON / text, multiple sinks, rotation, redaction, per-target levels, sampling, trace correlation |
 | [`log::bridge`](log.md#bridging-the-log-crate) | `log-bridge` | Routes records from the `log` facade crate into a ferroly `Logger` |
 | [`metrics`](metrics.md) | `metrics` | Counters, gauges, histograms (int and float); Prometheus and OpenMetrics text; cardinality guard; RED middleware for `turbo` |
@@ -107,7 +107,8 @@ Enable only what you use — unused modules and their dependencies never compile
 | `obs` | | `codec` (+ `http` for OTLP) | for OTLP | — |
 | `messaging` | | `codec`, `lifecycle` | ✅ | — |
 | `vfs` | | tokio | ✅ | — |
-| `store` | | `http`, `hash` | ✅ | ✅ |
+| `store-local` | | `hash`, `fsutils` | — | — |
+| `store` | | `store-local`, `http`, `hash` | ✅ | ✅ |
 | `store-s3` / `store-oci` | | `store`, `codec` | ✅ | ✅ |
 | `store-hf` | | `store` | ✅ | ✅ |
 | `protobuf` | | — | — | — |
@@ -117,9 +118,9 @@ Enable only what you use — unused modules and their dependencies never compile
 ```toml
 [dependencies]
 # just what you need
-ferroly = { version = "0.6", default-features = false, features = ["genai", "openai", "vectorstore"] }
+ferroly = { version = "0.7", default-features = false, features = ["genai", "openai", "vectorstore"] }
 # or everything
-ferroly = { version = "0.6", features = ["full"] }
+ferroly = { version = "0.7", features = ["full"] }
 ```
 
 ---

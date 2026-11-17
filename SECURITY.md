@@ -18,10 +18,8 @@ Where fixes land:
   [crates.io](https://crates.io/crates/ferroly) when a maintainer publishes its
   tag; for now that is a manual step, so crates.io can lag behind the tags.
   Check the newest version there against the repository's newest `v*` tag.
-  At the time of writing 0.4.0, 0.5.0 and 0.6.0 are tagged but not yet on
-  crates.io (which stops at 0.3.2). If crates.io is behind, depend on the tag directly until
-  it catches up:
-  `ferroly = { git = "https://github.com/nandlabs/ferroly", tag = "v0.6.0" }`.
+  If crates.io is behind, depend on the tag directly until it catches up, for
+  example `ferroly = { git = "https://github.com/nandlabs/ferroly", tag = "v0.7.0" }`.
 - **Old crates.io versions are not patched.** In particular, 0.3.2 and earlier
   have known vulnerabilities that were fixed in later releases (see
   `CHANGELOG.md`). Upgrade rather than wait for a backport.

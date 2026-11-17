@@ -6,13 +6,17 @@
 //! The holder is this test binary itself, re-run with an environment variable
 //! that turns `child_holds_the_locks` into the holding process.
 
-use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ferroly::fsutils::{FileLock, LockFile, TempDir};
 
 const CHILD_ENV: &str = "FERROLY_FILE_LOCK_CHILD_DIR";
+
+/// The file the child creates once it holds both locks. A marker file, not a
+/// line on stdout: libtest's own output (`test child_holds_the_locks ... `
+/// with one test thread) shares that line.
+const CHILD_READY: &str = "child-ready";
 
 /// In the child: take both locks, announce it, and wait to be killed. In a
 /// normal test run (no environment variable) it does nothing.
@@ -24,8 +28,9 @@ fn child_holds_the_locks() {
     let dir = std::path::PathBuf::from(dir);
     let os = FileLock::acquire(dir.join("os.lock")).unwrap();
     let file = LockFile::acquire(dir.join("file.lock")).unwrap();
-    println!("locked");
-    std::thread::sleep(Duration::from_secs(120));
+    std::fs::write(dir.join(CHILD_READY), b"locked").unwrap();
+    // The parent kills it within moments; this only bounds a stray child.
+    std::thread::sleep(Duration::from_secs(20));
     drop((os, file));
 }
 
@@ -35,20 +40,23 @@ fn a_killed_holder_releases_the_os_lock() {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["child_holds_the_locks", "--exact", "--nocapture"])
         .env(CHILD_ENV, dir.path())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
 
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    loop {
-        let line = lines
-            .next()
-            .expect("the child exited before taking the locks")
-            .unwrap();
-        if line.trim() == "locked" {
-            break;
+    let ready = dir.path().join(CHILD_READY);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("the child exited ({status}) before taking the locks");
         }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the child did not take the locks in time");
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 
     let os = dir.path().join("os.lock");

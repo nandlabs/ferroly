@@ -18,7 +18,7 @@ Enable with the `sig` feature. It pulls in `hash` (for SHA-512) and nothing
 else:
 
 ```toml
-ferroly = { version = "0.6", features = ["sig"] }
+ferroly = { version = "0.7", features = ["sig"] }
 ```
 
 > **Hand-rolled, not audited.** Field arithmetic modulo 2^255 − 19, scalars

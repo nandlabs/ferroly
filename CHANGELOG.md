@@ -5,15 +5,169 @@ All notable changes to this project are documented here. The format is based on
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 crate is pre-1.0 (`0.x`), minor releases may contain breaking changes.
 
-## [Unreleased]
+## [0.7.0]
+
+Configuration and storage release. It closes 8 issues (#105 to #112): config
+fixes for single unknown keys, environment variables that name a section, and
+empty sections and files; an injectable environment for tests (`merge_env_from`)
+and a file-format allow-list (`formats`); a boolean dynamic flag that takes
+`true`/`false` (`DynamicArity::BoolSwitch`); `TempFile::persist_with_mode` and a
+directory sync after `persist`; and a synchronous, HTTP-free content-addressed
+store (`store-local`) with layouts, listing, short-digest lookup, a
+non-destructive check and a cross-process lock, which `store::Cache` is now
+built on. No public item was removed; read "Breaking / behaviour changes" before
+upgrading from 0.6.
+
+### Breaking / behaviour changes
+
+**Upgrading from 0.6:**
+
+- **config**: `ConfigError::UnknownKeys` reads `unknown config key: …` when
+  there is exactly one key; zero, two or more keep `unknown config keys: …`. The
+  50-key cap and the `, and N more` tail are unchanged. Match on the variant,
+  not the text (#105).
+- **config**: with a schema, an environment variable whose path names a section
+  rather than a key (`APP_MODEL` against a `model` section, `APP_A__B` against
+  `a.b.c`) is no longer configuration: it is skipped without being reported, in
+  strict and lenient mode alike, and with `EnvOptions::secret_files()` the file
+  an `APP_MODEL_FILE` names is not read. A field whose default encodes as a
+  section (a data-carrying enum variant) can therefore no longer be set to a
+  unit variant from the environment; set it from a file, a value layer or
+  arguments (#107).
+- **config**: with a schema, a `null` where the schema has a section (a YAML
+  `engine:` heading with every key commented out) is dropped instead of
+  replacing the section, and an empty layer, with or without a schema, is now
+  read from a file of any format (JSON and XML included) that is empty or holds
+  only whitespace, from a comment-only YAML, TOML or properties file, and from a
+  JSON `null`; a section holding nothing but such null sections is dropped with
+  them, so it creates no empty object and records no origin. `null` for an
+  `Option`, a leaf or a free-form map, and any other scalar where a section is
+  expected, are merged as before; `merge_value(Value::Null)` is unchanged
+  (#109).
+- **config / cli**: `config::dynamic_arity` returns the new
+  `DynamicArity::BoolSwitch` (was `Switch`) for boolean keys, so a positional or
+  variadic value that is literally `true` or `false`, written directly after a
+  boolean dynamic flag, is now taken as the flag's value. To keep the old
+  behaviour, wrap the function: `move |n| arity(n).map(|a| if a ==
+  DynamicArity::BoolSwitch { DynamicArity::Switch } else { a })` (#108).
+- **store**: `remove`, `evict_to` and the deletion of a corrupt object in
+  `Cache::verify` take the new cross-process store lock when they have something
+  to delete: they then wait while another holder has it (they never blocked
+  before), and fail with `StoreError::Io` (`Unsupported`) on a platform where
+  `fsutils::FileLock` is unsupported. With nothing to delete (`remove` of an
+  absent object, `evict_to` when the objects already fit) they return as before
+  without the lock, so they also work on a read-only store root. The async
+  `Cache` forms wait in short slices; if the future is dropped while waiting,
+  nothing is deleted. A `.lock` file appears in the cache root after the first
+  call that deletes something, and is never deleted (#112).
+- **store**: `StoreError::Http` exists only with the `store` feature, and
+  `ferroly::Error::Store` with `store-local` (which `store` implies), so code
+  using `store` compiles unchanged. `StoreError` gains `NotFound`,
+  `AmbiguousPrefix` and `Locked`; it is `#[non_exhaustive]` (#112).
+
+### Added
+
+- **config**: `ConfigBuilder::merge_env_from(prefix, vars)` and
+  `merge_env_from_with(prefix, vars, &options)` read environment variables from
+  any iterator of `Into<OsString>` pairs instead of the process environment, so
+  environment handling can be tested without `std::env::set_var` and without
+  racing other tests. They follow every `merge_env` / `merge_env_with` rule:
+  nesting, ignored keys, sorted application, `EnvOptions`, schema screening and
+  provenance. `*_FILE` secret paths are still read from disk, and when a name is
+  repeated the last value in input order wins; if that last value is not valid
+  UTF-8 the variable is skipped, even when an earlier value was valid, as in the
+  process environment (#110).
+- **config**: `ConfigBuilder::formats(&[FileFormat])` and a public `FileFormat`
+  enum (`all`, `from_path`, `extensions`) restrict which file formats a builder
+  loads. `merge_file`, `merge_file_optional`, `merge_profile`, `merge_found` and
+  the file and profile `Layer`s refuse a known extension that is not accepted,
+  before touching the filesystem; with an extension-less base, `merge_profile`
+  probes only the accepted extensions. New `ConfigError::FormatNotAllowed {
+  path, allowed }`, classified `Unsupported` (#111).
+- **cli**: `DynamicArity::BoolSwitch`, a dynamic boolean switch that also takes
+  the next token when it is `true` or `false` (ASCII case-insensitive), so
+  `--name false` works as well as `--name` and `--name=false`. Any other next
+  token (`1`, `on`, `file.txt`, a flag, `--`, or a subcommand name, including a
+  subcommand literally named `true`/`false`) is left alone, and `--name=value`
+  reads the same boolean words as `Switch` (#108).
+- **fsutils**: `TempFile::persist_with_mode(dest, mode)` sets the file's exact
+  permission bits (Unix; the umask is not applied, and `mode` is ignored
+  elsewhere) just before the flush and rename. The draft stays `0600` while it
+  is written, so a shared cache or build output no longer has to `chmod` the
+  temporary path (#106).
+- **store**: new `store-local` feature (in `full`): `LocalStore`, a synchronous,
+  HTTP-free content-addressed store that depends only on `hash` and `fsutils`
+  (no tokio, rustls or HTTP client), with `open` / `open_with`, `get` /
+  `contains` / `path_for`, `insert_reader` / `insert_bytes` / `insert_verified`
+  / `insert_path`, `remove`, `usage`, `evict_to`, `purge_temp` and
+  `with_max_object_bytes`. `store` now implies `store-local`, and `Cache` is
+  layered on it (`Cache::from_local`, `Cache::local`, `From<LocalStore> for
+  Cache`); both can share one directory. `Digest`, `Stored` and `Evicted` are
+  available under `store-local` (#112).
+- **store**: `Layout::{Fanout, Flat}` with `Layout::flat(prefix)` and
+  `Cache::open_with` / `LocalStore::open_with`: objects go in `sha256/<2
+  hex>/<hex>` (the default, unchanged) or `<prefix>/sha256/<hex>` (for example
+  `blobs/sha256/<hex>`). Bad prefixes (empty, absolute, `..`, the store's own
+  `tmp` / `partial` / `.lock`, or a component ending in `.` or a space) are
+  refused with `StoreError::Config`. There is no migration between layouts
+  (#112).
+- **store**: `list()` (sorted `ObjectInfo { digest, path, size, modified }`;
+  foreign entries are skipped), `resolve_prefix()` / `resolve_prefix_min()` for
+  short digests (`MIN_PREFIX_HEX` = 12; like `list`, they ignore stray files and
+  symlinks), and `check()` / `check_all()` returning `ObjectStatus::{Intact,
+  Missing, Corrupt}`, which never modify the store; on `LocalStore` and, async,
+  on `Cache` (#112).
+- **store**: `StoreLock`, a cross-process store lock on `<root>/.lock` built on
+  `fsutils::FileLock`, taken with `LocalStore::lock` / `try_lock` /
+  `lock_timeout` or `Cache::lock().await`; its `remove`, `evict_to` and `repair`
+  run under the lock already held. New `StoreError` variants `NotFound(String)`
+  (`is_not_found()` is true; classified `NotFound`), `AmbiguousPrefix { prefix,
+  candidates, matches }` (`InvalidInput`) and `Locked(String)` (`Conflict`), and
+  `From<fsutils::FsError> for StoreError` (#112).
 
 ### Changed
 
 - **ci**: publishing to crates.io is manual for now. `tag-on-merge` still tags
   each version merged to `main` but no longer starts `publish.yml`, which now
   runs only when a maintainer dispatches it; the `crates.io drift` check runs by
-  hand and after a publish, with no daily schedule. CONTRIBUTING.md
-  ("Publishing to crates.io") has the by-hand steps.
+  hand and after a publish, with no daily schedule. CONTRIBUTING.md ("Publishing
+  to crates.io") has the by-hand steps (#104).
+- **ci**: `taiki-e/install-action` `v2.88.1` → `v2.90.3`, pinned by commit, in
+  the coverage and fuzz workflows (Dependabot PR #103).
+- **config**: `merge_env` and `merge_env_with` are thin wrappers over
+  `merge_env_from` / `merge_env_from_with` with `std::env::vars_os()`; their
+  behaviour is unchanged (#110).
+- **fsutils**: `TempFile::persist` (and `persist_with_mode`) flushes the
+  destination's directory after the rename on Unix, so the rename itself
+  survives a crash, as `AtomicFile::commit` already did and with the same
+  helper. It is best effort: errors are ignored, since the file is already in
+  place (#106).
+- **store**: `Cache::remove`, `verify`, `usage`, `evict_to` and `purge_temp`
+  each run as one blocking-thread call on the `LocalStore` core instead of a
+  series of `tokio::fs` calls when the store lock is free (while it is held
+  elsewhere, `remove`, `evict_to` and `verify` retry in 50 ms slices, and delete
+  nothing if cancelled); signatures and documented results are unchanged, and
+  `verify` checks again under the lock before deleting (#112).
+
+### Fixed
+
+- **config**: `SharedConfig::watch_files` waits for a change that leaves a watched
+  file empty or missing to stay that way for at least one second (and five polls)
+  before reloading, so a non-atomic rewrite caught between its truncation and its
+  write is not loaded as an empty layer now that an empty file is one (#109).
+- **config**: an environment variable named like a schema section
+  (`APP_MODEL=x`) no longer replaces the whole section and erases its defaults,
+  and with `EnvOptions::secret_files()` the file an `APP_MODEL_FILE` names is no
+  longer read; `APP_MODEL__PATH` still sets `model.path` (#107).
+- **config**: a section left empty in a config file, at any depth, no longer
+  erases the lower layers' values for that section; it is never reported as an
+  unknown key and records no provenance. An empty or whitespace-only file of any
+  format (a zero-byte `app.json` or `app.xml` was a `ConfigError::Parse`), or a
+  comment-only YAML, TOML or properties file, no longer erases the whole
+  configuration or fails through `merge_file`, `merge_file_optional` or
+  `merge_profile`; a parent section left empty only by null sections no longer
+  leaves an empty object with a file origin, and a layer that screens to nothing
+  records no phantom `""` entry in `Config::sources()` (#109).
 
 ## [0.6.0]
 

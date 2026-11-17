@@ -178,7 +178,7 @@ impl Drop for AtomicFile {
 }
 
 /// The directory containing `path` (`.` for a bare file name).
-fn parent_dir(path: &Path) -> PathBuf {
+pub(crate) fn parent_dir(path: &Path) -> PathBuf {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
@@ -188,14 +188,14 @@ fn parent_dir(path: &Path) -> PathBuf {
 /// Flushes a directory entry change to disk. Best-effort: not every
 /// filesystem supports it, and the data itself is already safe.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) {
+pub(crate) fn sync_dir(dir: &Path) {
     if let Ok(handle) = File::open(dir) {
         let _ = handle.sync_all();
     }
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) {}
+pub(crate) fn sync_dir(_dir: &Path) {}
 
 #[cfg(test)]
 mod tests {

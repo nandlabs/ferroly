@@ -10,7 +10,7 @@ Enable with the `protobuf` feature (std-only; no other feature or crate
 required):
 
 ```toml
-ferroly = { version = "0.6", features = ["protobuf"] }
+ferroly = { version = "0.7", features = ["protobuf"] }
 ```
 
 The terminology follows the rest of Ferroly: messages are **encoded** and
@@ -400,10 +400,10 @@ derives. It needs no `protoc`: put `ferroly` (with `protobuf`) in
 ```toml
 # Cargo.toml
 [dependencies]
-ferroly = { version = "0.6", features = ["protobuf"] }
+ferroly = { version = "0.7", features = ["protobuf"] }
 
 [build-dependencies]
-ferroly = { version = "0.6", default-features = false, features = ["protobuf"] }
+ferroly = { version = "0.7", default-features = false, features = ["protobuf"] }
 ```
 
 ```rust,no_run

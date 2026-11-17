@@ -6,7 +6,7 @@
 //!
 //! ```no_run
 //! // The body of `fn main` in build.rs, with
-//! // `ferroly = { version = "0.6", features = ["protobuf"] }` under
+//! // `ferroly = { version = "0.7", features = ["protobuf"] }` under
 //! // [build-dependencies]. `compile_to_file` prints `cargo:rerun-if-changed`
 //! // for every `.proto` file it reads.
 //! let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("protos.rs");

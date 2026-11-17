@@ -151,7 +151,10 @@ impl AsRef<Path> for TempDir {
 /// A uniquely named, open file that is deleted when the guard is dropped.
 ///
 /// The file is created with create-new semantics (an existing file is never
-/// reused or truncated) and, on Unix, mode `0600`.
+/// reused or truncated) and, on Unix, mode `0600`. The mode stays `0600`
+/// through [`persist`](TempFile::persist); use
+/// [`persist_with_mode`](TempFile::persist_with_mode) to publish it with a
+/// wider one (such as `0o644`) once it is complete.
 ///
 /// ```
 /// use ferroly::fsutils::TempFile;
@@ -233,11 +236,69 @@ impl TempFile {
 
     /// Flushes the file to disk and renames it to `dest`, replacing any
     /// existing file there. `dest` must be on the same filesystem (a rename
-    /// cannot cross devices); on failure the temporary file is removed.
-    pub fn persist(mut self, dest: impl AsRef<Path>) -> Result<(), FsError> {
+    /// cannot cross devices); on failure the temporary file is removed and
+    /// `dest` is left as it was.
+    ///
+    /// On Unix the containing directory is then flushed too, so the rename
+    /// itself survives a crash (best effort; some filesystems do not support
+    /// syncing a directory, and an error there is ignored because the file is
+    /// already at `dest`). Off Unix there is no directory sync.
+    ///
+    /// The persisted file keeps the temporary file's mode (`0600` on Unix);
+    /// use [`persist_with_mode`](TempFile::persist_with_mode) for a wider one.
+    pub fn persist(self, dest: impl AsRef<Path>) -> Result<(), FsError> {
+        self.persist_impl(dest.as_ref(), None)
+    }
+
+    /// Like [`persist`](TempFile::persist), but first sets the file's
+    /// permission bits to `mode` (Unix; `mode` is ignored elsewhere).
+    ///
+    /// The bits are applied exactly as given, like `chmod`: the process
+    /// umask does not apply. Only the low 12 bits (`0o7777`) are meaningful;
+    /// callers normally pass `0o644` or `0o640`. The file stays `0600` while
+    /// it is being written and only widens at publish time, so partially
+    /// written data is never exposed under the wider mode.
+    ///
+    /// Errors and the directory sync behave as for
+    /// [`persist`](TempFile::persist): if setting the mode, flushing or the
+    /// rename fails, the temporary file is removed and `dest` is untouched.
+    ///
+    /// ```
+    /// use ferroly::fsutils::{TempDir, TempFile};
+    /// use std::io::Write;
+    ///
+    /// let dir = TempDir::new("my-app")?;
+    /// let mut tmp = TempFile::new_in(dir.path(), "download")?;
+    /// tmp.as_file_mut().write_all(b"shared")?;
+    /// let dest = dir.path().join("blob.bin");
+    /// tmp.persist_with_mode(&dest, 0o644)?;   // readable by other users on Unix
+    /// assert_eq!(std::fs::read(&dest)?, b"shared");
+    /// # Ok::<(), ferroly::fsutils::FsError>(())
+    /// ```
+    pub fn persist_with_mode(self, dest: impl AsRef<Path>, mode: u32) -> Result<(), FsError> {
+        self.persist_impl(dest.as_ref(), Some(mode))
+    }
+
+    /// Shared body of [`persist`](TempFile::persist) and
+    /// [`persist_with_mode`](TempFile::persist_with_mode). Any error before or
+    /// during the rename leaves the guard armed, so `Drop` removes the file.
+    fn persist_impl(mut self, dest: &Path, mode: Option<u32>) -> Result<(), FsError> {
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            // On the open handle (fchmod), so it cannot race a rename of the
+            // path; before `sync_all`, so the change is flushed with the data.
+            self.file
+                .set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
         self.file.sync_all()?;
-        std::fs::rename(&self.path, dest.as_ref())?;
+        std::fs::rename(&self.path, dest)?;
         self.armed = false;
+        // Best effort, as in `AtomicFile::commit`: the file is already at
+        // `dest`, so an error here would only mislead a caller into retrying.
+        super::atomic::sync_dir(&super::atomic::parent_dir(dest));
         Ok(())
     }
 }
@@ -336,5 +397,109 @@ mod tests {
 
         let kept = TempFile::new_in(dir.path(), "k").unwrap().keep();
         assert!(kept.is_file());
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_default_mode_stays_0600() {
+        let dir = TempDir::new("ferroly-temp-default-mode").unwrap();
+        let mut tmp = TempFile::new_in(dir.path(), "f").unwrap();
+        tmp.as_file_mut().write_all(b"secret").unwrap();
+        let dest = dir.path().join("out.bin");
+        tmp.persist(&dest).unwrap();
+        assert_eq!(mode_of(&dest), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_with_mode_sets_exact_bits() {
+        let dir = TempDir::new("ferroly-temp-with-mode").unwrap();
+        let mut tmp = TempFile::new_in(dir.path(), "a").unwrap();
+        tmp.as_file_mut().write_all(b"shared").unwrap();
+        let dest = dir.path().join("a.bin");
+        tmp.persist_with_mode(&dest, 0o644).unwrap();
+        assert_eq!(mode_of(&dest), 0o644);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"shared");
+
+        // A create-time 0o666 would come out 0o644 under the usual umask of
+        // 022; an exact 0o666 shows the umask is not applied.
+        let mut tmp = TempFile::new_in(dir.path(), "b").unwrap();
+        tmp.as_file_mut().write_all(b"open").unwrap();
+        let dest = dir.path().join("b.bin");
+        tmp.persist_with_mode(&dest, 0o666).unwrap();
+        assert_eq!(mode_of(&dest), 0o666);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"open");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_with_mode_keeps_draft_private_until_persist() {
+        let dir = TempDir::new("ferroly-temp-draft-mode").unwrap();
+        let mut tmp = TempFile::new_in(dir.path(), "d").unwrap();
+        tmp.as_file_mut().write_all(b"partial").unwrap();
+        assert_eq!(mode_of(tmp.path()), 0o600);
+        let dest = dir.path().join("d.bin");
+        tmp.persist_with_mode(&dest, 0o644).unwrap();
+        assert_eq!(mode_of(&dest), 0o644);
+    }
+
+    #[test]
+    fn persist_with_mode_replaces_existing_destination() {
+        let dir = TempDir::new("ferroly-temp-replace").unwrap();
+        let dest = dir.path().join("existing.bin");
+        std::fs::write(&dest, b"old contents").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut tmp = TempFile::new_in(dir.path(), "r").unwrap();
+        tmp.as_file_mut().write_all(b"new").unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        tmp.persist_with_mode(&dest, 0o644).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert!(!tmp_path.exists());
+        #[cfg(unix)]
+        assert_eq!(mode_of(&dest), 0o644);
+    }
+
+    #[test]
+    fn persist_failure_removes_temp_file() {
+        let dir = TempDir::new("ferroly-temp-persist-fail").unwrap();
+        let missing = dir.path().join("missing");
+
+        let mut tmp = TempFile::new_in(dir.path(), "p").unwrap();
+        tmp.as_file_mut().write_all(b"x").unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        assert!(tmp.persist(missing.join("out.bin")).is_err());
+        assert!(!tmp_path.exists());
+
+        let mut tmp = TempFile::new_in(dir.path(), "m").unwrap();
+        tmp.as_file_mut().write_all(b"y").unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        assert!(tmp
+            .persist_with_mode(missing.join("out.bin"), 0o644)
+            .is_err());
+        assert!(!tmp_path.exists());
+
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn persist_with_mode_is_ignored_off_unix() {
+        let dir = TempDir::new("ferroly-temp-mode-ignored").unwrap();
+        let mut tmp = TempFile::new_in(dir.path(), "w").unwrap();
+        tmp.as_file_mut().write_all(b"portable").unwrap();
+        let dest = dir.path().join("w.bin");
+        tmp.persist_with_mode(&dest, 0o644).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"portable");
     }
 }

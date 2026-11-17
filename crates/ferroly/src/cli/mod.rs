@@ -334,6 +334,18 @@ pub enum DynamicArity {
     /// reported as `"true"` or `"false"`; anything else is
     /// [`CliError::InvalidValue`].
     Switch,
+    /// A boolean switch that may also be given its value as the next token:
+    /// `--name` alone is a switch (reported with no value, like
+    /// [`Switch`](DynamicArity::Switch)); `--name true` / `--name false`
+    /// (those two words only, ASCII case-insensitive, as
+    /// `config::ArgsOptions::types` reads them) take the next token and
+    /// report it as `"true"` or `"false"`. Any other next token (`1`, `on`,
+    /// `file.txt`, a flag, `--`, a subcommand name) is left alone, so
+    /// `--name file.txt` still leaves `file.txt` a positional, and a
+    /// subcommand literally named `true` or `false` still dispatches.
+    /// `--name=value` reads the boolean words of a declared switch, exactly
+    /// as for `Switch`.
+    BoolSwitch,
     /// Always takes a value: the next token, even one that starts with a
     /// single `-` (`--model.context -1`, `--model.stop -x`) or names a
     /// subcommand, but never one that starts with `--`. With no such token
@@ -830,7 +842,10 @@ impl Command {
     ///   value: `app --engine.deterministic file.txt` gives
     ///   `("engine.deterministic", Some("file.txt"))` and no positional. Write
     ///   `--name=true`, put the switch last, or declare the arity with
-    ///   [`dynamic_flags_with`](Command::dynamic_flags_with).
+    ///   [`dynamic_flags_with`](Command::dynamic_flags_with): a
+    ///   [`Switch`](DynamicArity::Switch) never takes the next token, and a
+    ///   [`BoolSwitch`](DynamicArity::BoolSwitch) takes it only when it is
+    ///   `true` or `false`, so `--name false` also works.
     /// - Declared flags, `--help` and `--version` always win; a flag for which
     ///   the predicate is false is still [`CliError::UnknownFlag`], with its
     ///   suggestion. Short flags are never dynamic, and neither is a name with
@@ -868,8 +883,10 @@ impl Command {
     /// [`dynamic_flags`](Command::dynamic_flags), with `arity` both choosing
     /// the names and saying how each reads the next token: `None` refuses the
     /// name ([`CliError::UnknownFlag`]); `Some(arity)` accepts it as a
-    /// [`Switch`](DynamicArity::Switch), [`Value`](DynamicArity::Value) or
-    /// [`Optional`](DynamicArity::Optional) flag. Everything else (precedence,
+    /// [`Switch`](DynamicArity::Switch),
+    /// [`BoolSwitch`](DynamicArity::BoolSwitch),
+    /// [`Value`](DynamicArity::Value) or [`Optional`](DynamicArity::Optional)
+    /// flag. Everything else (precedence,
     /// inheritance, help, [`Matches::dynamic`]) is as for `dynamic_flags`.
     ///
     /// With the `config` feature, `ferroly::config::dynamic_arity(&schema)`
@@ -881,6 +898,7 @@ impl Command {
     /// let cmd = Command::new("app")
     ///     .dynamic_flags_with(|name| match name {
     ///         "engine.deterministic" => Some(DynamicArity::Switch),
+    ///         "engine.warmup" => Some(DynamicArity::BoolSwitch),
     ///         "engine.threads" | "model.context" => Some(DynamicArity::Value),
     ///         _ => None,
     ///     })
@@ -900,6 +918,19 @@ impl Command {
     ///     ]
     /// );
     /// assert_eq!(m.subcommand().unwrap().1.get("file"), Some("a.txt"));
+    ///
+    /// // A `BoolSwitch` also takes a following `true` / `false`, and nothing else.
+    /// let m = cmd
+    ///     .parse(["--engine.warmup", "false", "serve", "--engine.warmup", "b.txt"].map(String::from))
+    ///     .unwrap();
+    /// assert_eq!(
+    ///     m.dynamic(),
+    ///     [
+    ///         ("engine.warmup".to_string(), Some("false".to_string())),
+    ///         ("engine.warmup".to_string(), None),
+    ///     ]
+    /// );
+    /// assert_eq!(m.subcommand().unwrap().1.get("file"), Some("b.txt"));
     /// ```
     pub fn dynamic_flags_with(
         mut self,
@@ -1104,7 +1135,7 @@ impl Command {
                         .and_then(|p| (p.0)(key));
                     if let Some(arity) = arity {
                         let value = match (arity, inline) {
-                            (DynamicArity::Switch, Some(v)) => Some(
+                            (DynamicArity::Switch | DynamicArity::BoolSwitch, Some(v)) => Some(
                                 parse_bool(v)
                                     .ok_or_else(|| CliError::InvalidValue {
                                         name: key.to_string(),
@@ -1114,6 +1145,22 @@ impl Command {
                             ),
                             (_, Some(v)) => Some(v.to_string()),
                             (DynamicArity::Switch, None) => None,
+                            // Only `true` / `false`, and never a token that
+                            // would select a subcommand.
+                            (DynamicArity::BoolSwitch, None) => match argv
+                                .get(i + 1)
+                                .filter(|next| {
+                                    !(positionals.is_empty()
+                                        && self.find_subcommand(next).is_some())
+                                })
+                                .and_then(|next| bool_word(next))
+                            {
+                                Some(b) => {
+                                    i += 1;
+                                    Some(b.to_string())
+                                }
+                                None => None,
+                            },
                             (DynamicArity::Value, None) => match argv.get(i + 1) {
                                 Some(next) if !next.starts_with("--") => {
                                     i += 1;
@@ -1524,6 +1571,17 @@ fn parse_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Some(true),
         "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Reads the next token after a [`BoolSwitch`](DynamicArity::BoolSwitch):
+/// only `true` / `false` (trimmed, ASCII case-insensitive), so `--flag 1 file`
+/// and `--flag on` stay unambiguous.
+fn bool_word(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
         _ => None,
     }
 }

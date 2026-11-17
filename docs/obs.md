@@ -20,10 +20,10 @@ Enable with the `obs` feature (`obs = ["codec"]`, std-only); the OTLP exporter
 and the HTTP client trace interceptor also need `http`:
 
 ```toml
-ferroly = { version = "0.6", features = ["obs"] }                     # spans + JSON / plain-text export
-ferroly = { version = "0.6", features = ["obs", "http"] }             # + OTLP/HTTP (JSON) export
-ferroly = { version = "0.6", features = ["obs", "http", "protobuf"] } # + OTLP/HTTP protobuf
-ferroly = { version = "0.6", features = ["obs", "grpc"] }             # + OTLP/gRPC
+ferroly = { version = "0.7", features = ["obs"] }                     # spans + JSON / plain-text export
+ferroly = { version = "0.7", features = ["obs", "http"] }             # + OTLP/HTTP (JSON) export
+ferroly = { version = "0.7", features = ["obs", "http", "protobuf"] } # + OTLP/HTTP protobuf
+ferroly = { version = "0.7", features = ["obs", "grpc"] }             # + OTLP/gRPC
 ```
 
 ## At a glance

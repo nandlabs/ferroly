@@ -584,6 +584,60 @@ fn env_can_reach_camel_case_keys() {
     std::env::remove_var("CFGIT_PC_dbPool__maxConnections");
 }
 
+#[test]
+fn merge_env_matches_merge_env_from_vars_os() {
+    let dir = temp_dir("env-parity");
+    let secret = dir.join("pw");
+    std::fs::write(&secret, "from-file\n").unwrap();
+    let vars = [
+        ("CFGIT_PAR_PORT", "8080".into()),
+        ("CFGIT_PAR_DB", "scalar".into()),
+        ("CFGIT_PAR_DB__HOST", "h".into()),
+        ("CFGIT_PAR_DB__PASSWORD", "from-env".into()),
+        ("CFGIT_PAR_DB__PASSWORD_FILE", secret.display().to_string()),
+        ("CFGIT_PAR_MAX_CONNECTIONS", "50".into()),
+    ];
+    for (k, v) in &vars {
+        std::env::set_var(k, v);
+    }
+
+    let sources = |cfg: &Config| -> Vec<(String, Source)> {
+        cfg.sources()
+            .map(|(k, s)| (k.to_string(), s.clone()))
+            .collect()
+    };
+
+    let real = Config::builder().merge_env("CFGIT_PAR_").build();
+    let injected = Config::builder()
+        .merge_env_from("CFGIT_PAR_", std::env::vars_os())
+        .build();
+    assert_eq!(real.value(), injected.value());
+    assert_eq!(sources(&real), sources(&injected));
+    assert_eq!(real.get::<String>("db.host").unwrap(), "h");
+
+    let options = EnvOptions::new().secret_files().case_insensitive();
+    let defaults = obj(&[("maxConnections", Value::Int(5))]);
+    let real = Config::builder()
+        .merge_value(defaults.clone())
+        .merge_env_with("CFGIT_PAR_", &options)
+        .unwrap()
+        .build();
+    let injected = Config::builder()
+        .merge_value(defaults)
+        .merge_env_from_with("CFGIT_PAR_", std::env::vars_os(), &options)
+        .unwrap()
+        .build();
+    assert_eq!(real.value(), injected.value());
+    assert_eq!(sources(&real), sources(&injected));
+    assert_eq!(real.get::<String>("db.password").unwrap(), "from-file");
+    assert_eq!(real.get::<u32>("maxConnections").unwrap(), 50);
+
+    for (k, _) in &vars {
+        std::env::remove_var(k);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- interpolation ---------------------------------------------------------
 
 #[test]
@@ -1411,6 +1465,42 @@ fn secret_dir_missing_oversized_and_non_utf8_files() {
 }
 
 // ---- change detection ------------------------------------------------------------
+
+#[test]
+fn watch_files_does_not_load_a_rewrite_caught_while_empty() {
+    use std::io::Write;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = temp_dir("watch-empty");
+    let file = dir.join("app.json");
+    std::fs::write(&file, r#"{"port": 1}"#).unwrap();
+    let loaded = file.clone();
+    let shared =
+        SharedConfig::with_loader(move || Ok(Config::builder().merge_file(&loaded)?.build()))
+            .unwrap();
+    let (tx, rx) = mpsc::channel();
+    let watcher = shared
+        .watch_files([file.clone()], Duration::from_millis(20), move |r| {
+            let _ = tx.send(r.map(|c| c.get::<u16>("port").ok()));
+        })
+        .unwrap();
+
+    // A slow non-atomic rewrite: truncated, then written ~15 polls later.
+    let mut handle = std::fs::File::create(&file).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    handle.write_all(br#"{"port": 2}"#).unwrap();
+    drop(handle);
+
+    // The only reload is of the finished file; the empty state never loads.
+    let seen = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.unwrap(), Some(2));
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    assert_eq!(shared.get::<u16>("port").unwrap(), 2);
+
+    watcher.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
 
 #[test]
 fn watch_files_reloads_when_a_file_changes_and_keeps_the_old_config_on_error() {

@@ -39,7 +39,7 @@ pub enum StoreError {
 [dependencies]
 ferroly = "0.4"                       # errutils + codec are the defaults
 # or, explicitly / minimally:
-ferroly = { version = "0.6", default-features = false, features = ["errutils"] }
+ferroly = { version = "0.7", default-features = false, features = ["errutils"] }
 ```
 
 ## Quick start

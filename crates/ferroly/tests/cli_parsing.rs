@@ -1251,6 +1251,7 @@ fn typed_dynamic_app() -> Command {
     Command::new("app")
         .dynamic_flags_with(|name| match name {
             "engine.det" => Some(DynamicArity::Switch),
+            "engine.flag" => Some(DynamicArity::BoolSwitch),
             "engine.name" | "engine.n" => Some(DynamicArity::Value),
             n if n.starts_with("engine.") => Some(DynamicArity::Optional),
             _ => None,
@@ -1281,6 +1282,14 @@ fn a_switch_arity_never_takes_the_next_token() {
     assert_eq!(m.dynamic(), dynamic(&[("engine.det", None)]));
     let (_, serve) = m.subcommand().unwrap();
     assert_eq!(serve.get_all("rest"), ["x", "y"]);
+
+    // Not even a boolean word (#108: that is `BoolSwitch`).
+    let m = typed_dynamic_app()
+        .parse(args(&["serve", "--engine.det", "false"]))
+        .unwrap();
+    assert_eq!(m.dynamic(), dynamic(&[("engine.det", None)]));
+    let (_, serve) = m.subcommand().unwrap();
+    assert_eq!(serve.get_all("rest"), ["false"]);
 
     // Before the subcommand: a mistyped subcommand is reported as one.
     let err = typed_dynamic_app()
@@ -1313,6 +1322,104 @@ fn a_switch_arity_never_takes_the_next_token() {
             value: "maybe".into()
         }
     );
+}
+
+// #108
+#[test]
+fn a_bool_switch_takes_a_following_true_or_false() {
+    let m = typed_dynamic_app()
+        .parse(args(&["--engine.flag", "false", "serve"]))
+        .unwrap();
+    assert_eq!(m.dynamic(), dynamic(&[("engine.flag", Some("false"))]));
+    assert_eq!(m.subcommand_name(), Some("serve"));
+    assert_eq!(m.dynamic_indices(), [1], "the value's token");
+
+    let m = typed_dynamic_app()
+        .parse(args(&["serve", "--engine.flag", "TRUE", "x"]))
+        .unwrap();
+    assert_eq!(m.dynamic(), dynamic(&[("engine.flag", Some("true"))]));
+    assert_eq!(m.dynamic_indices(), [2], "the value's token");
+    let (_, serve) = m.subcommand().unwrap();
+    assert_eq!(serve.get_all("rest"), ["x"]);
+}
+
+// #108
+#[test]
+fn a_bool_switch_leaves_other_tokens_alone() {
+    for next in ["file.txt", "1", "on"] {
+        let m = typed_dynamic_app()
+            .parse(args(&["serve", "--engine.flag", next]))
+            .unwrap();
+        assert_eq!(m.dynamic(), dynamic(&[("engine.flag", None)]), "{next}");
+        assert_eq!(m.dynamic_indices(), [1], "the flag's own token");
+        let (_, serve) = m.subcommand().unwrap();
+        assert_eq!(serve.get_all("rest"), [next]);
+    }
+
+    // Before the subcommand: a mistyped subcommand is reported as one.
+    let err = typed_dynamic_app()
+        .parse(args(&["--engine.flag", "srve"]))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CliError::UnknownCommand { ref name, suggestion: Some(ref s) }
+                if name == "srve" && s == "serve"
+        ),
+        "{err:?}"
+    );
+}
+
+// #108
+#[test]
+fn a_bool_switch_reads_inline_values_like_a_switch() {
+    let m = typed_dynamic_app()
+        .parse(args(&["--engine.flag=0", "serve", "--engine.flag=YES"]))
+        .unwrap();
+    assert_eq!(
+        m.dynamic(),
+        dynamic(&[
+            ("engine.flag", Some("false")),
+            ("engine.flag", Some("true"))
+        ])
+    );
+    let err = typed_dynamic_app()
+        .parse(args(&["--engine.flag=maybe"]))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        CliError::InvalidValue {
+            name: "engine.flag".into(),
+            value: "maybe".into()
+        }
+    );
+}
+
+// #108
+#[test]
+fn a_bool_switch_does_not_take_a_subcommand_or_the_terminator() {
+    let m = typed_dynamic_app()
+        .subcommand(Command::new("false"))
+        .parse(args(&["--engine.flag", "false"]))
+        .unwrap();
+    assert_eq!(m.dynamic(), dynamic(&[("engine.flag", None)]));
+    assert_eq!(m.subcommand_name(), Some("false"));
+
+    let m = typed_dynamic_app()
+        .parse(args(&["serve", "--engine.flag", "--", "false"]))
+        .unwrap();
+    assert_eq!(m.dynamic(), dynamic(&[("engine.flag", None)]));
+    let (_, serve) = m.subcommand().unwrap();
+    assert_eq!(serve.get_all("rest"), ["false"]);
+}
+
+// #108
+#[test]
+fn a_bool_switch_at_the_end_is_a_switch() {
+    let m = typed_dynamic_app()
+        .parse(args(&["serve", "--engine.flag"]))
+        .unwrap();
+    assert_eq!(m.dynamic(), dynamic(&[("engine.flag", None)]));
 }
 
 // CLI-1

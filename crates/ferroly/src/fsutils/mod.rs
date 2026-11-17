@@ -56,6 +56,9 @@ pub mod size;
 mod temp;
 
 pub use atomic::{write_atomic, AtomicFile};
+// The store's commit makes its renames durable with the same helper.
+#[cfg(feature = "store-local")]
+pub(crate) use atomic::sync_dir;
 pub use lock::LockFile;
 pub use mime::{detect_content_type, lookup_content_type, mime_for_ext, sniff, SNIFF_LEN};
 pub use mmap::Mmap;

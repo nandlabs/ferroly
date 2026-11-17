@@ -226,19 +226,28 @@ pub fn find_first<P: AsRef<Path>>(dirs: &[P], names: &[&str]) -> Option<PathBuf>
 
 impl ConfigBuilder {
     /// Merges the file [`find_first`] returns for `dirs × names`, or nothing
-    /// when there is none. The format is inferred from the extension and the
+    /// when there is none. The format is inferred from the extension, as
+    /// restricted by [`formats`](ConfigBuilder::formats), and the
     /// file is recorded in provenance ([`Source::File`](super::Source::File)),
     /// so [`Config::source`](super::Config::source) and
     /// [`Config::to_redacted_string`](super::Config::to_redacted_string) show
     /// which file was used.
     ///
     /// A found file that cannot be read or parsed is an error; the search
-    /// never falls through to a later candidate.
+    /// never falls through to a later candidate. Every name is checked
+    /// against [`formats`](ConfigBuilder::formats) before searching: the
+    /// first whose known extension is not accepted is
+    /// [`ConfigError::FormatNotAllowed`], whichever files exist. A name with
+    /// an unknown extension is an error
+    /// ([`ConfigError::UnsupportedFormat`]) only when it is the file found.
     pub fn merge_found<P: AsRef<Path>>(
         self,
         dirs: &[P],
         names: &[&str],
     ) -> Result<Self, ConfigError> {
+        for name in names {
+            super::source::check_allowed(Path::new(name), self.formats.as_deref())?;
+        }
         match find_first(dirs, names) {
             Some(path) => self.merge_file(path),
             None => Ok(self),

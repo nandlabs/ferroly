@@ -111,11 +111,11 @@ as under *Repository settings* below):
 
 ```sh
 git fetch --tags
-git checkout v0.6.0
-.github/scripts/check-release-version.sh 0.6.0
+git checkout v0.7.0
+.github/scripts/check-release-version.sh 0.7.0
 cargo publish --dry-run --locked -p ferroly-derive -p ferroly
 cargo publish --locked --no-verify -p ferroly-derive
-# wait until https://index.crates.io/fe/rr/ferroly-derive lists "vers":"0.6.0"
+# wait until https://index.crates.io/fe/rr/ferroly-derive lists "vers":"0.7.0"
 cargo publish --locked --no-verify -p ferroly
 ```
 
@@ -124,15 +124,12 @@ it from the index. The dry-run must name both crates (see *verify* below for why
 Afterwards, run the *crates.io drift* workflow (below) with the tag to confirm both
 crates are there.
 
-**Backlog: 0.4.0, 0.5.0 and 0.6.0 are not on crates.io.** All three are tagged on
-`main` (`v0.4.0`, `v0.5.0`, `v0.6.0`), but crates.io stops at 0.3.2. Publish them
-oldest first, so crates.io's newest version ends up the newest release: `v0.4.0`
-(optional; it keeps crates.io's version history complete), then `v0.5.0`, then
-`v0.6.0`.
+**Order.** Publish releases oldest first, so crates.io's newest version is always the
+newest release. A tag that was skipped can still be published later the same way.
 
 **With the workflow** (optional; needs the *Repository settings* below): Actions →
 *Publish to crates.io* → *Run workflow*, branch **`main`**, with the tag (for example
-`v0.6.0`) in the *tag* input. Any `v<version>` tag on `main` works, including ones
+`v0.7.0`) in the *tag* input. Any `v<version>` tag on `main` works, including ones
 whose tree predates the workflow. Nothing starts it automatically, and it has no
 tag-push trigger: for a tag push GitHub would run the workflow file from the tagged
 commit, which could be any commit with its own copy of the checks. It only runs from

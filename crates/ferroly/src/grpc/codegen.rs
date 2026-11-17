@@ -3,7 +3,7 @@
 //! [`proto::codegen`](crate::proto::codegen).
 //!
 //! ```no_run
-//! // build.rs, with `ferroly = { version = "0.6", features = ["grpc"] }`
+//! // build.rs, with `ferroly = { version = "0.7", features = ["grpc"] }`
 //! // under [build-dependencies].
 //! use ferroly::grpc::codegen::GrpcGenerator;
 //!

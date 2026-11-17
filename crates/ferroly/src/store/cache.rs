@@ -1,13 +1,12 @@
 //! The content-addressed cache.
 
-use std::collections::{BTreeSet, HashMap};
-use std::ffi::OsString;
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::OwnedMutexGuard;
@@ -16,72 +15,44 @@ use ferroly::hash::Sha256;
 use ferroly::http::{Client, Method, Request};
 
 use super::fetch::{fetch_http, Fetched};
-use super::{Digest, StoreError};
-
-/// Directory holding the committed objects, per algorithm.
-const OBJECTS: &str = "sha256";
-/// Directory holding in-progress downloads (one unique file per fetch).
-const TMP: &str = "tmp";
-/// Directory holding interrupted downloads waiting to be resumed.
-const PARTIAL: &str = "partial";
-
-/// Read buffer used when hashing a file already on disk.
-const READ_BUF: usize = 64 * 1024;
-
-/// Permissions of the directories the cache creates (Unix).
 #[cfg(unix)]
-const DIR_MODE: u32 = 0o700;
-/// Permissions of the files the cache writes (Unix).
-#[cfg(unix)]
-const FILE_MODE: u32 = 0o600;
-
-/// Temporary files a fetch in this process is writing, by file name (the
-/// names are unique per process). [`Cache::purge_temp`] never deletes one of
-/// these, however old it looks: a resumed partial keeps the modification
-/// time it was parked with until it is written to.
-static LIVE_TEMP: Mutex<BTreeSet<OsString>> = Mutex::new(BTreeSet::new());
+use super::local::FILE_MODE;
+use super::local::{min_opt, unique_name, Lease, READ_BUF};
+use super::{
+    Digest, Evicted, Layout, LocalStore, ObjectInfo, ObjectStatus, StoreError, StoreLock, Stored,
+};
 
 /// Reports download progress: the digest, the bytes on disk so far (a
 /// resumed prefix included) and the expected total, when known.
 type Progress = dyn Fn(&Digest, u64, Option<u64>) + Send + Sync;
 
-/// A file committed to the cache: its digest and where it is on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Stored {
-    /// The SHA-256 of the file's content.
-    pub digest: Digest,
-    /// The file's path inside the cache.
-    pub path: PathBuf,
-}
+/// The longest one blocking-thread attempt of `remove`, `evict_to` or
+/// `verify` waits for the store lock before checking whether its caller is
+/// still there (see `Cache::under_lock`).
+const LOCK_SLICE: Duration = Duration::from_millis(50);
 
-/// What [`Cache::evict_to`] removed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Evicted {
-    /// Objects deleted.
-    pub removed: usize,
-    /// Bytes those objects held.
-    pub freed: u64,
-    /// Bytes the remaining objects hold.
-    pub remaining: u64,
-}
-
-/// A content-addressed file cache: a directory of files keyed by SHA-256.
+/// A content-addressed file cache: a directory of files keyed by SHA-256,
+/// with async downloads that verify, resume and deduplicate.
 ///
-/// Layout under the root:
+/// `Cache` is the async layer over a [`LocalStore`] (see
+/// [`local`](Cache::local) and [`from_local`](Cache::from_local)): the same
+/// directory, the same files, usable from both sides at once. Layout under
+/// the root (see [`Layout`]):
 ///
 /// ```text
-/// sha256/ab/abcdef0123…   committed objects (the file name is the full hex digest)
+/// sha256/ab/abcdef0123…   committed objects, Layout::Fanout (the default;
+///                         the file name is the full hex digest)
+/// <prefix>/sha256/abcd…   committed objects, Layout::Flat { prefix }
 /// tmp/                    downloads in progress, one uniquely named file each
 /// partial/                interrupted downloads, parked for resumption
+/// .lock                   the store lock (see `lock`), created on first use
 /// ```
 ///
 /// A committed object always holds exactly the bytes its digest names:
 /// content is streamed into a file under `tmp/`, hashed as it arrives, and
-/// renamed into `sha256/` only after the digest (and the size, when known)
-/// matched. A rename within one directory tree is atomic, so readers never
-/// see a half-written object.
+/// renamed into the objects directory only after the digest (and the size,
+/// when known) matched. A rename within one directory tree is atomic, so
+/// readers never see a half-written object.
 ///
 /// - **Hit** — [`get_or_fetch`](Cache::get_or_fetch) returns the existing
 ///   path without calling the fetch callback.
@@ -107,23 +78,28 @@ pub struct Evicted {
 ///   and its files `0600` (before the umask), since cached models, layers
 ///   and objects are often private. An existing root keeps its permissions;
 ///   [`open`](Cache::open) removes group and other access from the
-///   `sha256/`, `tmp/` and `partial/` directories it owns, so a cache
+///   objects, `tmp/` and `partial/` directories it owns, so a cache
 ///   created by an older version (whose directories were `0755` and objects
 ///   `0644`) is no longer readable by others either (skipped where this user
 ///   may not change them).
 ///
+/// - **Deletion** — [`remove`](Cache::remove), [`evict_to`](Cache::evict_to)
+///   and the deletion inside [`verify`](Cache::verify) take the
+///   cross-process [store lock](Cache::lock) when they have something to
+///   delete, so they wait while another holder has it. A call dropped
+///   while waiting deletes nothing.
+///
 /// `Cache` is cheap to clone; clones share their in-process coordination.
 #[derive(Clone)]
 pub struct Cache {
+    local: LocalStore,
     inner: Arc<Inner>,
-    max_object_bytes: Option<u64>,
     stall_timeout: Option<Duration>,
     fetch_timeout: Option<Duration>,
     progress: Option<Arc<Progress>>,
 }
 
 struct Inner {
-    root: PathBuf,
     inflight: Mutex<HashMap<[u8; 32], Slot>>,
 }
 
@@ -137,12 +113,20 @@ struct Slot {
 impl std::fmt::Debug for Cache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cache")
-            .field("root", &self.inner.root)
-            .field("max_object_bytes", &self.max_object_bytes)
+            .field("root", &self.local.root())
+            .field("layout", self.local.layout())
+            .field("max_object_bytes", &self.local.max_object_bytes())
             .field("stall_timeout", &self.stall_timeout)
             .field("fetch_timeout", &self.fetch_timeout)
             .field("progress", &self.progress.is_some())
             .finish()
+    }
+}
+
+impl From<LocalStore> for Cache {
+    /// [`Cache::from_local`].
+    fn from(local: LocalStore) -> Cache {
+        Cache::from_local(local)
     }
 }
 
@@ -183,71 +167,46 @@ enum Failure {
     Rejected(StoreError),
 }
 
-/// Creates `dir` and its missing parents, private to the owner on Unix.
-fn create_dirs(dir: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(DIR_MODE);
-    }
-    builder.create(dir)
-}
-
-/// Tightens one of the cache's own directories to `0700` on Unix, for a
-/// cache created by an older version (or under a lax umask) whose
-/// directories are readable by others. A symlink is left alone (never chmod
-/// through it), and so is a directory this user may not change (a shared
-/// cache owned by someone else).
-fn make_private(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::symlink_metadata(dir)?;
-        if !meta.is_dir() || meta.permissions().mode() & 0o077 == 0 {
-            return Ok(());
-        }
-        let mode = meta.permissions().mode() & !0o077;
-        match std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)) {
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
-            other => other,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
-}
-
-async fn create_dirs_async(dir: &Path) -> std::io::Result<()> {
-    let mut builder = tokio::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    builder.mode(DIR_MODE);
-    builder.create(dir).await
-}
-
 impl Cache {
-    /// Opens (creating if needed) a cache rooted at `dir`.
+    /// Opens (creating if needed) a cache rooted at `dir`, with the default
+    /// [`Layout::Fanout`].
     pub fn open(dir: impl AsRef<Path>) -> Result<Cache, StoreError> {
-        let root = dir.as_ref().to_path_buf();
-        for sub in [OBJECTS, TMP, PARTIAL] {
-            let dir = root.join(sub);
-            create_dirs(&dir)?;
-            make_private(&dir)?;
-        }
-        Ok(Cache {
+        Cache::open_with(dir, Layout::Fanout)
+    }
+
+    /// Opens (creating if needed) a cache rooted at `dir` with `layout`
+    /// (see [`LocalStore::open_with`]).
+    ///
+    /// **No migration is performed**: a cache written with one layout looks
+    /// empty when opened with another (copy objects across with
+    /// [`LocalStore::list`] and [`LocalStore::insert_path`]).
+    pub fn open_with(dir: impl AsRef<Path>, layout: Layout) -> Result<Cache, StoreError> {
+        Ok(Cache::from_local(LocalStore::open_with(dir, layout)?))
+    }
+
+    /// The async cache over an open [`LocalStore`] (sharing its directory,
+    /// layout and [object size cap](LocalStore::with_max_object_bytes)),
+    /// with no timeouts and no progress callback.
+    pub fn from_local(local: LocalStore) -> Cache {
+        Cache {
+            local,
             inner: Arc::new(Inner {
-                root,
                 inflight: Mutex::new(HashMap::new()),
             }),
-            max_object_bytes: None,
             stall_timeout: None,
             fetch_timeout: None,
             progress: None,
-        })
+        }
+    }
+
+    /// The synchronous store under this cache (same directory, same objects).
+    pub fn local(&self) -> &LocalStore {
+        &self.local
+    }
+
+    /// Where committed objects live under the root.
+    pub fn layout(&self) -> &Layout {
+        self.local.layout()
     }
 
     /// Caps the size of any one object this cache will download (`None`, the
@@ -256,8 +215,11 @@ impl Cache {
     ///
     /// Without a cap, a source that declares no size can fill the disk: set
     /// one when the sources are not trusted.
+    ///
+    /// The cap is shared with [`local`](Cache::local), so it also bounds
+    /// the synchronous inserts made through it.
     pub fn with_max_object_bytes(mut self, max: Option<u64>) -> Cache {
-        self.max_object_bytes = max;
+        self.local = self.local.with_max_object_bytes(max);
         self
     }
 
@@ -297,72 +259,209 @@ impl Cache {
 
     /// The cache's root directory.
     pub fn root(&self) -> &Path {
-        &self.inner.root
+        self.local.root()
     }
 
     /// Where the object for `digest` lives (or would live) in the cache.
     pub fn path_for(&self, digest: &Digest) -> PathBuf {
-        let hex = digest.hex();
-        self.inner.root.join(OBJECTS).join(&hex[..2]).join(hex)
+        self.local.path_for(digest)
     }
 
     fn partial_path(&self, digest: &Digest) -> PathBuf {
-        self.inner
-            .root
-            .join(PARTIAL)
-            .join(format!("{}-{}", OBJECTS, digest.hex()))
+        self.local.partial_path(digest)
     }
 
     /// The path of the committed object for `digest`, if the cache has it.
     ///
     /// This only checks that the file exists; the content was verified when
-    /// it was written. Use [`verify`](Cache::verify) to re-check it.
+    /// it was written. Use [`verify`](Cache::verify) or
+    /// [`check`](Cache::check) to re-check it.
     pub fn get(&self, digest: &Digest) -> Option<PathBuf> {
-        let path = self.path_for(digest);
-        match std::fs::metadata(&path) {
-            Ok(m) if m.is_file() => Some(path),
-            _ => None,
-        }
+        self.local.get(digest)
     }
 
     /// Whether the cache holds `digest`.
     pub fn contains(&self, digest: &Digest) -> bool {
-        self.get(digest).is_some()
+        self.local.contains(digest)
     }
 
     /// The size of a parked, resumable partial download of `digest`, if any.
     pub fn partial_len(&self, digest: &Digest) -> Option<u64> {
-        std::fs::metadata(self.partial_path(digest))
-            .ok()
-            .map(|m| m.len())
+        self.local.partial_len(digest)
+    }
+
+    /// Runs `f` on the store on a blocking thread (one hop for the whole
+    /// operation).
+    async fn blocking<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(LocalStore) -> Result<T, StoreError> + Send + 'static,
+    {
+        let local = self.local.clone();
+        tokio::task::spawn_blocking(move || f(local))
+            .await
+            .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    /// Runs a destructive operation that needs the store lock, without ever
+    /// leaving a blocking thread waiting on the lock for an abandoned call.
+    ///
+    /// Each attempt is one blocking hop: `op` gets the store and an
+    /// `acquire` function, which waits at most [`LOCK_SLICE`] for the lock
+    /// and returns `None` if it is still held or this future was dropped
+    /// meanwhile (the lock is then released at once). `op` returns
+    /// `Ok(None)` to ask for another attempt. When the lock is free the
+    /// whole operation is one hop; while another holder has it, each hop
+    /// ends after a slice, so a dropped future deletes nothing and holds up
+    /// runtime shutdown for at most one slice.
+    async fn under_lock<T, F>(&self, op: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: Fn(
+                &LocalStore,
+                &dyn Fn() -> Result<Option<StoreLock>, StoreError>,
+            ) -> Result<Option<T>, StoreError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        /// Marks the call abandoned when its future is dropped.
+        struct Abandon(Arc<AtomicBool>);
+        impl Drop for Abandon {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let op = Arc::new(op);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let _abandon = Abandon(Arc::clone(&abandoned));
+        loop {
+            let op = Arc::clone(&op);
+            let abandoned = Arc::clone(&abandoned);
+            let done = self
+                .blocking(move |local| {
+                    let acquire = || match local.lock_timeout(LOCK_SLICE) {
+                        Ok(lock) if !abandoned.load(Ordering::SeqCst) => Ok(Some(lock)),
+                        Ok(_) | Err(StoreError::Locked(_)) => Ok(None),
+                        Err(e) => Err(e),
+                    };
+                    op(&local, &acquire)
+                })
+                .await?;
+            if let Some(value) = done {
+                return Ok(value);
+            }
+        }
     }
 
     /// Removes the object for `digest` (and any parked partial download).
     /// Returns whether an object was removed.
+    ///
+    /// Takes the [store lock](Cache::lock) when there is something to
+    /// delete, so it waits while another holder (in this process or another)
+    /// has it; with nothing to delete it returns `Ok(false)` without the
+    /// lock ([`LocalStore::remove`], on a blocking thread). Under a lock you
+    /// already hold, use [`StoreLock::remove`].
+    ///
+    /// **Cancellation**: the wait for the lock happens in short slices, not
+    /// on a blocking thread parked until the holder lets go. If this future
+    /// is dropped while waiting, nothing is deleted (now or later). Once the
+    /// lock is taken the deletion runs to completion even if the future is
+    /// dropped.
     pub async fn remove(&self, digest: &Digest) -> Result<bool, StoreError> {
-        let _ = remove_if_exists(&self.partial_path(digest)).await;
-        Ok(remove_if_exists(&self.path_for(digest)).await?)
+        let digest = *digest;
+        self.under_lock(move |local, acquire| {
+            if !local.has_removable(&digest) {
+                return Ok(Some(false));
+            }
+            match acquire()? {
+                Some(lock) => lock.remove(&digest).map(Some),
+                None => Ok(None),
+            }
+        })
+        .await
     }
 
     /// Re-hashes the stored object for `digest`. A missing object is
     /// `Ok(false)`; a corrupted one (changed on disk since it was committed)
     /// is deleted and also `Ok(false)`.
+    ///
+    /// The deletion runs under the [store lock](Cache::lock), after checking
+    /// again (the object may have been replaced by a good copy meanwhile;
+    /// then the answer is `Ok(true)`). Use [`check`](Cache::check) to
+    /// re-hash without deleting anything.
+    ///
+    /// **Cancellation**: as for [`remove`](Cache::remove), the wait for the
+    /// lock happens in short slices; if this future is dropped while
+    /// waiting, the corrupted object is not deleted.
     pub async fn verify(&self, digest: &Digest) -> Result<bool, StoreError> {
-        let path = self.path_for(digest);
-        let mut file = match tokio::fs::File::open(&path).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        let mut hasher = Sha256::new();
-        hash_reader(&mut file, &mut hasher).await?;
-        drop(file);
-        if Digest::from(hasher.finalize()).ct_eq(digest) {
-            Ok(true)
-        } else {
-            remove_if_exists(&path).await?;
-            Ok(false)
-        }
+        let digest = *digest;
+        self.under_lock(move |local, acquire| match local.check(&digest)? {
+            ObjectStatus::Intact { .. } => Ok(Some(true)),
+            ObjectStatus::Corrupt { .. } => match acquire()? {
+                Some(lock) => {
+                    let status = lock.repair(&digest)?;
+                    Ok(Some(matches!(status, ObjectStatus::Intact { .. })))
+                }
+                None => Ok(None),
+            },
+            _ => Ok(Some(false)),
+        })
+        .await
+    }
+
+    /// Every committed object, sorted by digest ([`LocalStore::list`] on a
+    /// blocking thread).
+    pub async fn list(&self) -> Result<Vec<ObjectInfo>, StoreError> {
+        self.blocking(|local| local.list()).await
+    }
+
+    /// Resolves a short digest to the one stored digest that starts with it
+    /// ([`LocalStore::resolve_prefix`] on a blocking thread).
+    pub async fn resolve_prefix(&self, prefix: &str) -> Result<Digest, StoreError> {
+        let prefix = prefix.to_owned();
+        self.blocking(move |local| local.resolve_prefix(&prefix))
+            .await
+    }
+
+    /// [`resolve_prefix`](Cache::resolve_prefix) with another minimum number
+    /// of hex digits ([`LocalStore::resolve_prefix_min`] on a blocking
+    /// thread).
+    pub async fn resolve_prefix_min(
+        &self,
+        prefix: &str,
+        min_hex: usize,
+    ) -> Result<Digest, StoreError> {
+        let prefix = prefix.to_owned();
+        self.blocking(move |local| local.resolve_prefix_min(&prefix, min_hex))
+            .await
+    }
+
+    /// Re-hashes the object for `digest` without modifying anything
+    /// ([`LocalStore::check`] on a blocking thread).
+    pub async fn check(&self, digest: &Digest) -> Result<ObjectStatus, StoreError> {
+        let digest = *digest;
+        self.blocking(move |local| local.check(&digest)).await
+    }
+
+    /// Re-hashes every committed object without modifying anything
+    /// ([`LocalStore::check_all`] on a blocking thread).
+    pub async fn check_all(&self) -> Result<Vec<(Digest, ObjectStatus)>, StoreError> {
+        self.blocking(|local| local.check_all()).await
+    }
+
+    /// Takes the exclusive, cross-process store lock, waiting (on a blocking
+    /// thread) until it is free. See [`LocalStore::lock`] for what it
+    /// excludes and the intended registry pattern.
+    ///
+    /// Do not call [`remove`](Cache::remove), [`evict_to`](Cache::evict_to)
+    /// or [`verify`](Cache::verify) on this store while holding it: they
+    /// would wait for it. Use the guard's methods instead. If this future is
+    /// dropped while waiting, the lock is taken and released again in the
+    /// background once it comes free.
+    pub async fn lock(&self) -> Result<StoreLock, StoreError> {
+        self.blocking(|local| local.lock()).await
     }
 
     /// Returns the path of `digest`, fetching it first on a miss.
@@ -450,7 +549,7 @@ impl Cache {
                 fetched.start
             )));
         }
-        let limit = min_opt(fetched.total, self.max_object_bytes);
+        let limit = min_opt(fetched.total, self.local.max_object_bytes());
         while let Some(chunk) = self
             .bounded(deadline, true, fetched.body.next_chunk())
             .await?
@@ -474,7 +573,7 @@ impl Cache {
         }
         tmp.finish().await?;
         let digest = Digest::from(tmp.hasher.clone().finalize());
-        let _lock = self.lock(&digest).await;
+        let _lock = self.lock_digest(&digest).await;
         let path = self.commit(tmp, &digest).await?;
         Ok(Stored { digest, path })
     }
@@ -497,33 +596,13 @@ impl Cache {
     /// write after that updates it, so use an age well above the longest a
     /// source may stall.
     pub async fn purge_temp(&self, older_than: Duration) -> Result<usize, StoreError> {
-        let now = SystemTime::now();
-        let mut removed = 0;
-        for sub in [TMP, PARTIAL] {
-            let mut dir = tokio::fs::read_dir(self.inner.root.join(sub)).await?;
-            while let Some(entry) = dir.next_entry().await? {
-                if sub == TMP && is_live(&entry.file_name()) {
-                    continue;
-                }
-                let Ok(meta) = entry.metadata().await else {
-                    continue;
-                };
-                let age = meta
-                    .modified()
-                    .ok()
-                    .and_then(|m| now.duration_since(m).ok())
-                    .unwrap_or_default();
-                if meta.is_file() && age > older_than && remove_if_exists(&entry.path()).await? {
-                    removed += 1;
-                }
-            }
-        }
-        Ok(removed)
+        self.blocking(move |local| local.purge_temp(older_than))
+            .await
     }
 
     /// The total size of the committed objects, in bytes.
     pub async fn usage(&self) -> Result<u64, StoreError> {
-        Ok(self.objects().await?.iter().map(|o| o.1).sum())
+        self.blocking(|local| local.usage()).await
     }
 
     /// Deletes committed objects, oldest first (by modification time, which
@@ -532,52 +611,32 @@ impl Cache {
     /// are not counted (see [`purge_temp`](Cache::purge_temp)). An object
     /// that cannot be deleted (open elsewhere, on Windows) is skipped.
     ///
-    /// A path the cache returned earlier stops existing when its object is
-    /// evicted; open files keep working on Unix.
+    /// Takes the [store lock](Cache::lock) when it has something to delete,
+    /// so it waits while another holder has it, and lists the objects again
+    /// under the lock; when the objects already fit it returns without the
+    /// lock ([`LocalStore::evict_to`], on a blocking thread). Under a lock
+    /// you already hold, use [`StoreLock::evict_to`]. A path the cache
+    /// returned earlier stops existing when its object is evicted; open
+    /// files keep working on Unix.
+    ///
+    /// **Cancellation**: as for [`remove`](Cache::remove), the wait for the
+    /// lock happens in short slices; if this future is dropped while
+    /// waiting, nothing is evicted.
     pub async fn evict_to(&self, max_bytes: u64) -> Result<Evicted, StoreError> {
-        let mut objects = self.objects().await?;
-        objects.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
-        let mut evicted = Evicted {
-            remaining: objects.iter().map(|o| o.1).sum(),
-            ..Evicted::default()
-        };
-        for (path, len, _) in objects {
-            if evicted.remaining <= max_bytes {
-                break;
+        self.under_lock(move |local, acquire| {
+            if let Some(fits) = local.evict_unneeded(max_bytes)? {
+                return Ok(Some(fits));
             }
-            if let Ok(true) = remove_if_exists(&path).await {
-                evicted.removed += 1;
-                evicted.freed += len;
-                evicted.remaining -= len;
+            match acquire()? {
+                Some(lock) => lock.evict_to(max_bytes).map(Some),
+                None => Ok(None),
             }
-        }
-        Ok(evicted)
-    }
-
-    /// Every committed object: its path, size and modification time.
-    async fn objects(&self) -> Result<Vec<(PathBuf, u64, SystemTime)>, StoreError> {
-        let mut out = Vec::new();
-        let mut fans = tokio::fs::read_dir(self.inner.root.join(OBJECTS)).await?;
-        while let Some(fan) = fans.next_entry().await? {
-            if !fan.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let mut files = tokio::fs::read_dir(fan.path()).await?;
-            while let Some(file) = files.next_entry().await? {
-                let Ok(meta) = file.metadata().await else {
-                    continue;
-                };
-                if meta.is_file() {
-                    let modified = meta.modified().unwrap_or(UNIX_EPOCH);
-                    out.push((file.path(), meta.len(), modified));
-                }
-            }
-        }
-        Ok(out)
+        })
+        .await
     }
 
     fn tmp_dir(&self) -> PathBuf {
-        self.inner.root.join(TMP)
+        self.local.tmp_dir()
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -613,7 +672,7 @@ impl Cache {
         }
     }
 
-    async fn lock(&self, digest: &Digest) -> Inflight<'_> {
+    async fn lock_digest(&self, digest: &Digest) -> Inflight<'_> {
         let key = *digest.as_bytes();
         let mutex = {
             let mut map = self
@@ -652,14 +711,14 @@ impl Cache {
         if let Some(path) = self.get(digest) {
             return Ok(path);
         }
-        if let (Some(size), Some(max)) = (size, self.max_object_bytes) {
+        if let (Some(size), Some(max)) = (size, self.local.max_object_bytes()) {
             if size > max {
                 return Err(StoreError::SizeMismatch(format!(
                     "{digest} is {size} bytes, over the {max}-byte cap"
                 )));
             }
         }
-        let _lock = self.lock(digest).await;
+        let _lock = self.lock_digest(digest).await;
         // Another task may have committed it while we waited.
         if let Some(path) = self.get(digest) {
             return Ok(path);
@@ -755,7 +814,7 @@ impl Cache {
             }
         }
         let expected = size.or(fetched.total);
-        let limit = min_opt(min_opt(size, fetched.total), self.max_object_bytes);
+        let limit = min_opt(min_opt(size, fetched.total), self.local.max_object_bytes());
         loop {
             let chunk = match self
                 .bounded(deadline, true, fetched.body.next_chunk())
@@ -803,53 +862,29 @@ impl Cache {
         Ok(())
     }
 
-    /// Moves a verified temporary file to its final place.
+    /// Moves a verified temporary file to its final place, with the rules
+    /// of [`LocalStore`]'s commit (shared with the synchronous inserts), on
+    /// a blocking thread.
     async fn commit(&self, mut tmp: TempFile, digest: &Digest) -> Result<PathBuf, StoreError> {
-        let dest = self.path_for(digest);
-        if let Some(parent) = dest.parent() {
-            create_dirs_async(parent).await?;
+        let src = tmp.path.clone();
+        // Keeps `purge_temp` off the file even if this future is cancelled
+        // while the blocking commit runs.
+        let lease = Lease::new(&src);
+        let digest = *digest;
+        // From here the blocking commit owns the file: a cancelled caller
+        // must not park or delete it under it.
+        tmp.committed = true;
+        let result = self
+            .blocking(move |local| {
+                let _lease = lease;
+                local.commit_file(&src, &digest)
+            })
+            .await;
+        if result.is_err() && tmp.path.exists() {
+            // Failed before the rename: let `Drop` park or delete it.
+            tmp.committed = false;
         }
-        if self.get(digest).is_some() {
-            // Another process got there first with the same bytes.
-            tmp.discard().await;
-            return Ok(dest);
-        }
-        match tokio::fs::rename(&tmp.path, &dest).await {
-            Ok(()) => {
-                tmp.committed = true;
-                if let Some(parent) = dest.parent() {
-                    sync_dir(parent).await;
-                }
-                Ok(dest)
-            }
-            Err(e) => {
-                tmp.discard().await;
-                if self.get(digest).is_some() {
-                    Ok(dest)
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
-    }
-}
-
-/// Makes a rename into `dir` durable (Unix; best effort: a failure can lose
-/// the entry in a crash, never corrupt it).
-async fn sync_dir(dir: &Path) {
-    #[cfg(unix)]
-    if let Ok(d) = tokio::fs::File::open(dir).await {
-        let _ = d.sync_all().await;
-    }
-    #[cfg(not(unix))]
-    let _ = dir;
-}
-
-fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, None) => a,
-        (None, b) => b,
+        result
     }
 }
 
@@ -871,49 +906,6 @@ async fn hash_reader(file: &mut tokio::fs::File, hasher: &mut Sha256) -> std::io
         }
         hasher.update(&buf[..n]);
         total += n as u64;
-    }
-}
-
-fn is_live(name: &std::ffi::OsStr) -> bool {
-    LIVE_TEMP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(name)
-}
-
-/// A name no other fetch — in this process or another — is using: the
-/// process id, a process-wide counter and the current time. (Not random:
-/// `hash::random` is not available on every platform.)
-fn unique_name(prefix: &str) -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    format!("{prefix}.{}.{n}.{nanos}.tmp", std::process::id())
-}
-
-/// Marks a temporary file as in use by this process (see [`LIVE_TEMP`]).
-struct Lease(OsString);
-
-impl Lease {
-    fn new(path: &Path) -> Lease {
-        let name = path.file_name().unwrap_or_default().to_os_string();
-        LIVE_TEMP
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(name.clone());
-        Lease(name)
-    }
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        LIVE_TEMP
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
     }
 }
 
@@ -1102,21 +1094,7 @@ impl Drop for TempFile {
 mod tests {
     use super::*;
 
-    #[test]
-    fn unique_names_differ() {
-        let a = unique_name("x");
-        let b = unique_name("x");
-        assert_ne!(a, b);
-        assert!(a.starts_with("x.") && a.ends_with(".tmp"));
-    }
-
-    #[test]
-    fn min_opt_combines() {
-        assert_eq!(min_opt(Some(3), Some(2)), Some(2));
-        assert_eq!(min_opt(None, Some(2)), Some(2));
-        assert_eq!(min_opt(Some(3), None), Some(3));
-        assert_eq!(min_opt(None, None), None);
-    }
+    use crate::store::local::{OBJECTS, PARTIAL, TMP};
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1139,10 +1117,10 @@ mod tests {
         let dir = scratch("waiter");
         let cache = Cache::open(&dir).unwrap();
         let digest = Digest::of(b"queued");
-        let holder = cache.lock(&digest).await;
+        let holder = cache.lock_digest(&digest).await;
         let waiter_cache = cache.clone();
         let waiter = tokio::spawn(async move {
-            let _place = waiter_cache.lock(&digest).await;
+            let _place = waiter_cache.lock_digest(&digest).await;
             std::future::pending::<()>().await;
         });
         // Let the waiter queue up behind the holder.
@@ -1157,10 +1135,10 @@ mod tests {
         assert_eq!(inflight_len(&cache), 0);
 
         // A waiter cancelled while the holder still holds.
-        let holder = cache.lock(&digest).await;
+        let holder = cache.lock_digest(&digest).await;
         let waiter_cache = cache.clone();
         let waiter = tokio::spawn(async move {
-            let _place = waiter_cache.lock(&digest).await;
+            let _place = waiter_cache.lock_digest(&digest).await;
         });
         for _ in 0..10 {
             tokio::task::yield_now().await;

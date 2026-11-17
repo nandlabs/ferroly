@@ -5,7 +5,7 @@
 //! you enable:
 //!
 //! ```toml
-//! ferroly = { version = "0.6", features = ["genai", "codec"] }
+//! ferroly = { version = "0.7", features = ["genai", "codec"] }
 //! ```
 //!
 //! ```
@@ -42,7 +42,7 @@
 //! | `rest` | REST client and server framework |
 //! | `rt` | Async runtime surface (re-exported `tokio` primitives) |
 //! | `sig` | Verify-only Ed25519 signatures (RFC 8032; Ed25519ph and Ed25519ctx; streaming) |
-//! | `store` | Content-addressed cache; S3 (SigV4), Hugging Face and OCI fetch adapters (`store-s3`, `store-hf`, `store-oci`) |
+//! | `store` | Content-addressed store: a synchronous local core (`store-local`: layouts, listing, short digests, non-destructive checks, a cross-process lock; no tokio or HTTP), an async download cache (`store`), and S3 (SigV4), Hugging Face and OCI fetch adapters (`store-s3`, `store-hf`, `store-oci`) |
 //! | `template` | Sandboxed, bounded Jinja2-subset template engine (LLM chat templates) |
 //! | `turbo` | HTTP router with middleware |
 //! | `vectorstore` | Vector-store trait with an in-memory backend |
@@ -128,7 +128,7 @@ pub mod rest;
 pub mod rt;
 #[cfg(feature = "sig")]
 pub mod sig;
-#[cfg(feature = "store")]
+#[cfg(feature = "store-local")]
 pub mod store;
 #[cfg(feature = "template")]
 pub mod template;
@@ -235,8 +235,8 @@ pub enum Error {
     #[error(transparent)]
     Sig(#[from] sig::SigError),
 
-    /// An artifact-cache or fetch-adapter error.
-    #[cfg(feature = "store")]
+    /// An artifact-store, cache or fetch-adapter error.
+    #[cfg(feature = "store-local")]
     #[error(transparent)]
     Store(#[from] store::StoreError),
 
@@ -370,13 +370,18 @@ impl errutils::Classify for Error {
                 }
                 _ => K::InvalidInput,
             },
-            #[cfg(feature = "store")]
+            #[cfg(feature = "store-local")]
             Error::Store(e) => {
                 use store::StoreError as S;
                 match e {
+                    #[cfg(feature = "store")]
                     S::Http(h) => h.kind(),
                     S::Io(io) => Classify::kind(io),
                     S::InvalidDigest(_) | S::Config(_) => K::InvalidInput,
+                    S::NotFound(_) => K::NotFound,
+                    S::AmbiguousPrefix { .. } => K::InvalidInput,
+                    // Another holder has the store lock.
+                    S::Locked(_) => K::Conflict,
                     S::DigestMismatch { .. } | S::SizeMismatch(_) => K::Internal,
                     // A short or stalled transfer is parked for resumption.
                     S::Interrupted(_) => K::Unavailable,

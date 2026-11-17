@@ -137,7 +137,7 @@ fn schema_kind(schema: &Value, key: &str) -> Kind {
 ///
 /// | Schema value at the flag's name | Result |
 /// |---|---|
-/// | a boolean | [`Switch`](ferroly::cli::DynamicArity::Switch): never takes the next token |
+/// | a boolean | [`BoolSwitch`](ferroly::cli::DynamicArity::BoolSwitch): takes the next token only if it is `true`/`false` |
 /// | any other scalar, or a list | [`Value`](ferroly::cli::DynamicArity::Value): always takes the next token (even `-1` or `-x`) |
 /// | `null` (an unset `Option`) | [`Optional`](ferroly::cli::DynamicArity::Optional): the value heuristic of `dynamic_flags` |
 /// | a section, or absent | `None`: not a dynamic flag ([`CliError::UnknownFlag`](ferroly::cli::CliError::UnknownFlag)) |
@@ -148,6 +148,15 @@ fn schema_kind(schema: &Value, key: &str) -> Kind {
 /// `move |n| arity(n).or_else(|| n.starts_with("labels.").then_some(DynamicArity::Value))`.
 /// Merge the result with
 /// [`merge_cli_with`](ConfigBuilder::merge_cli_with) and the same schema.
+///
+/// A boolean key reads `--key`, `--key=false` and `--key false` the way
+/// [`ArgsOptions::types`] does, so `parse` + `merge_cli_with` and
+/// [`merge_args_with`](ConfigBuilder::merge_args_with) merge the same value.
+/// A positional whose value is literally `true` or `false`, written directly
+/// after a boolean flag, is therefore taken as the flag's value. To keep it
+/// a positional (the [`Switch`](ferroly::cli::DynamicArity::Switch) arity,
+/// which never takes the next token), wrap the function:
+/// `move |n| arity(n).map(|a| if a == DynamicArity::BoolSwitch { DynamicArity::Switch } else { a })`.
 ///
 /// ```
 /// use ferroly::cli::{Arg, Command};
@@ -177,6 +186,16 @@ fn schema_kind(schema: &Value, key: &str) -> Kind {
 ///     .build();
 /// assert!(cfg.get::<bool>("engine.deterministic")?);
 /// assert_eq!(cfg.get::<u32>("engine.threads")?, 4);
+///
+/// // But it does take a following `true` / `false`.
+/// let m = cmd
+///     .parse(["--engine.deterministic", "false", "serve"].map(String::from))
+///     .unwrap();
+/// assert_eq!(m.subcommand().unwrap().1.get("file"), None);
+/// let cfg = Config::builder()
+///     .merge_cli_with(&m, ArgsOptions::default().types(&schema))
+///     .build();
+/// assert!(!cfg.get::<bool>("engine.deterministic")?);
 /// # Ok::<(), ferroly::config::ConfigError>(())
 /// ```
 #[cfg(feature = "cli")]
@@ -186,7 +205,7 @@ pub fn dynamic_arity(
     use ferroly::cli::DynamicArity;
     let schema = schema.clone();
     move |name| match navigate(&schema, name)? {
-        Value::Bool(_) => Some(DynamicArity::Switch),
+        Value::Bool(_) => Some(DynamicArity::BoolSwitch),
         Value::Null => Some(DynamicArity::Optional),
         Value::Object(_) => None,
         _ => Some(DynamicArity::Value),

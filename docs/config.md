@@ -40,7 +40,7 @@ the usual directories, and binds [secret references](#secret-references-secretre
 
 ```toml
 [dependencies]
-ferroly = { version = "0.6", features = ["config"] }
+ferroly = { version = "0.7", features = ["config"] }
 ```
 
 Enabling `config` automatically pulls in `codec`.
@@ -132,11 +132,14 @@ source over everything merged so far.
 | Method | Description |
 |---|---|
 | `merge_value(self, value: Value) -> Self` | Merge an explicit `codec::Value` layer (e.g. compiled-in defaults). |
+| `formats(self, formats: &[FileFormat]) -> Self` | Accept only these file formats in every later file-loading call ([restricting file formats](#restricting-file-formats--formats)). |
 | `merge_file(self, path) -> Result<Self, ConfigError>` | Merge a config file; format inferred from the extension. |
 | `merge_file_optional(self, path) -> Result<Self, ConfigError>` | Same, but a missing file is skipped. |
 | `merge_profile(self, base, profile: &str) -> Result<Self, ConfigError>` | Merge `base.<ext>` and then `base-<profile>.<ext>` if present. |
 | `merge_env(self, prefix: &str) -> Self` | Merge environment variables whose names start with `prefix`. |
 | `merge_env_with(self, prefix: &str, options: &EnvOptions) -> Result<Self, ConfigError>` | Same, with opt-in behaviours (secret files, lists, key-case matching). |
+| `merge_env_from(self, prefix: &str, vars: I) -> Self` | Like `merge_env`, but reads the variables from `vars` (pairs of anything `Into<OsString>`) instead of the process environment ([testing](#testing-environment-handling)). |
+| `merge_env_from_with(self, prefix: &str, vars: I, options: &EnvOptions) -> Result<Self, ConfigError>` | Like `merge_env_with`, reading the variables from `vars`. |
 | `merge_secret_dir(self, dir) -> Result<Self, ConfigError>` | Merge a mounted secrets directory, one file per key ([Kubernetes / Docker secrets](#merge_secret_dir--mounted-secret-volumes)). |
 | `merge_secret_dir_optional(self, dir) -> Result<Self, ConfigError>` | Same, but a missing directory is skipped. |
 | `merge_args_with(self, args, options: ArgsOptions) -> Self` | Merge raw `--key value` / `--key=value` flags, each flag's arity decided by [`ArgsOptions`](#merge_args_with--raw-command-line-flags) (e.g. `types(&schema)`). |
@@ -159,6 +162,7 @@ source over everything merged so far.
 #[non_exhaustive]
 pub enum ConfigError {
     UnsupportedFormat(String),                        // extension not a recognized format
+    FormatNotAllowed { path: String, allowed: Vec<String> }, // known format, refused by formats(..)
     Io(String),                                       // I/O error reading a config or secret file
     MissingKey(String),                               // get(key) found no such key
     MissingKeys(Vec<String>),                         // require(..): every missing key
@@ -185,7 +189,8 @@ parse error never repeats the offending line of the file — see
 
 With the `errutils` feature, `ConfigError` implements
 [`Classify`](errutils.md#classification-classify--errorkind): `InvalidInput`,
-except `UnsupportedFormat` (`Unsupported`) and `Io` (`Unknown`).
+except `UnsupportedFormat` and `FormatNotAllowed` (`Unsupported`) and `Io`
+(`Unknown`).
 
 ## Layering in depth
 
@@ -308,9 +313,21 @@ validated *before* the file is read:
 | `.properties`, `.props`, `.env` | Java-style properties | built-in |
 
 Any other extension yields `ConfigError::UnsupportedFormat`, whose message names
-the file and lists every supported extension. A read failure yields
+the file and lists every supported extension. A known extension that the builder
+does not accept ([`formats`](#restricting-file-formats--formats)) yields
+`ConfigError::FormatNotAllowed`. A read failure yields
 `ConfigError::Io` (the message starts with the path); a malformed document yields
 `ConfigError::Parse { path, message }`.
+
+An **empty file** is an empty layer: it sets nothing, changes nothing and is
+recorded as the source of nothing, with or without a [schema](#unknown-keys-schema-and-build_checked).
+That covers a file of any format (JSON and XML included) that is zero bytes long or
+holds only whitespace, after an optional UTF-8 byte-order mark; a YAML, TOML or
+properties file holding only comments; and a JSON file holding `null`. A JSON or
+XML file with any other text that does not parse is still `ConfigError::Parse`. Only files are
+read this way: `merge_value(Value::Null)` is an explicit value and still replaces
+the whole configuration when no schema is set (with a schema, a `null` layer is
+screened to nothing like any other null section).
 
 The YAML, TOML and XML codecs cover the common configuration subset of their
 formats — see the [codec](codec.md) page for exactly what each one models.
@@ -346,6 +363,54 @@ let cfg = Config::builder()
     .build();
 ```
 
+### Restricting file formats — `formats`
+
+By default every format in the table above is loaded. An application that
+documents only some of them says so once, on the builder, with a list of
+`FileFormat`s (`Json`, `Yaml`, `Toml`, `Xml`, `Properties`):
+
+```rust
+use ferroly::config::{Config, FileFormat};
+
+let cfg = Config::builder()
+    .formats(&[FileFormat::Yaml, FileFormat::Toml, FileFormat::Json])
+    .merge_file(path)?          // "app.env" -> ConfigError::FormatNotAllowed
+    .build();
+```
+
+A file whose extension is a known format outside the list fails with
+`ConfigError::FormatNotAllowed { path, allowed }`, where `allowed` lists the
+accepted extensions in probing order; the message reads
+`config file format of 'app.env' is not accepted (expected one of .json, .yaml, .yml, .toml)`.
+An extension ferroly does not know at all (`app.ini`) is still
+`UnsupportedFormat`, with the full list of known extensions.
+
+- **Every file-loading call merged after `formats` honours it**: `merge_file`,
+  `merge_file_optional`, `merge_profile`, `merge_found`, and the `Layer::File`,
+  `Layer::OptionalFile` and `Layer::Profile` layers of `layers`. Layers merged
+  before the call are kept. `Config::from_file` and `Config::from_layers` are
+  unrestricted; write `Config::builder().formats(..).layers(..)?.build()` for a
+  restricted stack.
+- **The answer does not depend on which files exist.** The extension is checked
+  before the filesystem is touched, so `merge_file_optional("app.env")` fails
+  even when `app.env` is missing.
+- **`merge_profile`** with an extension-less base tries only the accepted
+  formats' extensions, so a stray `config/app.env` next to `config/app.yaml` is
+  never read, and the "no config file found (tried …)" error lists only those. A
+  base with an extension that is known but not accepted (`config/app.env`) is
+  `FormatNotAllowed` before anything is read.
+- **`merge_found`** checks every name against the list before searching: the
+  first refused name is `FormatNotAllowed` even if an earlier name would have
+  been found. A name with an unknown extension is an error only when it is the
+  file found, as before.
+- Calling `formats` again replaces the list; order and duplicates do not matter.
+  An empty list accepts no format: every file-loading call fails with
+  `FormatNotAllowed` (an empty `allowed`, "no file formats are accepted").
+
+`FileFormat::all()` lists every format in probing order,
+`FileFormat::from_path(path)` maps an extension (ignoring case) to its format,
+and `FileFormat::extensions(self)` gives a format's extensions without the dot.
+
 ### `merge_profile` — per-environment overlays
 
 `merge_profile(base, profile)` merges a base file and then, if present, its
@@ -365,6 +430,9 @@ let cfg = Config::builder()
   `.props`, `.env`, and every file found is merged (normally there is just one).
 - **`base` with an extension** (`config/app.yaml`): exactly that file, and
   `config/app-prod.yaml` as the overlay.
+- **With [`formats`](#restricting-file-formats--formats)**, only the accepted
+  formats' extensions are tried, and an explicit extension that is not accepted
+  is `ConfigError::FormatNotAllowed`.
 - **The base is required** — if no base file exists the call fails with
   `ConfigError::Io`. The overlay is optional. (Use `merge_file_optional` directly
   if the base may be absent too.)
@@ -401,6 +469,76 @@ Rules:
   deeper key is ignored rather than merged, which would overflow the stack.
 - A variable whose name or value is **not valid UTF-8** is ignored. Unrelated
   non-UTF-8 variables in the environment do not affect loading.
+- With a [schema](#unknown-keys-schema-and-build_checked), a variable whose path
+  **names a section** rather than a key (`APP_MODEL` against a `model` section,
+  `APP_A__B` against `a: { b: { c } }`) is not configuration: it is skipped without
+  being reported, in strict and lenient mode alike, so a script's own `APP_MODEL`
+  can never replace the section's defaults. `APP_MODEL__PATH` still sets
+  `model.path`, and with `secret_files()` the file an `APP_MODEL_FILE` names is
+  never read. Trade-off: a field whose default encodes as a section (an enum whose
+  default is a data-carrying variant) cannot be set to a unit variant from the
+  environment; set it from a file, a value layer or arguments.
+
+#### Testing environment handling
+
+The process environment is shared by every test in a binary, and
+`std::env::set_var` is `unsafe` from edition 2024 on. `merge_env_from(prefix, vars)`
+and `merge_env_from_with(prefix, vars, &options)` take the variables as an
+argument instead — an array, a `Vec` or a `HashMap` of `&str`, `String`, `&OsStr`
+or `OsString` pairs — so environment tests need no `set_var` and run in parallel:
+
+```rust
+use ferroly::config::{Config, Source};
+
+let cfg = Config::builder()
+    .merge_env_from("APP_", [("APP_PORT", "8080"), ("APP_DB__HOST", "db"), ("HOME", "/x")])
+    .build();
+assert_eq!(cfg.get::<u16>("port")?, 8080);
+assert_eq!(cfg.get::<String>("db.host")?, "db");
+assert!(!cfg.contains("home"));
+assert_eq!(cfg.source("port"), Some(&Source::Env("APP_PORT".into())));
+```
+
+`merge_env(prefix)` is exactly `merge_env_from(prefix, std::env::vars_os())`, and
+`merge_env_with` is `merge_env_from_with` over `vars_os()` in the same way. Every
+rule above, every `EnvOptions` behaviour, [unknown-key](#unknown-keys-schema-and-build_checked)
+screening and provenance (`Source::Env`, `Source::SecretFile`) are the same; the
+process environment is not consulted at all. Two rules matter only for an
+injected list:
+
+- variables are applied in sorted name order whatever the input order;
+- a name given more than once keeps its **last** value in input order, as if the
+  variables had been set one after another. If that last value is not valid
+  UTF-8, the variable is skipped even when an earlier value was valid
+  (`[("APP_A", "1"), ("APP_A", <non-UTF-8>)]` sets nothing): the process
+  environment would hold only the last value, which `merge_env` skips.
+
+Only the variables are injected, not the filesystem: with `secret_files()`, a
+`*_FILE` value is still a path read from disk, with the same precedence, errors and
+masking:
+
+```rust
+use ferroly::config::{Config, EnvOptions, Source};
+
+let path = std::env::temp_dir().join("app-test-db-password");
+std::fs::write(&path, "s3cret\n")?;
+let file = path.display().to_string();
+
+let cfg = Config::builder()
+    .merge_env_from_with(
+        "APP_",
+        [("APP_DB__PASSWORD", "from-env"), ("APP_DB__PASSWORD_FILE", file.as_str())],
+        &EnvOptions::new().secret_files(),
+    )?
+    .build();
+assert_eq!(cfg.get::<String>("db.password")?, "s3cret");     // the file wins
+assert!(matches!(cfg.source("db.password"), Some(Source::SecretFile { .. })));
+assert!(!cfg.to_redacted_string().contains("s3cret"));
+```
+
+`${env:VAR}` interpolation, `SecretRef::Env` resolution and the directories of
+config-file [discovery](#config-file-discovery-search) still read the process
+environment.
 
 ### `merge_env_with` — `EnvOptions`
 
@@ -645,14 +783,20 @@ let cfg = Config::builder()
   `merge_cli_with(&m, ArgsOptions::default())`.
 - To have the **parser** read each dynamic flag by its type, build the command with
   `dynamic_flags_with(ferroly::config::dynamic_arity(&schema))`: a boolean key is a
-  `Switch` (it never takes the next positional: `app --engine.deterministic file.txt`
-  keeps `file.txt`), any other scalar or list a `Value` (always takes the next token,
+  `BoolSwitch` (`--key`, `--key=false` and `--key false` all work, before or after a
+  subcommand, and merge what `merge_args_with(.., ArgsOptions::default().types(&schema))`
+  merges; it takes the next token only when it is `true` or `false`, so
+  `app --engine.deterministic file.txt` keeps `file.txt`, and so do `1` and `on`), any
+  other scalar or list a `Value` (always takes the next token,
   `--model.context -1` included), a `null` key `Optional`, and a section or a key the
   schema does not have is refused (`UnknownFlag`), so a typo fails at parse time. With
   plain `dynamic_flags` a switch directly before a positional takes it as its value
   (see [the limitation](cli.md#dynamic-flags)). To accept the keys of a map section
   (whose default is empty) too, chain a fallback:
   `move |n| arity(n).or_else(|| n.starts_with("labels.").then_some(DynamicArity::Value))`.
+  A positional literally `true` or `false` written directly after a boolean flag is
+  taken as its value; to keep it a positional, map `BoolSwitch` back to `Switch`:
+  `move |n| arity(n).map(|a| if a == DynamicArity::BoolSwitch { DynamicArity::Switch } else { a })`.
 
 ```rust
 use ferroly::cli::{Arg, Command};
@@ -902,6 +1046,9 @@ match config {
 unknown config keys: `serve.port` in /etc/app.yaml (did you mean `server.port`?), `APP_ENGINE__THREAD` (did you mean `APP_ENGINE__THREADS`?), `--engine.thread` (did you mean `--engine.threads`?)
 ```
 
+A single key reads `unknown config key: …`; match on the `UnknownKeys` variant,
+not on the message text.
+
 **The schema** is any `Value` shaped like the configuration; `T::default().encode()`
 is the convenient source, so the keys cannot drift from the struct.
 
@@ -911,11 +1058,24 @@ is the convenient source, so the keys cannot drift from the struct.
   unknown, so it cannot replace the valid key.
 - `null` (an `Option` defaulting to `None`) and an object with **no entries**
   (free-form maps) accept any keys below them.
-- A value that is not an object where the schema has a section (`APP_ENGINE=3`
-  against an `engine` section) is not an unknown key: it is merged and left for
-  decoding to accept (an enum variant, `null` for an `Option`) or to report. A field
-  whose default encodes as a scalar but which can also hold keys (an enum whose
-  default is a unit variant) needs `null` or `{}` in the schema.
+- **`null` where the schema has a section** — a YAML heading with every key under
+  it commented out (`engine:` followed by `#   threads: 8`), at any depth, or a
+  whole layer that is `null` — means "no settings for this section": it is dropped
+  before the merge, so the lower layers' values for that section stay in place. A
+  section holding nothing but such null sections (`server:` with only an empty
+  `limits:` under it) is dropped with them, at any depth, so it neither creates an
+  empty `server` object nor records an origin; an explicit `{}` is still merged. It
+  is not an unknown key (never in `UnknownKeys` or `ignored_keys()`) and records no
+  [provenance](#provenance). `null` where the schema has `null` (an `Option`
+  defaulting to `None`), a leaf or an empty object is merged as before, so a layer
+  can still reset an `Option` to `None`.
+- Any other value that is not an object where the schema has a section
+  (`engine: 3`, `--engine=3` against an `engine` section) is not an unknown key: it
+  is merged, replacing the section, and left for decoding to accept (an enum
+  variant) or to report. A field whose default encodes as a scalar but which can
+  also hold keys (an enum whose default is a unit variant) needs `null` or `{}` in
+  the schema. An environment variable naming a section (`APP_ENGINE=3`) is skipped
+  instead (see [`merge_env`](#merge_env--from_env--environment-variables)).
 - A field that only decodes through an `alias`, or that is left out of the encoding
   (`skip`, a `None` under `skip_none`), must be added to the schema by hand.
 
@@ -945,8 +1105,10 @@ rest (`…, and 950 more`), and cuts a key longer than 200 characters; the
 **Environment variables** under the prefix whose first segment is not a top-level
 key of the schema (`APP_LOG`, the variables secret references point at) are not
 configuration: they are dropped without being reported, and with `secret_files()`
-their file is never read. Unknown keys inside a known section are reported (the file
-of an unknown `*_FILE` variable is not read either).
+their file is never read. The same goes for a variable whose path names a section
+rather than a key (`APP_ENGINE`, `APP_ENGINE_FILE`): skipped, not reported, its file
+not read, in strict and lenient mode alike. Unknown keys inside a known section are
+reported (the file of an unknown `*_FILE` variable is not read either).
 
 **Declared `cli` arguments** (`merge_cli`, `merge_cli_with`, `merge_cli_defaults`)
 follow the same rule: one whose first segment is not a top-level schema key
@@ -1028,7 +1190,9 @@ and is skipped.
 `merge_found(&dirs, &names)` merges the file `find_first` returns (or nothing) with
 `merge_file`, so it is recorded in provenance as `Source::File(path)` and shows in
 `source`, `sources` and `to_redacted_string`. `Source::is_file()` tells file layers
-apart.
+apart. It honours [`formats`](#restricting-file-formats--formats): every name is
+checked before searching, and a name whose known extension is not accepted is
+`ConfigError::FormatNotAllowed` whichever files exist.
 
 ## Secret references: `SecretRef`
 
@@ -1125,8 +1289,8 @@ for (key, source) in cfg.sources() {
 |---|---|---|
 | `Value` | `merge_value` | `value` |
 | `File(path)` | `merge_file`, `merge_file_optional`, `merge_profile` | `file <path>` |
-| `Env(var)` | `merge_env`, `merge_env_with` | `env <VAR>` |
-| `SecretFile { var, path }` | `merge_env_with` + `secret_files()` | `secret file <path> (env <VAR>)` |
+| `Env(var)` | `merge_env`, `merge_env_with`, `merge_env_from`, `merge_env_from_with` | `env <VAR>` |
+| `SecretFile { var, path }` | `merge_env_with` / `merge_env_from_with` + `secret_files()` | `secret file <path> (env <VAR>)` |
 | `SecretDir(path)` | `merge_secret_dir` / `merge_secret_dir_optional` | `secret file <path>` |
 | `Args` | `merge_args_with`, `merge_args` | `args` |
 | `Cli` | `merge_cli`, `merge_cli_with`, `merge_cli_defaults` | `cli` |
@@ -1135,7 +1299,8 @@ for (key, source) in cfg.sources() {
 for exactly that variant.
 
 Keys are full dotted paths to leaf values; a list counts as one leaf, and a key
-naming a whole section has no source. A [`Layer`](#layer--the-stack-as-a-list)
+naming a whole section has no source. A layer that sets nothing (an empty file, a
+null section dropped by the schema) is the source of nothing. A [`Layer`](#layer--the-stack-as-a-list)
 records the same source as its builder call (`Layer::File` → `File(path)`, …).
 
 ## Secret hygiene
@@ -1259,10 +1424,14 @@ reload. `watch_files` returns `ConfigError::Io` if its thread cannot be started.
 
 - **A change must settle first.** The watcher reloads only once the files look the
   same on two polls in a row, so a file caught half written (an editor or `cp` that
-  truncates, then writes) is not loaded while it is still being written. A writer
-  slower than one interval can still be caught mid-write, so **replace files
+  truncates, then writes) is not loaded while it is still being written. A change
+  that leaves a watched file **empty or missing** must stay that way for at least one
+  second (and five polls) first: an empty file is a valid, empty layer, so the moment
+  between a rewrite's truncation and its write must not load as "no settings". A
+  writer slower than that can still be caught mid-write, so **replace files
   atomically** (write a temporary file, then rename it over the old one) where you can.
-  Expect a reload one to two intervals after the change.
+  Expect a reload one to two intervals after the change (about a second when the
+  change empties or deletes a file).
 - **Changes before the call count.** If a watched file was modified at or after the
   last load started (between `with_loader` and `watch_files`, say), the first poll
   reloads. A file deleted in that window is only noticed with the next change.

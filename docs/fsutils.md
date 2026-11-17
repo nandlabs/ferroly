@@ -34,7 +34,7 @@ in-memory, pluggable backends), see the separate [vfs](vfs.md) module.
 
 ```toml
 [dependencies]
-ferroly = { version = "0.6", features = ["fsutils"] }
+ferroly = { version = "0.7", features = ["fsutils"] }
 ```
 
 ## Quick start
@@ -491,7 +491,8 @@ impl TempFile {
     pub fn as_file(&self) -> &File;
     pub fn as_file_mut(&mut self) -> &mut File;
     pub fn keep(self) -> PathBuf;
-    pub fn persist(self, dest: impl AsRef<Path>) -> Result<(), FsError>;   // fsync + rename
+    pub fn persist(self, dest: impl AsRef<Path>) -> Result<(), FsError>;   // fsync + rename + dir fsync
+    pub fn persist_with_mode(self, dest: impl AsRef<Path>, mode: u32) -> Result<(), FsError>;   // chmod first (Unix)
 }
 ```
 
@@ -499,6 +500,16 @@ impl TempFile {
   (seeded from OS randomness), and creation uses create-new semantics with
   retries, so an existing entry is never reused or truncated.
 - On Unix a `TempDir` is created with mode `0700` and a `TempFile` with `0600`.
+- `persist` flushes the file, renames it over `dest` (same filesystem only)
+  and then, on Unix, flushes the destination's directory so the rename itself
+  survives a crash. That directory sync is best effort, as in `AtomicFile`:
+  errors are ignored because the file is already in place. If flushing or the
+  rename fails, the temporary file is removed and `dest` is left as it was.
+- The persisted file keeps mode `0600`. `persist_with_mode(dest, mode)` sets
+  exactly `mode` (normally `0o644` or `0o640`) on the open file just before
+  the flush and rename, like `chmod`: the umask does not apply. The draft
+  stays `0600` while it is written, so partial data is never exposed under
+  the wider mode. Off Unix `mode` is ignored and there is no directory sync.
 - Dropping the guard removes the directory (recursively) or the file, ignoring
   errors; `close()` removes a directory and reports them. `keep()` disarms the
   guard.
@@ -514,6 +525,10 @@ let dir = TempDir::new("my-app")?;
 let mut report = TempFile::with_suffix_in(dir.path(), "report", ".csv")?;
 report.as_file_mut().write_all(b"a,b\n")?;
 report.persist(dir.path().join("report.csv"))?;   // keep it under a final name
+
+let mut shared = TempFile::new_in(dir.path(), "download")?;
+shared.as_file_mut().write_all(b"public data")?;
+shared.persist_with_mode(dir.path().join("blob.bin"), 0o644)?;   // readable by others on Unix
 # Ok::<(), ferroly::fsutils::FsError>(())
 ```
 

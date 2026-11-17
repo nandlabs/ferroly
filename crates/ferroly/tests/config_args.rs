@@ -552,7 +552,7 @@ mod cli {
         use ferroly::config::dynamic_arity;
 
         let arity = dynamic_arity(&schema());
-        assert_eq!(arity("a.b"), Some(DynamicArity::Switch));
+        assert_eq!(arity("a.b"), Some(DynamicArity::BoolSwitch));
         assert_eq!(arity("a.n"), Some(DynamicArity::Value));
         assert_eq!(arity("a.tags"), Some(DynamicArity::Value));
         assert_eq!(arity("a.seed"), Some(DynamicArity::Optional));
@@ -587,6 +587,78 @@ mod cli {
         // A mistyped key is refused by the parser.
         let err = cmd.parse(strings(&["--engine.thread=4"])).unwrap_err();
         assert!(matches!(err, CliError::UnknownFlag { .. }), "{err:?}");
+    }
+
+    // #108: a boolean key also reads `--key false`, before or after a
+    // subcommand.
+    #[test]
+    fn dynamic_arity_reads_a_following_boolean_word() {
+        use ferroly::config::dynamic_arity;
+
+        let cmd = Command::new("app")
+            .dynamic_flags_with(dynamic_arity(&schema()))
+            .subcommand(Command::new("serve").positional(Arg::new("rest").variadic()));
+
+        for argv in [
+            &["--engine.deterministic", "false", "serve"][..],
+            &["serve", "--engine.deterministic", "False"][..],
+        ] {
+            let m = cmd.parse(strings(argv)).unwrap();
+            assert_eq!(m.subcommand_name(), Some("serve"), "{argv:?}");
+            let (_, serve) = m.subcommand().unwrap();
+            assert!(serve.get_all("rest").is_empty(), "{argv:?}");
+            let cfg = Config::builder()
+                .merge_value(obj(&[(
+                    "engine",
+                    obj(&[("deterministic", Value::Bool(true))]),
+                )]))
+                .merge_cli_with(&m, typed())
+                .build();
+            assert!(
+                !cfg.get::<bool>("engine.deterministic").unwrap(),
+                "{argv:?}"
+            );
+        }
+
+        let m = cmd
+            .parse(strings(&["serve", "--engine.deterministic"]))
+            .unwrap();
+        let cfg = Config::builder().merge_cli_with(&m, typed()).build();
+        assert!(cfg.get::<bool>("engine.deterministic").unwrap());
+    }
+
+    // #108: the two halves of "config keys as command-line flags" agree.
+    #[test]
+    fn dynamic_arity_and_merge_args_with_agree_on_booleans() {
+        use ferroly::config::dynamic_arity;
+
+        let cmd = Command::new("app")
+            .dynamic_flags_with(dynamic_arity(&schema()))
+            .positional(Arg::new("rest").variadic());
+        let k = "--engine.deterministic";
+        let table: [(Vec<String>, bool); 6] = [
+            (strings(&[k]), true),
+            (strings(&[&format!("{k}=false")]), false),
+            (strings(&[k, "false"]), false),
+            (strings(&[k, "true", "x"]), true),
+            (strings(&[k, "x"]), true),
+            (strings(&[k, "1", "x"]), true),
+        ];
+        for (argv, expected) in table {
+            let m = cmd.parse(argv.clone()).unwrap();
+            let via_cli = Config::builder()
+                .merge_cli_with(&m, typed())
+                .build()
+                .get::<bool>("engine.deterministic")
+                .unwrap();
+            let via_args = Config::builder()
+                .merge_args_with(argv.clone(), typed())
+                .build()
+                .get::<bool>("engine.deterministic")
+                .unwrap();
+            assert_eq!(via_cli, via_args, "{argv:?}");
+            assert_eq!(via_cli, expected, "{argv:?}");
+        }
     }
 
     #[test]

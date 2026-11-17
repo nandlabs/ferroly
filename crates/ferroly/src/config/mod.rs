@@ -6,6 +6,8 @@
 //!
 //! - File formats are inferred from the extension: `.json`, `.yaml`/`.yml`,
 //!   `.toml`, `.xml`, `.properties`/`.props`/`.env`.
+//!   [`ConfigBuilder::formats`] restricts a builder to the [`FileFormat`]s an
+//!   application supports.
 //! - Environment variables are matched by prefix; `__` denotes nesting
 //!   (`APP_DB__HOST` → `db.host`).
 //! - Values deep-merge; later layers win.
@@ -69,6 +71,7 @@ mod source;
 mod unknown;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -82,6 +85,7 @@ pub use layer::Layer;
 #[cfg(feature = "hash")]
 pub use secret::SecretRef;
 pub use shared::{ConfigWatcher, SharedConfig};
+pub use source::FileFormat;
 pub use unknown::UnknownKey;
 
 use source::{Setting, Tree};
@@ -96,6 +100,17 @@ pub enum ConfigError {
     /// A file's extension is not a recognized config format. The payload is
     /// the path; the message also lists the supported extensions.
     UnsupportedFormat(String),
+
+    /// A file's extension is a format ferroly reads, but not one this builder
+    /// accepts ([`ConfigBuilder::formats`]).
+    FormatNotAllowed {
+        /// The file, as given.
+        path: String,
+        /// The accepted extensions, with the dot, in probing order
+        /// (`[".json", ".yaml", ".yml", ".toml"]`); empty when no format is
+        /// accepted.
+        allowed: Vec<String>,
+    },
 
     /// An I/O error reading a config or secret file. The message starts with
     /// the path.
@@ -152,7 +167,9 @@ pub enum ConfigError {
 
     /// Keys that the [schema](ConfigBuilder::schema) does not know, from every
     /// layer, reported by [`ConfigBuilder::build_checked`]. The message lists
-    /// the first 50 and counts the rest; the vector holds them all.
+    /// the first 50 and counts the rest; the vector holds them all. It reads
+    /// `unknown config key: …` for one key and `unknown config keys: …`
+    /// otherwise.
     UnknownKeys(Vec<UnknownKey>),
 
     /// A secret reference (`env:NAME` / `file:/path`) could not be resolved.
@@ -177,6 +194,20 @@ impl fmt::Display for ConfigError {
                     known.join(", ")
                 )
             }
+            ConfigError::FormatNotAllowed { path, allowed } => {
+                if allowed.is_empty() {
+                    write!(
+                        f,
+                        "config file format of '{path}' is not accepted (no file formats are accepted)"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "config file format of '{path}' is not accepted (expected one of {})",
+                        allowed.join(", ")
+                    )
+                }
+            }
             ConfigError::Io(m) => write!(f, "io error: {m}"),
             ConfigError::MissingKey(k) => write!(f, "missing key: {k}"),
             ConfigError::MissingKeys(keys) => {
@@ -200,7 +231,11 @@ impl fmt::Display for ConfigError {
             ConfigError::UnknownKeys(keys) => {
                 // Enough to act on; the variant holds every key.
                 const SHOWN: usize = 50;
-                f.write_str("unknown config keys: ")?;
+                f.write_str(if keys.len() == 1 {
+                    "unknown config key: "
+                } else {
+                    "unknown config keys: "
+                })?;
                 for (i, key) in keys.iter().take(SHOWN).enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
@@ -239,13 +274,16 @@ impl From<CodecError> for ConfigError {
 impl ferroly::errutils::Classify for ConfigError {
     /// A configuration problem is the operator's input
     /// ([`InvalidInput`](ferroly::errutils::ErrorKind::InvalidInput)), except an
-    /// unknown file format ([`Unsupported`](ferroly::errutils::ErrorKind::Unsupported))
+    /// unknown or not accepted file format
+    /// ([`Unsupported`](ferroly::errutils::ErrorKind::Unsupported))
     /// and I/O failures, whose cause is not known here
     /// ([`Unknown`](ferroly::errutils::ErrorKind::Unknown)).
     fn kind(&self) -> ferroly::errutils::ErrorKind {
         use ferroly::errutils::ErrorKind;
         match self {
-            ConfigError::UnsupportedFormat(_) => ErrorKind::Unsupported,
+            ConfigError::UnsupportedFormat(_) | ConfigError::FormatNotAllowed { .. } => {
+                ErrorKind::Unsupported
+            }
             ConfigError::Io(_) => ErrorKind::Unknown,
             _ => ErrorKind::InvalidInput,
         }
@@ -830,6 +868,9 @@ pub struct ConfigBuilder {
     check: unknown::Check,
     /// See [`Config::secret_derived`].
     secret_derived: BTreeSet<String>,
+    /// The file formats accepted ([`ConfigBuilder::formats`]); `None` accepts
+    /// every format.
+    formats: Option<Vec<FileFormat>>,
 }
 
 impl Default for ConfigBuilder {
@@ -840,6 +881,7 @@ impl Default for ConfigBuilder {
             origins: BTreeMap::new(),
             check: unknown::Check::default(),
             secret_derived: BTreeSet::new(),
+            formats: None,
         }
     }
 }
@@ -856,10 +898,14 @@ impl ConfigBuilder {
     /// Merges a whole layer that came from one place.
     fn apply(mut self, layer: Value, source: Source) -> Self {
         let layer = self.check.screen_value(layer, &source);
-        let origins = &mut self.origins;
-        leaves(&layer, "", &mut |path| {
-            origins.insert(path.to_string(), source.clone());
-        });
+        // An empty layer (an empty file, a layer that screened to nothing)
+        // sets nothing, so it is the origin of nothing.
+        if !matches!(&layer, Value::Object(entries) if entries.is_empty()) {
+            let origins = &mut self.origins;
+            leaves(&layer, "", &mut |path| {
+                origins.insert(path.to_string(), source.clone());
+            });
+        }
         self.value = merge(std::mem::take(&mut self.value), layer);
         self
     }
@@ -894,21 +940,130 @@ impl ConfigBuilder {
     /// key path. Variables that are not valid UTF-8, and variables whose path
     /// would contain an empty segment (`APP_A____B`) or more than 128
     /// segments (the codec's nesting limit), are ignored.
+    ///
+    /// With a [schema](ConfigBuilder::schema), a variable whose path names a
+    /// section rather than a key (`APP_MODEL` against a `model` section) is
+    /// not configuration: it is skipped without being reported, in strict
+    /// and lenient mode alike, so it can never replace the section.
+    /// `APP_MODEL__PATH` still sets `model.path`. A field whose default
+    /// encodes as a section (an enum whose default is a data-carrying
+    /// variant) therefore cannot be set to a unit variant from the
+    /// environment; set it from a file, a value layer or arguments.
+    ///
+    /// To test environment handling without touching the process
+    /// environment, use [`merge_env_from`](ConfigBuilder::merge_env_from).
     pub fn merge_env(self, prefix: &str) -> Self {
-        // Without secret files there is nothing fallible to do.
-        let options = EnvOptions::default();
-        let classify = |segs: &[String]| self.check.classify_env(segs);
-        let settings =
-            source::read_env(prefix, &options, &self.value, &classify).unwrap_or_default();
-        self.apply_env(prefix, &options, settings)
+        self.merge_env_from(prefix, std::env::vars_os())
     }
 
     /// Merges environment variables with the given prefix, with the extra
     /// behaviours selected in `options` (secrets from files, lists, key-case
     /// matching). Fails only when a secret file cannot be read.
+    ///
+    /// As with [`merge_env`](ConfigBuilder::merge_env), a variable naming a
+    /// schema section rather than a key is skipped without being reported;
+    /// with [`EnvOptions::secret_files`] the file an `APP_MODEL_FILE`
+    /// variable points at is then never read.
+    ///
+    /// To test environment handling without touching the process
+    /// environment, use
+    /// [`merge_env_from_with`](ConfigBuilder::merge_env_from_with).
     pub fn merge_env_with(self, prefix: &str, options: &EnvOptions) -> Result<Self, ConfigError> {
+        self.merge_env_from_with(prefix, std::env::vars_os(), options)
+    }
+
+    /// Like [`merge_env`](ConfigBuilder::merge_env), but reads the variables
+    /// from `vars` instead of the process environment, so a test needs no
+    /// `std::env::set_var` and cannot race other tests.
+    ///
+    /// Everything else is the same: prefix stripping, lowercasing, `__`
+    /// nesting, ignored keys, application in sorted name order (`APP_DB__HOST`
+    /// beats `APP_DB`), schema screening and provenance ([`Source::Env`]).
+    /// The process environment is not consulted at all.
+    ///
+    /// - A name or value that is not valid UTF-8 is skipped.
+    /// - A name given more than once keeps its **last** value in input order,
+    ///   as if the variables had been set one after another. If that last
+    ///   value is not valid UTF-8, the variable is skipped, even when an
+    ///   earlier value was valid: the process environment would hold only the
+    ///   last value, which `merge_env` skips.
+    ///
+    /// `vars` takes anything yielding pairs of `&str`, `String`, `&OsStr` or
+    /// `OsString`: an array, a `Vec`, a `HashMap`, or `std::env::vars_os()`
+    /// (which is what `merge_env` passes).
+    ///
+    /// ```
+    /// use ferroly::config::{Config, Source};
+    ///
+    /// let cfg = Config::builder()
+    ///     .merge_env_from("APP_", [("APP_PORT", "8080"), ("APP_DB__HOST", "db"), ("HOME", "/x")])
+    ///     .build();
+    /// assert_eq!(cfg.get::<u16>("port")?, 8080);
+    /// assert_eq!(cfg.get::<String>("db.host")?, "db");
+    /// assert!(!cfg.contains("home"));
+    /// assert_eq!(cfg.source("port"), Some(&Source::Env("APP_PORT".into())));
+    /// # Ok::<(), ferroly::config::ConfigError>(())
+    /// ```
+    pub fn merge_env_from<I, K, V>(self, prefix: &str, vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        // Without secret files there is nothing fallible to do.
+        let options = EnvOptions::default();
+        let vars = source::collect_vars(vars);
         let classify = |segs: &[String]| self.check.classify_env(segs);
-        let settings = source::read_env(prefix, options, &self.value, &classify)?;
+        let settings =
+            source::read_env(prefix, vars, &options, &self.value, &classify).unwrap_or_default();
+        self.apply_env(prefix, &options, settings)
+    }
+
+    /// Like [`merge_env_with`](ConfigBuilder::merge_env_with), but reads the
+    /// variables from `vars` instead of the process environment; see
+    /// [`merge_env_from`](ConfigBuilder::merge_env_from) for how `vars` is
+    /// read (non-UTF-8 pairs skipped, the last of a repeated name wins, and a
+    /// repeated name whose last value is not valid UTF-8 is skipped even when
+    /// an earlier value was valid).
+    ///
+    /// Only the variables are injected: with
+    /// [`EnvOptions::secret_files`], the value of a `*_FILE` variable is
+    /// still a path read from the real filesystem, with the same precedence,
+    /// errors, masking and [`Source::SecretFile`] provenance.
+    ///
+    /// ```
+    /// use ferroly::config::{Config, EnvOptions, Source};
+    ///
+    /// let path = std::env::temp_dir().join(format!("ferroly-doc-env-from-{}", std::process::id()));
+    /// std::fs::write(&path, "s3cret\n").unwrap();
+    /// let file = path.display().to_string();
+    ///
+    /// let cfg = Config::builder()
+    ///     .merge_env_from_with(
+    ///         "APP_",
+    ///         [("APP_DB__PASSWORD", "from-env"), ("APP_DB__PASSWORD_FILE", file.as_str())],
+    ///         &EnvOptions::new().secret_files(),
+    ///     )?
+    ///     .build();
+    /// assert_eq!(cfg.get::<String>("db.password")?, "s3cret");
+    /// assert!(matches!(cfg.source("db.password"), Some(Source::SecretFile { .. })));
+    /// # std::fs::remove_file(&path).ok();
+    /// # Ok::<(), ferroly::config::ConfigError>(())
+    /// ```
+    pub fn merge_env_from_with<I, K, V>(
+        self,
+        prefix: &str,
+        vars: I,
+        options: &EnvOptions,
+    ) -> Result<Self, ConfigError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        let vars = source::collect_vars(vars);
+        let classify = |segs: &[String]| self.check.classify_env(segs);
+        let settings = source::read_env(prefix, vars, options, &self.value, &classify)?;
         Ok(self.apply_env(prefix, options, settings))
     }
 
@@ -922,22 +1077,96 @@ impl ConfigBuilder {
         self.apply_screened(settings, &env)
     }
 
+    /// Restricts the file formats this builder loads to `formats`; by default
+    /// every [`FileFormat`] is accepted.
+    ///
+    /// Every file-loading call merged **after** this one honours the list:
+    /// [`merge_file`](ConfigBuilder::merge_file),
+    /// [`merge_file_optional`](ConfigBuilder::merge_file_optional),
+    /// [`merge_profile`](ConfigBuilder::merge_profile),
+    /// [`merge_found`](ConfigBuilder::merge_found), and the file and profile
+    /// [`Layer`]s of [`layers`](ConfigBuilder::layers). Call it first; layers
+    /// merged earlier are kept as they are. [`Config::from_file`] and
+    /// [`Config::from_layers`] stay unrestricted — write
+    /// `Config::builder().formats(..).layers(..)?.build()` instead.
+    ///
+    /// - A file whose extension is a known format outside the list is
+    ///   [`ConfigError::FormatNotAllowed`], decided from the name alone,
+    ///   before the filesystem is touched: `merge_file_optional("app.env")`
+    ///   fails even when `app.env` does not exist.
+    /// - An extension ferroly does not know at all (`app.ini`) is still
+    ///   [`ConfigError::UnsupportedFormat`].
+    /// - Calling it again replaces the list; order and duplicates do not
+    ///   matter. An empty slice accepts no format, so every file-loading call
+    ///   then fails with `FormatNotAllowed`.
+    ///
+    /// ```
+    /// use ferroly::config::{Config, ConfigError, FileFormat};
+    ///
+    /// let dir = std::env::temp_dir().join(format!("ferroly-doc-formats-{}", std::process::id()));
+    /// std::fs::create_dir_all(&dir).unwrap();
+    /// std::fs::write(dir.join("app.env"), "port=1\n").unwrap();
+    /// std::fs::write(dir.join("app.yaml"), "port: 2\n").unwrap();
+    ///
+    /// let documented = [FileFormat::Yaml, FileFormat::Toml, FileFormat::Json];
+    /// let err = Config::builder()
+    ///     .formats(&documented)
+    ///     .merge_file(dir.join("app.env"))
+    ///     .unwrap_err();
+    /// assert!(matches!(err, ConfigError::FormatNotAllowed { .. }));
+    ///
+    /// let cfg = Config::builder()
+    ///     .formats(&documented)
+    ///     .merge_file(dir.join("app.yaml"))?
+    ///     .build();
+    /// assert_eq!(cfg.get::<u16>("port")?, 2);
+    /// # std::fs::remove_dir_all(&dir).ok();
+    /// # Ok::<(), ferroly::config::ConfigError>(())
+    /// ```
+    pub fn formats(mut self, formats: &[FileFormat]) -> Self {
+        let mut list: Vec<FileFormat> = Vec::with_capacity(formats.len());
+        for f in formats {
+            if !list.contains(f) {
+                list.push(*f);
+            }
+        }
+        self.formats = Some(list);
+        self
+    }
+
     /// Merges a config file, format inferred from extension. A missing file is
     /// an error; see [`merge_file_optional`](ConfigBuilder::merge_file_optional).
+    ///
+    /// An unknown extension is [`ConfigError::UnsupportedFormat`]; a known one
+    /// that [`formats`](ConfigBuilder::formats) does not accept is
+    /// [`ConfigError::FormatNotAllowed`].
+    ///
+    /// An empty layer, which changes nothing with or without a schema, is
+    /// read from a file of any format that is empty or holds only whitespace
+    /// (after an optional UTF-8 byte-order mark), a YAML, TOML or properties
+    /// file holding only comments, or a JSON file holding `null`.
     pub fn merge_file(self, path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         self.merge_file_impl(path.as_ref(), false).map(|(b, _)| b)
     }
 
     /// Merges a config file if it exists. A missing file is skipped silently;
-    /// an unsupported extension, an unreadable file or malformed content is
-    /// still an error.
+    /// an unsupported or not accepted extension
+    /// ([`formats`](ConfigBuilder::formats)), an unreadable file or malformed
+    /// content is still an error. The extension is checked first, so a
+    /// missing file with a not accepted extension is an error too.
     pub fn merge_file_optional(self, path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         self.merge_file_impl(path.as_ref(), true).map(|(b, _)| b)
     }
 
+    /// The extensions [`formats`](ConfigBuilder::formats) accepts, without the
+    /// dot, in probing order.
+    fn allowed_extensions(&self) -> Vec<&'static str> {
+        source::allowed_extensions(self.formats.as_deref())
+    }
+
     /// Returns the builder and whether the file was found.
     fn merge_file_impl(self, path: &Path, optional: bool) -> Result<(Self, bool), ConfigError> {
-        match source::load_file(path, optional)? {
+        match source::load_file(path, optional, self.formats.as_deref())? {
             Some(layer) => Ok((
                 self.apply(layer, Source::File(path.display().to_string())),
                 true,
@@ -954,7 +1183,11 @@ impl ConfigBuilder {
     ///   and `config/app-prod.yaml`) or omit it, in which case every supported
     ///   extension is tried, in the order `.json`, `.yaml`, `.yml`, `.toml`,
     ///   `.xml`, `.properties`, `.props`, `.env`, and every file found is
-    ///   merged.
+    ///   merged. With [`formats`](ConfigBuilder::formats), only the accepted
+    ///   formats' extensions are tried, so a stray `config/app.env` is never
+    ///   read; an explicit extension that is not accepted is
+    ///   [`ConfigError::FormatNotAllowed`] before anything is read, and so is
+    ///   an extension-less `base` when no format is accepted.
     /// - At least one base file must exist; the overlay is optional.
     /// - An empty `profile` loads only the base. The profile is used as part
     ///   of a file name, so it may only contain letters, digits, `_`, `-` and
@@ -976,9 +1209,24 @@ impl ConfigBuilder {
             .extension()
             .and_then(|e| e.to_str())
             .filter(|_| source::has_known_extension(base));
+        // The explicit extension is detected against every known format (so
+        // `config/app.env` is never probed as `config/app.env.json`) and then
+        // checked against the accepted ones.
         let (stem, extensions): (PathBuf, Vec<&str>) = match explicit {
-            Some(ext) => (base.with_extension(""), vec![ext]),
-            None => (base.to_path_buf(), source::EXTENSIONS.to_vec()),
+            Some(ext) => {
+                source::check_allowed(base, self.formats.as_deref())?;
+                (base.with_extension(""), vec![ext])
+            }
+            None => {
+                let extensions = self.allowed_extensions();
+                if extensions.is_empty() {
+                    return Err(ConfigError::FormatNotAllowed {
+                        path: base.display().to_string(),
+                        allowed: Vec::new(),
+                    });
+                }
+                (base.to_path_buf(), extensions)
+            }
         };
 
         let mut found = false;

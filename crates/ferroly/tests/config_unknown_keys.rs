@@ -409,7 +409,7 @@ fn a_literal_dotted_key_is_told_to_nest() {
     assert_eq!(keys[0].suggestion, None);
     assert_eq!(
         message,
-        "unknown config keys: `engine.threads` in a value layer \
+        "unknown config key: `engine.threads` in a value layer \
          (one key name with dots in it: write it as nested keys)"
     );
 }
@@ -462,6 +462,7 @@ fn suggestions_are_bounded_in_cost_and_the_message_in_size() {
         .unwrap();
     assert_eq!(near.suggestion.as_deref(), Some("--section_0.setting_0"));
     // The message lists 50 keys and counts the rest; the huge key is cut.
+    assert!(message.starts_with("unknown config keys: "));
     assert!(
         message.ends_with(", and 12951 more"),
         "{}",
@@ -521,4 +522,372 @@ fn secret_directory_keys_are_spelled_as_their_file() {
     let shown = format!("{keys:?}");
     assert!(!shown.contains("\"1\""), "{shown}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn one_unknown_key_is_reported_in_the_singular() {
+    // #105: the most common message must read right.
+    let err = Config::builder()
+        .schema(schema())
+        .merge_value(obj(&[("engine", obj(&[("thread", Value::Int(8))]))]))
+        .build_checked()
+        .unwrap_err();
+    let message = err.to_string();
+    assert_eq!(
+        message,
+        "unknown config key: `engine.thread` in a value layer (did you mean `engine.threads`?)"
+    );
+    assert!(!message.starts_with("unknown config keys"), "{message}");
+}
+
+#[test]
+fn two_or_more_unknown_keys_are_reported_in_the_plural() {
+    let err = Config::builder()
+        .schema(schema())
+        .merge_value(obj(&[
+            ("engine", obj(&[("thread", Value::Int(8))])),
+            ("serve", obj(&[("port", Value::Int(1))])),
+        ]))
+        .build_checked()
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.starts_with("unknown config keys: "), "{message}");
+    assert!(
+        message.contains(
+            "`engine.thread` in a value layer (did you mean `engine.threads`?), \
+             `serve.port` in a value layer (did you mean `server.port`?)"
+        ),
+        "{message}"
+    );
+
+    // 51 keys: plural, 50 listed, one counted.
+    let many: Vec<(String, Value)> = (0..51)
+        .map(|i| (format!("zz_{i}"), Value::Int(1)))
+        .collect();
+    let err = Config::builder()
+        .schema(schema())
+        .merge_value(Value::Object(many))
+        .build_checked()
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.starts_with("unknown config keys: "), "{message}");
+    assert!(message.ends_with(", and 1 more"), "{message}");
+
+    // A hand-built empty list keeps the plural.
+    assert_eq!(
+        ConfigError::UnknownKeys(Vec::new()).to_string(),
+        "unknown config keys: "
+    );
+}
+
+#[test]
+fn a_null_section_keeps_the_lower_layers_values() {
+    // #109: `engine:` with every key under it commented out.
+    let cfg = Config::builder()
+        .schema(schema())
+        .merge_value(App::default().encode())
+        .merge_value(obj(&[("engine", Value::Null)]))
+        .build_checked()
+        .unwrap();
+    assert_eq!(cfg.extract::<App>().unwrap(), App::default());
+    assert!(cfg.ignored_keys().is_empty());
+    assert_eq!(cfg.source("engine.threads"), Some(&Source::Value));
+    assert_eq!(cfg.source("engine"), None);
+}
+
+#[test]
+fn a_null_section_in_a_yaml_file_is_ignored() {
+    let dir = temp_dir("null-section");
+    let file = dir.join("app.yaml");
+    std::fs::write(&file, "engine:\n  # threads: 8\nserver:\n  port: 9000\n").unwrap();
+    let cfg = Config::builder()
+        .schema(schema())
+        .merge_value(App::default().encode())
+        .merge_file(&file)
+        .unwrap()
+        .build_checked()
+        .unwrap();
+    assert_eq!(cfg.get::<u32>("engine.threads").unwrap(), 4);
+    assert_eq!(cfg.get::<u16>("server.port").unwrap(), 9000);
+    assert_eq!(
+        cfg.source("server.port"),
+        Some(&Source::File(file.display().to_string()))
+    );
+    // The null section is the origin of nothing.
+    assert_eq!(cfg.source("engine.threads"), Some(&Source::Value));
+    assert!(cfg.ignored_keys().is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_nested_null_section_is_dropped() {
+    let schema = obj(&[(
+        "server",
+        obj(&[
+            ("port", Value::Int(8080)),
+            ("limits", obj(&[("max", Value::Int(10))])),
+        ]),
+    )]);
+    let cfg = Config::builder()
+        .schema(schema.clone())
+        .merge_value(schema)
+        .merge_value(obj(&[("server", obj(&[("limits", Value::Null)]))]))
+        .build_checked()
+        .unwrap();
+    assert_eq!(cfg.get::<i64>("server.limits.max").unwrap(), 10);
+    assert_eq!(cfg.get::<i64>("server.port").unwrap(), 8080);
+    assert!(cfg.ignored_keys().is_empty());
+}
+
+#[test]
+fn an_empty_file_changes_nothing() {
+    let dir = temp_dir("empty-file");
+    let files = [
+        ("empty.yaml", ""),
+        (
+            "comments.yaml",
+            "# every setting commented out\n# engine:\n",
+        ),
+        ("null.json", "null"),
+    ];
+    for (name, content) in files {
+        let file = dir.join(name);
+        std::fs::write(&file, content).unwrap();
+        for with_schema in [false, true] {
+            let builder = || {
+                if with_schema {
+                    Config::builder().schema(schema())
+                } else {
+                    Config::builder()
+                }
+            };
+            let cfg = builder()
+                .merge_value(App::default().encode())
+                .merge_file(&file)
+                .unwrap()
+                .build_checked()
+                .unwrap();
+            assert_eq!(cfg.value(), &App::default().encode(), "{name}");
+            assert!(cfg.sources().all(|(k, _)| !k.is_empty()), "{name}");
+            assert_eq!(cfg.source("engine.threads"), Some(&Source::Value));
+
+            // Alone, it gives an empty configuration with no origins.
+            let cfg = builder()
+                .merge_file(&file)
+                .unwrap()
+                .build_checked()
+                .unwrap();
+            assert_eq!(cfg.value(), &Value::Object(Vec::new()), "{name}");
+            assert_eq!(cfg.sources().count(), 0, "{name}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_empty_or_blank_file_of_any_format_changes_nothing() {
+    let dir = temp_dir("blank-file");
+    let contents = ["", " \n\t\r\n  ", "\u{feff}", "\u{feff}\n  \n"];
+    for ext in ["json", "xml", "toml", "properties", "yaml"] {
+        for (i, content) in contents.iter().enumerate() {
+            let file = dir.join(format!("blank{i}.{ext}"));
+            std::fs::write(&file, content).unwrap();
+            for with_schema in [false, true] {
+                let builder = || {
+                    if with_schema {
+                        Config::builder().schema(schema())
+                    } else {
+                        Config::builder()
+                    }
+                };
+                let what = format!("{} (schema: {with_schema})", file.display());
+                let cfg = builder()
+                    .merge_value(App::default().encode())
+                    .merge_file(&file)
+                    .unwrap_or_else(|e| panic!("{what}: {e}"))
+                    .build_checked()
+                    .unwrap();
+                assert_eq!(cfg.value(), &App::default().encode(), "{what}");
+                assert!(cfg.sources().all(|(_, s)| s == &Source::Value), "{what}");
+
+                let cfg = builder()
+                    .merge_file(&file)
+                    .unwrap()
+                    .build_checked()
+                    .unwrap();
+                assert_eq!(cfg.value(), &Value::Object(Vec::new()), "{what}");
+                assert_eq!(cfg.sources().count(), 0, "{what}");
+            }
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_empty_json_file_through_optional_and_profile_changes_nothing() {
+    let dir = temp_dir("blank-json-profile");
+    std::fs::write(dir.join("app.json"), "").unwrap();
+    std::fs::write(dir.join("app-prod.json"), "  \n").unwrap();
+    for with_schema in [false, true] {
+        let builder = || {
+            let b = Config::builder();
+            let b = if with_schema { b.schema(schema()) } else { b };
+            b.merge_value(App::default().encode())
+        };
+        let cfg = builder()
+            .merge_file_optional(dir.join("app.json"))
+            .unwrap()
+            .build_checked()
+            .unwrap();
+        assert_eq!(cfg.value(), &App::default().encode());
+        assert!(cfg.sources().all(|(_, s)| s == &Source::Value));
+
+        for base in [dir.join("app"), dir.join("app.json")] {
+            let cfg = builder()
+                .merge_profile(&base, "prod")
+                .unwrap()
+                .build_checked()
+                .unwrap();
+            assert_eq!(cfg.value(), &App::default().encode());
+            assert!(cfg.sources().all(|(_, s)| s == &Source::Value));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_json_file_with_invalid_text_is_still_a_parse_error() {
+    let dir = temp_dir("bad-json");
+    for (i, content) in ["nul", "{", " x ", "\u{feff}\u{feff}"].iter().enumerate() {
+        let file = dir.join(format!("bad{i}.json"));
+        std::fs::write(&file, content).unwrap();
+        let err = Config::builder().merge_file(&file).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "{content:?}: {err:?}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `server: { limits: { max: 10 }, port: 0 }`
+fn limits_schema() -> Value {
+    obj(&[(
+        "server",
+        obj(&[
+            ("limits", obj(&[("max", Value::Int(10))])),
+            ("port", Value::Int(0)),
+        ]),
+    )])
+}
+
+#[test]
+fn a_section_holding_only_null_sections_is_dropped_with_them() {
+    let dir = temp_dir("null-parent");
+    let file = dir.join("app.yaml");
+    std::fs::write(&file, "server:\n  limits:\n").unwrap();
+    let layer = obj(&[("server", obj(&[("limits", Value::Null)]))]);
+
+    // No lower layer: nothing is set and nothing has an origin.
+    let from_file = Config::builder()
+        .schema(limits_schema())
+        .merge_file(&file)
+        .unwrap()
+        .build_checked()
+        .unwrap();
+    let from_value = Config::builder()
+        .schema(limits_schema())
+        .merge_value(layer.clone())
+        .build_checked()
+        .unwrap();
+    for cfg in [&from_file, &from_value] {
+        assert!(!cfg.contains("server"), "{:?}", cfg.value());
+        assert_eq!(cfg.value(), &Value::Object(Vec::new()));
+        assert_eq!(cfg.source("server"), None);
+        assert_eq!(cfg.sources().count(), 0);
+        assert!(cfg.ignored_keys().is_empty());
+    }
+
+    // Over defaults: the defaults stay, with their own origin.
+    let cfg = Config::builder()
+        .schema(limits_schema())
+        .merge_value(limits_schema())
+        .merge_file(&file)
+        .unwrap()
+        .build_checked()
+        .unwrap();
+    assert_eq!(cfg.value(), &limits_schema());
+    assert_eq!(cfg.source("server.limits.max"), Some(&Source::Value));
+    assert_eq!(cfg.source("server.port"), Some(&Source::Value));
+    assert_eq!(cfg.source("server"), None);
+
+    // An explicit `{}` is still merged.
+    let cfg = Config::builder()
+        .schema(limits_schema())
+        .merge_value(obj(&[("server", obj(&[]))]))
+        .build_checked()
+        .unwrap();
+    assert_eq!(cfg.value(), &obj(&[("server", obj(&[]))]));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_null_option_still_resets_it() {
+    let defaults = App {
+        tls: Some("a".into()),
+        ..App::default()
+    };
+    let cfg = Config::builder()
+        .schema(schema())
+        .merge_value(defaults.encode())
+        .merge_value(obj(&[("tls", Value::Null)]))
+        .build_checked()
+        .unwrap();
+    assert_eq!(cfg.extract::<App>().unwrap().tls, None);
+}
+
+#[test]
+fn a_scalar_where_a_section_is_expected_is_still_merged() {
+    let cfg = Config::builder()
+        .schema(schema())
+        .merge_value(App::default().encode())
+        .merge_value(obj(&[("engine", Value::Int(3))]))
+        .build_checked()
+        .unwrap();
+    assert_eq!(cfg.get::<i64>("engine").unwrap(), 3);
+    assert!(cfg.extract::<App>().is_err());
+}
+
+#[test]
+fn null_sections_are_not_unknown_keys_in_lenient_mode() {
+    let cfg = Config::builder()
+        .schema(schema())
+        .lenient()
+        .merge_value(App::default().encode())
+        .merge_value(obj(&[
+            ("engine", Value::Null),
+            ("serve", obj(&[("port", Value::Int(1))])),
+        ]))
+        .build_checked()
+        .unwrap();
+    let ignored: Vec<&str> = cfg.ignored_keys().iter().map(|k| k.path.as_str()).collect();
+    assert_eq!(ignored, ["serve.port"]);
+    assert_eq!(cfg.extract::<App>().unwrap(), App::default());
+}
+
+#[test]
+fn the_layer_api_drops_null_sections_too() {
+    use ferroly::config::Layer;
+    let cfg = Config::builder()
+        .schema(schema())
+        .layers([
+            Layer::value(App::default().encode()),
+            Layer::value(obj(&[("engine", Value::Null)])),
+        ])
+        .unwrap()
+        .build_checked()
+        .unwrap();
+    assert_eq!(cfg.extract::<App>().unwrap(), App::default());
+    assert!(cfg.ignored_keys().is_empty());
+    assert_eq!(cfg.source("engine.threads"), Some(&Source::Value));
 }

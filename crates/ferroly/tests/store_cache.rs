@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferroly::http::{Client, HttpResponse, StatusCode};
-use ferroly::store::{BoxFuture, ByteStream, Cache, Digest, Fetched, StoreError};
+use ferroly::store::{
+    BoxFuture, ByteStream, Cache, Digest, Fetched, Layout, LocalStore, ObjectStatus, StoreError,
+};
 use store_common::{content, files_in, serve_range, spawn, Scratch};
 
 /// Yields `data` in `piece`-byte chunks, then fails (or ends) after `limit`
@@ -801,4 +803,282 @@ async fn fetch_http_does_not_decode_the_body() {
         .await
         .unwrap();
     assert_eq!(std::fs::read(path).unwrap(), stored);
+}
+
+// ------------------------------------------------ layouts and the sync core
+
+#[tokio::test]
+async fn layout_fanout_is_the_default() {
+    let dir = Scratch::new("layout-default");
+    let a = Cache::open(dir.path()).unwrap();
+    let b = Cache::open_with(dir.path(), Layout::Fanout).unwrap();
+    assert_eq!(a.layout(), &Layout::Fanout);
+    let d = Digest::of(b"x");
+    let hex = d.hex();
+    assert_eq!(a.path_for(&d), b.path_for(&d));
+    assert!(a
+        .path_for(&d)
+        .ends_with(std::path::Path::new("sha256").join(&hex[..2]).join(&hex)));
+    let stored = a.insert_bytes(b"x".to_vec()).await.unwrap();
+    assert_eq!(stored.path, a.path_for(&d));
+}
+
+#[tokio::test]
+async fn flat_layout_fetch_resumes() {
+    let dir = Scratch::new("resume-flat");
+    let cache = Cache::open_with(dir.path(), Layout::flat("blobs").unwrap()).unwrap();
+    let data = content(50_000);
+    let digest = Digest::of(&data);
+    park_partial(&cache, &digest, &data, 20_000).await;
+    assert_eq!(files_in(&dir.path().join("partial")), 1);
+
+    let (base, log) = range_server(data.clone(), false).await;
+    let path = cache
+        .fetch_url(&Client::new(), &format!("{base}/blob"), &digest)
+        .await
+        .unwrap();
+    assert_eq!(
+        path,
+        dir.path().join("blobs").join("sha256").join(digest.hex())
+    );
+    assert_eq!(std::fs::read(path).unwrap(), data);
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![Some("bytes=20000-".to_string())],
+        "only the missing tail is requested"
+    );
+    assert_eq!(cache.partial_len(&digest), None);
+    assert_eq!(files_in(&dir.path().join("tmp")), 0);
+    assert!(!dir.path().join("sha256").exists());
+}
+
+#[tokio::test]
+async fn local_and_async_share_a_store() {
+    let dir = Scratch::new("shared-core");
+    let store = LocalStore::open_with(dir.path(), Layout::flat("blobs").unwrap()).unwrap();
+    let synced = store.insert_bytes(b"from the sync side").unwrap();
+
+    let cache = Cache::from_local(store.clone());
+    assert_eq!(cache.local().root(), store.root());
+    let path = cache
+        .get_or_fetch(&synced.digest, |_| async { must_not_fetch() })
+        .await
+        .unwrap();
+    assert_eq!(path, synced.path);
+
+    let from_async = cache
+        .insert_bytes(b"from the async side".to_vec())
+        .await
+        .unwrap();
+    let listed: Vec<Digest> = store.list().unwrap().iter().map(|o| o.digest).collect();
+    assert!(listed.contains(&from_async.digest) && listed.contains(&synced.digest));
+    assert_eq!(cache.list().await.unwrap().len(), 2);
+
+    // `From` and the shared size cap.
+    let capped: Cache = store.clone().with_max_object_bytes(Some(4)).into();
+    let err = capped.insert_bytes(b"too long".to_vec()).await.unwrap_err();
+    assert!(matches!(err, StoreError::SizeMismatch(_)), "{err:?}");
+    let capped = Cache::from_local(store).with_max_object_bytes(Some(4));
+    assert_eq!(capped.local().max_object_bytes(), Some(4));
+    assert!(capped.local().insert_bytes(b"too long").is_err());
+}
+
+#[tokio::test]
+async fn async_list_resolve_and_check() {
+    let dir = Scratch::new("async-mirrors");
+    let cache = Cache::open(dir.path()).unwrap();
+    let a = cache.insert_bytes(b"alpha".to_vec()).await.unwrap();
+    let b = cache.insert_bytes(b"beta".to_vec()).await.unwrap();
+    assert_eq!(cache.list().await.unwrap().len(), 2);
+    assert_eq!(
+        cache.resolve_prefix(&a.digest.hex()[..12]).await.unwrap(),
+        a.digest
+    );
+    assert_eq!(
+        cache
+            .resolve_prefix_min(&b.digest.hex()[..6], 6)
+            .await
+            .unwrap(),
+        b.digest
+    );
+    assert!(cache
+        .resolve_prefix(&Digest::of(b"gamma").hex()[..12])
+        .await
+        .unwrap_err()
+        .is_not_found());
+
+    std::fs::write(&b.path, b"BETA").unwrap();
+    assert_eq!(
+        cache.check(&a.digest).await.unwrap(),
+        ObjectStatus::Intact { size: 5 }
+    );
+    assert!(matches!(
+        cache.check(&b.digest).await.unwrap(),
+        ObjectStatus::Corrupt { size: 4, .. }
+    ));
+    let all = cache.check_all().await.unwrap();
+    assert_eq!(all.len(), 2);
+    // `check` never deletes; `verify` still does, under the store lock.
+    assert!(cache.contains(&b.digest));
+    assert!(!cache.verify(&b.digest).await.unwrap());
+    assert!(!cache.contains(&b.digest));
+    assert!(dir.path().join(".lock").is_file());
+    assert_eq!(cache.check(&b.digest).await.unwrap(), ObjectStatus::Missing);
+}
+
+#[tokio::test]
+async fn cache_lock_async() {
+    let dir = Scratch::new("async-lock");
+    let cache = Cache::open(dir.path()).unwrap();
+    let stored = cache.insert_bytes(b"locked".to_vec()).await.unwrap();
+    let guard = cache.lock().await.unwrap();
+
+    let remover = {
+        let cache = cache.clone();
+        let digest = stored.digest;
+        tokio::spawn(async move { cache.remove(&digest).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!remover.is_finished(), "remove ran while the lock was held");
+    assert!(stored.path.exists());
+
+    // The guard's own methods work while it is held.
+    assert!(!guard.remove(&Digest::of(b"absent")).unwrap());
+    drop(guard);
+    let removed = tokio::time::timeout(Duration::from_secs(10), remover)
+        .await
+        .expect("remove did not finish after the lock was released")
+        .unwrap()
+        .unwrap();
+    assert!(removed);
+    assert!(!stored.path.exists());
+}
+
+#[tokio::test]
+async fn cancelled_destructive_calls_delete_nothing() {
+    let dir = Scratch::new("async-cancel");
+    let cache = Cache::open(dir.path()).unwrap();
+    let a = cache.insert_bytes(b"alpha".to_vec()).await.unwrap();
+    let b = cache.insert_bytes(b"beta".to_vec()).await.unwrap();
+    let c = cache.insert_bytes(b"gamma".to_vec()).await.unwrap();
+    std::fs::write(&c.path, b"GAMMA").unwrap(); // corrupt: `verify` would delete it
+
+    let held = cache.local().lock().unwrap();
+    let short = Duration::from_millis(100);
+    assert!(tokio::time::timeout(short, cache.remove(&a.digest))
+        .await
+        .is_err());
+    assert!(tokio::time::timeout(short, cache.evict_to(0))
+        .await
+        .is_err());
+    assert!(tokio::time::timeout(short, cache.verify(&c.digest))
+        .await
+        .is_err());
+    drop(held);
+    // Long enough for any attempt still in flight to see the lock free.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(a.path.exists(), "a dropped remove deleted the object");
+    assert!(b.path.exists(), "a dropped evict_to deleted an object");
+    assert!(c.path.exists(), "a dropped verify deleted the object");
+
+    // Not cancelled, they still do their work.
+    assert!(cache.remove(&a.digest).await.unwrap());
+    assert!(!cache.verify(&c.digest).await.unwrap());
+    assert!(!c.path.exists());
+    assert_eq!(cache.evict_to(0).await.unwrap().removed, 1);
+    assert!(!b.path.exists());
+}
+
+#[test]
+fn a_cancelled_remove_does_not_hold_up_runtime_shutdown() {
+    let dir = Scratch::new("async-cancel-shutdown");
+    let store = LocalStore::open(dir.path()).unwrap();
+    let stored = store.insert_bytes(b"kept").unwrap();
+    let held = store.lock().unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cache = Cache::from_local(store.clone());
+    let timed_out = rt.block_on(async {
+        tokio::time::timeout(Duration::from_millis(100), cache.remove(&stored.digest))
+            .await
+            .is_err()
+    });
+    assert!(timed_out);
+    let started = std::time::Instant::now();
+    drop(rt); // waits for the blocking pool
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown waited {:?} for the lock holder",
+        started.elapsed()
+    );
+    drop(held);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(stored.path.exists());
+}
+
+#[tokio::test]
+async fn nothing_to_delete_takes_no_lock() {
+    let dir = Scratch::new("async-no-lock");
+    let cache = Cache::open(dir.path()).unwrap();
+    let a = cache.insert_bytes(b"alpha".to_vec()).await.unwrap();
+    let absent = Digest::of(b"absent");
+    // Even with the lock held elsewhere, these return at once.
+    let held = cache.local().lock().unwrap();
+    let quick = Duration::from_secs(5);
+    assert!(!tokio::time::timeout(quick, cache.remove(&absent))
+        .await
+        .unwrap()
+        .unwrap());
+    let fits = tokio::time::timeout(quick, cache.evict_to(u64::MAX))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((fits.removed, fits.freed, fits.remaining), (0, 0, 5));
+    assert!(!tokio::time::timeout(quick, cache.verify(&absent))
+        .await
+        .unwrap()
+        .unwrap());
+    drop(held);
+    assert!(a.path.exists());
+}
+
+#[tokio::test]
+async fn nothing_to_delete_creates_no_lock_file() {
+    let dir = Scratch::new("async-no-lock-file");
+    let cache = Cache::open(dir.path()).unwrap();
+    cache.insert_bytes(b"alpha".to_vec()).await.unwrap();
+    assert!(!cache.remove(&Digest::of(b"absent")).await.unwrap());
+    assert_eq!(cache.evict_to(u64::MAX).await.unwrap().removed, 0);
+    assert!(
+        !dir.path().join(".lock").exists(),
+        "the lock file was created with nothing to delete"
+    );
+}
+
+/// On a store root this user may not write to, `remove` of an absent object
+/// and an `evict_to` with nothing to do succeed (as in 0.6) instead of
+/// failing to create the lock file.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_only_root_allows_no_op_deletions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Scratch::new("async-read-only");
+    let cache = Cache::open(dir.path()).unwrap();
+    cache.insert_bytes(b"alpha".to_vec()).await.unwrap();
+    let set_mode =
+        |mode| std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode));
+    set_mode(0o555).unwrap();
+    if std::fs::write(dir.path().join("probe"), b"x").is_ok() {
+        // Running as root, which ignores the mode: nothing to test.
+        set_mode(0o755).unwrap();
+        return;
+    }
+    let removed = cache.remove(&Digest::of(b"absent")).await;
+    let evicted = cache.evict_to(u64::MAX).await;
+    set_mode(0o755).unwrap();
+    assert!(!removed.unwrap());
+    assert_eq!(evicted.unwrap().remaining, 5);
 }

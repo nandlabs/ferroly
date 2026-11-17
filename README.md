@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml"><img src="https://github.com/nandlabs/ferroly/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.6.0-B22222" alt="version 0.6.0">
+  <img src="https://img.shields.io/badge/version-0.7.0-B22222" alt="version 0.7.0">
   <img src="https://img.shields.io/badge/rust-1.75%2B-B7410E" alt="MSRV 1.75+">
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="license: Apache-2.0 OR MIT"></a>
   <img src="https://img.shields.io/badge/unsafe-4%20audited%20modules-9cbf3b" alt="unsafe: 4 audited modules">
@@ -66,7 +66,7 @@ extension traits (`vfs::Vfs`, `messaging::Provider`, `vectorstore::VectorStore`)
 
 ```toml
 [dependencies]
-ferroly = { version = "0.6", features = ["genai", "openai", "codec"] }
+ferroly = { version = "0.7", features = ["genai", "openai", "codec"] }
 ```
 
 Enable only what you need — unused modules and their dependencies are never compiled.
@@ -98,7 +98,8 @@ Enable only what you need — unused modules and their dependencies are never co
 | `vectorstore` | `ferroly::vectorstore` | `VectorStore` trait, in-memory store with metadata filters, namespaces and snapshots, text chunking | `codec` |
 | `messaging` | `ferroly::messaging` | In-process queues and topics with typed attributes, subscription filters, a delivery context (deferred acks, delivery info), priority, scheduling, TTL, dead-lettering and graceful drain; a provider trait with receipts and capabilities | `codec`, `lifecycle` |
 | `vfs` | `ferroly::vfs` | Virtual filesystem trait; rooted local and in-memory backends, scheme registry, atomic and streaming writes with abort, write preconditions, etags, signed-URL and typed-error hooks for object stores | tokio |
-| `store` | `ferroly::store` | Content-addressed cache: SHA-256-keyed, verify-on-write, atomic commit, resumable downloads, safe concurrent fetches | `http`, `hash` |
+| `store-local` | `ferroly::store` | Synchronous content-addressed store: SHA-256-keyed, verify-on-write, atomic commit, fan-out or flat layouts, listing, short-digest lookup, non-destructive verify, cross-process lock; no tokio or HTTP | `hash`, `fsutils` |
+| `store` | `ferroly::store` | Content-addressed cache: SHA-256-keyed, verify-on-write, atomic commit, resumable downloads, safe concurrent fetches | `store-local`, `http`, `hash` |
 | `store-s3` / `store-hf` / `store-oci` | `ferroly::store::{s3, hf, oci}` | Fetch adapters into the cache: S3-compatible storage with SigV4, Hugging Face Hub files, OCI registry manifests and blobs | `store` (+ `codec` for S3 / OCI) |
 | `log` | `ferroly::log` | Structured logging: JSON or text, multiple sinks, file rotation, redaction, per-target levels | `codec` |
 | `log-bridge` | `ferroly::log::bridge` | Routes records from the `log` facade crate (`log::info!`, …) into a ferroly `Logger`; adds the optional `log` dependency | `log` |

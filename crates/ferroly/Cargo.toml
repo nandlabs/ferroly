@@ -77,8 +77,10 @@ messaging = ["codec", "lifecycle", "dep:tokio"]
 vfs = ["dep:tokio", "tokio/rt", "tokio/fs", "tokio/io-util"]
 hash = []
 sig = ["hash"]
+# Local content-addressed store: synchronous, no tokio, no http.
+store-local = ["hash", "fsutils"]
 # Content-addressed cache + artifact fetch plumbing; one feature per adapter.
-store = ["http", "hash"]
+store = ["store-local", "http", "hash"]
 store-s3 = ["store", "codec"]
 store-hf = ["store"]
 store-oci = ["store", "codec"]
@@ -123,6 +125,7 @@ full = [
     "obs",
     "tls-ring",
     "sig",
+    "store-local",
     "store",
     "store-s3",
     "store-hf",

@@ -204,9 +204,13 @@ impl SharedConfig {
     /// **A change must settle first**: the watcher reloads only once the
     /// files look the same on two polls in a row, so a file caught half
     /// written (an editor or `cp` that truncates, then writes) is not loaded
-    /// while it is still being written. A writer slower than one interval
-    /// can still be caught mid-write, so replace files atomically (write a
-    /// temporary file, then rename it over the old one) where you can.
+    /// while it is still being written. A change that leaves a watched file
+    /// empty or missing must stay that way for at least one second (and five
+    /// polls) before it reloads, because an empty file is a valid, empty
+    /// layer: the moment between a rewrite's truncation and its write is not
+    /// loaded as "no settings". A writer slower than that can still be
+    /// caught mid-write, so replace files atomically (write a temporary
+    /// file, then rename it over the old one) where you can.
     ///
     /// A change made after the configuration was loaded but before
     /// `watch_files` is called is noticed when it gave a watched file a
@@ -265,7 +269,8 @@ impl SharedConfig {
             Debounce::stale(current)
         } else {
             Debounce::new(current)
-        };
+        }
+        .with_empty_polls(Debounce::empty_polls_for(interval));
         let thread = std::thread::Builder::new()
             .name("ferroly-config-watch".into())
             .spawn(move || {
@@ -372,6 +377,14 @@ fn fingerprint(path: &Path) -> Fingerprint {
 
 /// Whether any of `current` was modified at or after `loaded` — then the
 /// loaded configuration may predate it.
+/// Whether a watched file is empty or cannot be read: the state a non-atomic
+/// rewrite passes through.
+fn has_empty_or_missing(prints: &[Fingerprint]) -> bool {
+    prints
+        .iter()
+        .any(|print| !matches!(print, Some((len, _, _)) if *len > 0))
+}
+
 fn modified_since(current: &[Fingerprint], loaded: SystemTime) -> bool {
     current
         .iter()
@@ -379,9 +392,20 @@ fn modified_since(current: &[Fingerprint], loaded: SystemTime) -> bool {
         .any(|(_, modified, _)| modified.is_some_and(|m| m >= loaded))
 }
 
+/// How long a change that leaves a watched file empty or missing must stay
+/// put before it reloads: far longer than the gap between the truncation and
+/// the write of a non-atomic rewrite, so that gap is never loaded as an empty
+/// layer.
+const EMPTY_SETTLE: Duration = Duration::from_secs(1);
+
+/// The fewest polls [`EMPTY_SETTLE`] is made of, however long the interval.
+const EMPTY_SETTLE_MIN_POLLS: u32 = 5;
+
 /// The watcher's reload decision: reload when the files differ from what was
 /// last loaded **and** look the same as on the previous poll, so a change is
-/// only picked up once it has settled for one interval.
+/// only picked up once it has settled for one interval. A change that leaves
+/// a watched file empty or missing must look the same for `empty_polls`
+/// polls in a row instead.
 #[derive(Debug)]
 struct Debounce {
     /// What the running configuration was loaded from; `None` when unknown
@@ -389,6 +413,10 @@ struct Debounce {
     loaded: Option<Vec<Fingerprint>>,
     /// The previous poll, when it differed from `loaded`.
     pending: Option<Vec<Fingerprint>>,
+    /// How many polls in a row have repeated `pending`.
+    repeats: u32,
+    /// Repeats needed when a watched file is empty or missing (at least 1).
+    empty_polls: u32,
 }
 
 impl Debounce {
@@ -397,6 +425,8 @@ impl Debounce {
         Debounce {
             loaded: Some(loaded),
             pending: None,
+            repeats: 0,
+            empty_polls: 1,
         }
     }
 
@@ -406,7 +436,25 @@ impl Debounce {
         Debounce {
             loaded: None,
             pending: Some(seen),
+            repeats: 0,
+            empty_polls: 1,
         }
+    }
+
+    /// Requires `polls` repeated polls (at least 1) before a state with an
+    /// empty or missing watched file reloads.
+    fn with_empty_polls(mut self, polls: u32) -> Self {
+        self.empty_polls = polls.max(1);
+        self
+    }
+
+    /// The number of polls that make up [`EMPTY_SETTLE`] at `interval`.
+    fn empty_polls_for(interval: Duration) -> u32 {
+        let per_poll = interval.as_millis().max(1);
+        let polls = EMPTY_SETTLE.as_millis().div_ceil(per_poll);
+        u32::try_from(polls)
+            .unwrap_or(u32::MAX)
+            .max(EMPTY_SETTLE_MIN_POLLS)
     }
 
     /// Feeds one poll; `true` means reload now. The fingerprint is taken
@@ -414,14 +462,26 @@ impl Debounce {
     fn poll(&mut self, now: Vec<Fingerprint>) -> bool {
         if self.loaded.as_ref() == Some(&now) {
             self.pending = None;
+            self.repeats = 0;
             return false;
         }
         if self.pending.as_ref() == Some(&now) {
+            self.repeats += 1;
+            let needed = if has_empty_or_missing(&now) {
+                self.empty_polls
+            } else {
+                1
+            };
+            if self.repeats < needed {
+                return false;
+            }
             self.pending = None;
+            self.repeats = 0;
             self.loaded = Some(now);
             return true;
         }
         self.pending = Some(now);
+        self.repeats = 0;
         false
     }
 }
@@ -491,6 +551,39 @@ mod tests {
         assert!(!state.poll(print(4)));
         assert!(!state.poll(print(3)));
         assert!(!state.poll(print(3)));
+    }
+
+    #[test]
+    fn an_empty_or_missing_file_must_settle_longer() {
+        let empty = || vec![Some((0, None, Some(0)))];
+        let mut state = Debounce::new(print(1)).with_empty_polls(3);
+        // Truncated, then rewritten before the longer settle is up: the
+        // empty state is never loaded.
+        assert!(!state.poll(empty()));
+        assert!(!state.poll(empty()));
+        assert!(!state.poll(empty()));
+        assert!(!state.poll(print(2)));
+        assert!(state.poll(print(2)), "a non-empty change settles as usual");
+        // Emptied on purpose: reloads once it has stayed empty long enough.
+        assert!(!state.poll(empty()));
+        assert!(!state.poll(empty()));
+        assert!(!state.poll(empty()));
+        assert!(state.poll(empty()));
+        assert!(!state.poll(empty()));
+        // A missing file is treated the same way.
+        assert!(!state.poll(vec![None]));
+        assert!(!state.poll(vec![None]));
+        assert!(!state.poll(vec![None]));
+        assert!(state.poll(vec![None]));
+    }
+
+    #[test]
+    fn the_empty_settle_spans_a_second_and_at_least_five_polls() {
+        assert_eq!(Debounce::empty_polls_for(Duration::from_millis(20)), 50);
+        assert_eq!(Debounce::empty_polls_for(Duration::from_millis(10)), 100);
+        assert_eq!(Debounce::empty_polls_for(Duration::from_millis(300)), 5);
+        assert_eq!(Debounce::empty_polls_for(Duration::from_secs(5)), 5);
+        assert_eq!(Debounce::empty_polls_for(Duration::ZERO), 1000);
     }
 
     #[test]

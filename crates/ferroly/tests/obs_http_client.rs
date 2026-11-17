@@ -17,7 +17,7 @@ use ferroly::obs::{
     self, Context, Exporter, FinishedSpan, Level, Sampler, Span, SpanKind, Status, TraceInterceptor,
 };
 
-/// Serialises the tests (an async lock: it is held across `.await`).
+/// Runs the tests one at a time (an async lock: it is held across `.await`).
 fn globals() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))

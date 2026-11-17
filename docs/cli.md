@@ -8,7 +8,7 @@ mean" suggestions, and shell completion.
 Enable with the `cli` feature:
 
 ```toml
-ferroly = { version = "0.6", features = ["cli"] }
+ferroly = { version = "0.7", features = ["cli"] }
 ```
 
 ```rust
@@ -38,7 +38,7 @@ assert_eq!(m.get_as::<u16>("port").unwrap(), Some(9090));
 | | `subcommand_required()` | fail when no subcommand is given |
 | | `group(Group)` | add a cross-argument rule (see [Groups](#groups)) |
 | | `dynamic_flags(predicate)` | accept undeclared `--name[=value]` flags whose name satisfies `predicate` (see [Dynamic flags](#dynamic-flags)) |
-| | `dynamic_flags_with(arity)` | the same, with `arity(name) -> Option<DynamicArity>` also saying whether each flag is a `Switch`, takes a `Value` or has an `Optional` one ([arity](#dynamic-flags)) |
+| | `dynamic_flags_with(arity)` | the same, with `arity(name) -> Option<DynamicArity>` also saying whether each flag is a `Switch`, a `BoolSwitch`, takes a `Value` or has an `Optional` one ([arity](#dynamic-flags)) |
 | | `parse(args)` / `parse_env()` | parse; returns [`Matches`](#reading-results) |
 | | `parse_or_exit(args)` / `parse_env_or_exit()` / `run(args, handler)` | parse and apply the [exit-code convention](#exit-codes) |
 | | `help()` | render the usage/help text |
@@ -239,7 +239,9 @@ assert!(matches!(err, CliError::UnknownFlag { suggestion: Some(_), .. }));
   dynamic switch written directly before a positional takes it:
   `app --engine.deterministic file.txt` gives
   `("engine.deterministic", Some("file.txt"))` and no positional. Write `--name=true`,
-  put the switch last, or declare the arity with `dynamic_flags_with` (below).
+  put the switch last, or declare the arity with `dynamic_flags_with` (below): a
+  `Switch` never takes the next token, and a `BoolSwitch` takes it only when it is
+  `true` or `false`, so `--name false` also works.
 - **Names:** a name with an empty `.`-separated segment (`--engine.`, `--a..b`,
   `--.x`) is never dynamic: it is `UnknownFlag`, whatever the predicate says.
 - **Precedence:** declared flags, `--help` and `--version` win over the predicate;
@@ -263,6 +265,7 @@ assert!(matches!(err, CliError::UnknownFlag { suggestion: Some(_), .. }));
 | `DynamicArity` | `--name next` | `--name=value` |
 |---|---|---|
 | `Switch` | never takes `next` (`None`), so a positional or subcommand after it stays one | a boolean word (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`), reported as `"true"` / `"false"`; anything else is `InvalidValue` |
+| `BoolSwitch` | takes `next` only when it is `true` or `false` (ASCII case-insensitive), reported as `"true"` / `"false"`, and not when it selects a subcommand; any other token (`1`, `on`, `file.txt`, a flag, `--`) is left alone and the flag is a switch (`None`) | as for `Switch` |
 | `Value` | always takes `next`, even `-1`, `-x` or a subcommand name, but never a token starting with `--`; with none, `MissingValue` | the value |
 | `Optional` | the rule above (what `dynamic_flags` uses for every name) | the value |
 
@@ -272,6 +275,7 @@ use ferroly::cli::{Arg, Command, DynamicArity};
 let cmd = Command::new("app")
     .dynamic_flags_with(|name| match name {
         "engine.deterministic" => Some(DynamicArity::Switch),
+        "engine.warmup" => Some(DynamicArity::BoolSwitch),
         "engine.threads" | "model.context" => Some(DynamicArity::Value),
         _ => None,
     })
@@ -284,10 +288,18 @@ let m = cmd.parse(
 assert_eq!(m.dynamic()[0], ("engine.deterministic".into(), None));
 assert_eq!(m.dynamic()[1], ("model.context".into(), Some("-1".into())));
 assert_eq!(m.subcommand().unwrap().1.get("file"), Some("a.txt"));
+
+// app --engine.warmup false serve --engine.warmup b.txt
+let m = cmd.parse(
+    ["--engine.warmup", "false", "serve", "--engine.warmup", "b.txt"].map(String::from),
+).unwrap();
+assert_eq!(m.dynamic()[0], ("engine.warmup".into(), Some("false".into())));
+assert_eq!(m.dynamic()[1], ("engine.warmup".into(), None));
+assert_eq!(m.subcommand().unwrap().1.get("file"), Some("b.txt"));
 ```
 
 With the `config` feature, `ferroly::config::dynamic_arity(&schema)` builds the arity
-function from an encoded default configuration (boolean → `Switch`, other scalar or
+function from an encoded default configuration (boolean → `BoolSwitch`, other scalar or
 list → `Value`, `null` → `Optional`, section or absent → refused); see
 [`merge_cli`](config.md#merge_cli--parsed-command-lines).
 

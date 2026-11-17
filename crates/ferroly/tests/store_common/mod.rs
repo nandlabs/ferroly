@@ -1,17 +1,24 @@
 //! Shared helpers for the `store_*` suites: a loopback HTTP server built
-//! from a closure, a range-aware file responder, and scratch directories.
+//! from a closure, a range-aware file responder (both `store` only, they
+//! need the HTTP stack), and scratch directories (also for the synchronous
+//! `store_local` suite).
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "store")]
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "store")]
 use ferroly::http::{serve, BoxFuture, HttpHandler, HttpResponse, Request, StatusCode};
+#[cfg(feature = "store")]
 use tokio::net::TcpListener;
 
+#[cfg(feature = "store")]
 struct FnHandler<F>(F);
 
+#[cfg(feature = "store")]
 impl<F> HttpHandler for FnHandler<F>
 where
     F: Fn(Request) -> HttpResponse + Send + Sync + 'static,
@@ -23,6 +30,7 @@ where
 }
 
 /// Serves `handler` on an ephemeral loopback port; returns `http://127.0.0.1:<port>`.
+#[cfg(feature = "store")]
 pub async fn spawn<F>(handler: F) -> String
 where
     F: Fn(Request) -> HttpResponse + Send + Sync + 'static,
@@ -38,6 +46,7 @@ where
 
 /// Answers `req` for `body`, honouring an open-ended `Range: bytes=N-`
 /// (206, or 416 with `bytes */len` past the end).
+#[cfg(feature = "store")]
 pub fn serve_range(req: &Request, body: &[u8]) -> HttpResponse {
     match req.headers.get("range") {
         Some(r) if r.starts_with("bytes=") => {

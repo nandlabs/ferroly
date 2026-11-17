@@ -235,10 +235,14 @@ impl Check {
             Value::Object(top) if !top.is_empty() => {
                 if find(top, &segs[0]).is_none() {
                     EnvKey::Ignore
-                } else if walk(schema, segs).is_some() {
-                    EnvKey::Known
                 } else {
-                    EnvKey::Unknown
+                    match walk(schema, segs) {
+                        // The path names a section, not a key: someone
+                        // else's variable, which must not replace it.
+                        Some(Value::Object(entries)) if !entries.is_empty() => EnvKey::Ignore,
+                        Some(_) => EnvKey::Known,
+                        None => EnvKey::Unknown,
+                    }
                 }
             }
             _ => EnvKey::Known,
@@ -285,7 +289,8 @@ pub(super) enum EnvKey {
     Known,
     /// Configuration the schema does not know: report, do not read a secret.
     Unknown,
-    /// Not configuration (outside the schema's top-level keys): skip.
+    /// Not configuration (outside the schema's top-level keys, or naming a
+    /// section rather than a key): skip.
     Ignore,
 }
 
@@ -325,6 +330,8 @@ fn strip(
 ) -> Option<Value> {
     match (schema, value) {
         (Value::Object(known), Value::Object(entries)) if !known.is_empty() => {
+            let written = !entries.is_empty();
+            let reported = out.len();
             let mut kept = Vec::with_capacity(entries.len());
             for (k, v) in entries {
                 path.push(k);
@@ -342,6 +349,12 @@ fn strip(
                     }
                 }
             }
+            // A section whose every entry was a dropped null section
+            // (`server:` holding only an empty `limits:`) is "no settings
+            // here" too, at any depth. An explicit `{}` is kept.
+            if written && kept.is_empty() && out.len() == reported {
+                return None;
+            }
             Some(Value::Object(kept))
         }
         // Keys below a scalar or list leaf (`port.x` where the schema has
@@ -350,9 +363,14 @@ fn strip(
             leaf_paths(&Value::Object(entries), path, out);
             None
         }
-        // An open node, a matching leaf, or a scalar where the schema has a
-        // section (an enum variant, `null` for an `Option`): left for
-        // decoding to accept or report.
+        // A section written with nothing under it (`engine:` with every key
+        // commented out, an empty file) is "no settings here", not "erase
+        // the section": drop it, so the merge leaves the lower layers' values
+        // in place. It is not an unknown key either.
+        (Value::Object(known), Value::Null) if !known.is_empty() => None,
+        // An open node (including `null` for an `Option` that defaults to
+        // `None`), a matching leaf, or a non-null scalar where the schema has
+        // a section (an enum variant): left for decoding to accept or report.
         (_, value) => Some(value),
     }
 }
@@ -526,12 +544,26 @@ impl ConfigBuilder {
     /// - `null` (an `Option` that defaults to `None`) and an object with no
     ///   entries (a free-form map) accept any keys below them.
     ///
-    /// A value that is not an object where the schema has a section
-    /// (`APP_ENGINE=3` against an `engine` section) is not an unknown key:
-    /// it is merged, replacing the section, and left for decoding to accept
-    /// (an enum variant, `null` for an `Option`) or to report. A field whose
+    /// `null` where the schema has a section (a YAML `engine:` heading with
+    /// every key under it commented out, at any depth, or a whole layer that
+    /// is `null`) means "no settings for this section": it is dropped before
+    /// the merge, so the lower layers' values for the section stay in place,
+    /// and it is neither reported nor recorded as the origin of anything. A
+    /// section holding nothing but such null sections is dropped with them,
+    /// at any depth; an explicit `{}` is still merged.
+    /// `null` where the schema has `null` (an `Option` that defaults to
+    /// `None`), a leaf or an empty object is merged as before, so a layer can
+    /// still set an `Option` back to `None`.
+    ///
+    /// Any other value that is not an object where the schema has a section
+    /// (`engine: 3`, `--engine=3` against an `engine` section) is not an
+    /// unknown key: it is merged, replacing the section, and left for
+    /// decoding to accept (an enum variant) or to report. A field whose
     /// default encodes as a scalar but which can also hold keys (an enum
     /// whose default is a unit variant) needs `null` or `{}` in the schema.
+    /// An environment variable that names a section (`APP_ENGINE`) is not
+    /// configuration at all and is skipped (see
+    /// [`merge_env`](ConfigBuilder::merge_env)).
     ///
     /// Keys are matched exactly, so a field that decodes through an `alias`,
     /// or one left out of the encoding (`skip`, a `None` under `skip_none`),
@@ -543,7 +575,9 @@ impl ConfigBuilder {
     /// `cli` feature) whose first
     /// segment is not a top-level key of the schema (`APP_LOG`, the variables
     /// secret references point at, `--config`, `--verbose`) are not
-    /// configuration: they are dropped without being reported. Unknown keys
+    /// configuration: they are dropped without being reported; so are
+    /// environment variables naming a section rather than a key
+    /// (`APP_ENGINE`), whose `*_FILE` target is then never read. Unknown keys
     /// inside a known section are reported. Raw arguments
     /// ([`merge_args`](ConfigBuilder::merge_args)) and dynamic flags are all
     /// configuration and are always checked.
@@ -577,7 +611,7 @@ impl ConfigBuilder {
     ///     .unwrap_err();
     /// assert_eq!(
     ///     err.to_string(),
-    ///     "unknown config keys: `engine.thread` in a value layer (did you mean `engine.threads`?)"
+    ///     "unknown config key: `engine.thread` in a value layer (did you mean `engine.threads`?)"
     /// );
     /// ```
     pub fn schema(mut self, schema: Value) -> Self {
@@ -746,5 +780,159 @@ mod tests {
         let shown = key.to_string();
         assert!(shown.len() < 300, "{shown}");
         assert!(shown.contains("(1000 chars)"), "{shown}");
+    }
+
+    fn obj(pairs: Vec<(&str, Value)>) -> Value {
+        Value::Object(pairs.into_iter().map(|(k, v)| (k.into(), v)).collect())
+    }
+
+    /// `{ model: { path, context }, port, opt: null, labels: {}, a: { b: { c } } }`
+    fn env_check() -> Check {
+        let mut check = Check::default();
+        check.set_schema(obj(vec![
+            (
+                "model",
+                obj(vec![
+                    ("path", Value::Str(String::new())),
+                    ("context", Value::Int(0)),
+                ]),
+            ),
+            ("port", Value::Int(0)),
+            ("opt", Value::Null),
+            ("labels", obj(vec![])),
+            ("a", obj(vec![("b", obj(vec![("c", Value::Int(1))]))])),
+        ]));
+        check
+    }
+
+    fn classify(check: &Check, segs: &[&str]) -> EnvKey {
+        let segs: Vec<String> = segs.iter().map(|s| s.to_string()).collect();
+        check.classify_env(&segs)
+    }
+
+    #[test]
+    fn env_key_naming_a_section_is_ignored() {
+        let check = env_check();
+        assert_eq!(classify(&check, &["model"]), EnvKey::Ignore);
+        assert_eq!(classify(&check, &["a"]), EnvKey::Ignore);
+        assert_eq!(classify(&check, &["a", "b"]), EnvKey::Ignore);
+    }
+
+    #[test]
+    fn env_key_naming_a_leaf_is_known() {
+        let check = env_check();
+        assert_eq!(classify(&check, &["model", "path"]), EnvKey::Known);
+        assert_eq!(classify(&check, &["port"]), EnvKey::Known);
+        assert_eq!(classify(&check, &["a", "b", "c"]), EnvKey::Known);
+    }
+
+    #[test]
+    fn env_key_reaching_an_open_node_is_known() {
+        let check = env_check();
+        assert_eq!(classify(&check, &["opt"]), EnvKey::Known);
+        assert_eq!(classify(&check, &["labels"]), EnvKey::Known);
+        assert_eq!(classify(&check, &["labels", "anything"]), EnvKey::Known);
+    }
+
+    #[test]
+    fn env_key_below_a_leaf_or_missing_is_unknown() {
+        let check = env_check();
+        assert_eq!(classify(&check, &["port", "x"]), EnvKey::Unknown);
+        assert_eq!(classify(&check, &["model", "pth"]), EnvKey::Unknown);
+        assert_eq!(classify(&check, &["log"]), EnvKey::Ignore);
+    }
+
+    #[test]
+    fn env_classification_without_schema_is_known() {
+        let check = Check::default();
+        assert_eq!(classify(&check, &["model"]), EnvKey::Known);
+        let mut check = Check::default();
+        check.set_schema(obj(vec![]));
+        assert_eq!(classify(&check, &["model"]), EnvKey::Known);
+        let mut check = Check::default();
+        check.set_schema(Value::Null);
+        assert_eq!(classify(&check, &["model"]), EnvKey::Known);
+    }
+
+    #[test]
+    fn strip_drops_null_where_the_schema_has_a_section() {
+        let section = obj(vec![("threads", Value::Int(4))]);
+        let mut out = Vec::new();
+        assert_eq!(
+            strip(Value::Null, &section, &mut Vec::new(), &mut out),
+            None
+        );
+        assert!(out.is_empty(), "{out:?}");
+        // Nested: the null child is dropped, the section around it kept
+        // while it still holds something.
+        let schema = obj(vec![(
+            "server",
+            obj(vec![("limits", section.clone()), ("port", Value::Int(0))]),
+        )]);
+        let layer = obj(vec![(
+            "server",
+            obj(vec![("limits", Value::Null), ("port", Value::Int(1))]),
+        )]);
+        assert_eq!(
+            strip(layer, &schema, &mut Vec::new(), &mut out),
+            Some(obj(vec![("server", obj(vec![("port", Value::Int(1))]))]))
+        );
+        assert!(out.is_empty(), "{out:?}");
+        // A non-empty section left empty only by dropped null sections is
+        // dropped too, at any depth, up to the layer itself.
+        let layer = obj(vec![("server", obj(vec![("limits", Value::Null)]))]);
+        assert_eq!(strip(layer, &schema, &mut Vec::new(), &mut out), None);
+        assert!(out.is_empty(), "{out:?}");
+        let deep = obj(vec![("a", obj(vec![("b", schema.clone())]))]);
+        let layer = obj(vec![(
+            "a",
+            obj(vec![(
+                "b",
+                obj(vec![("server", obj(vec![("limits", Value::Null)]))]),
+            )]),
+        )]);
+        assert_eq!(strip(layer, &deep, &mut Vec::new(), &mut out), None);
+        assert!(out.is_empty(), "{out:?}");
+        // Beside a kept sibling, only the emptied section goes.
+        let schema = obj(vec![
+            ("server", obj(vec![("limits", section.clone())])),
+            ("port", Value::Int(0)),
+        ]);
+        let layer = obj(vec![
+            ("server", obj(vec![("limits", Value::Null)])),
+            ("port", Value::Int(1)),
+        ]);
+        assert_eq!(
+            strip(layer, &schema, &mut Vec::new(), &mut out),
+            Some(obj(vec![("port", Value::Int(1))]))
+        );
+        assert!(out.is_empty(), "{out:?}");
+        // An explicit `{}` still passes, nested or as the whole layer.
+        let layer = obj(vec![("server", obj(vec![]))]);
+        assert_eq!(
+            strip(layer.clone(), &schema, &mut Vec::new(), &mut out),
+            Some(layer)
+        );
+        assert_eq!(
+            strip(obj(vec![]), &schema, &mut Vec::new(), &mut out),
+            Some(obj(vec![]))
+        );
+        // A section emptied by an unknown key is kept as before (the key is
+        // reported).
+        let layer = obj(vec![("server", obj(vec![("bogus", Value::Int(1))]))]);
+        assert_eq!(
+            strip(layer, &schema, &mut Vec::new(), &mut out),
+            Some(obj(vec![("server", obj(vec![]))]))
+        );
+        assert_eq!(out, vec![vec!["server".to_string(), "bogus".to_string()]]);
+        out.clear();
+        // `null` for an `Option`, a leaf or a free-form map still passes.
+        for node in [Value::Null, Value::Int(1), obj(vec![])] {
+            assert_eq!(
+                strip(Value::Null, &node, &mut Vec::new(), &mut out),
+                Some(Value::Null)
+            );
+        }
+        assert!(out.is_empty(), "{out:?}");
     }
 }

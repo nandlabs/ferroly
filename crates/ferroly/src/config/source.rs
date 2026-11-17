@@ -1,6 +1,7 @@
 //! Configuration sources: files, environment variables and raw arguments.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use ferroly::codec::{json, toml, xml, yaml, Limits, Value};
@@ -37,28 +38,114 @@ pub(super) fn usable_key(segs: &[String]) -> bool {
     !segs.is_empty() && segs.len() <= MAX_KEY_DEPTH && !segs.iter().any(String::is_empty)
 }
 
-#[derive(Clone, Copy)]
-enum FileFormat {
+/// A config file format, chosen from the file extension.
+///
+/// Give a list of them to [`ConfigBuilder::formats`](super::ConfigBuilder::formats)
+/// to restrict which files a builder loads.
+///
+/// ```
+/// use std::path::Path;
+/// use ferroly::config::FileFormat;
+///
+/// assert_eq!(FileFormat::from_path(Path::new("app.YML")), Some(FileFormat::Yaml));
+/// assert_eq!(FileFormat::Properties.extensions(), ["properties", "props", "env"]);
+/// assert_eq!(FileFormat::from_path(Path::new("app.ini")), None);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FileFormat {
+    /// JSON: `.json`.
     Json,
+    /// YAML: `.yaml`, `.yml`.
     Yaml,
+    /// TOML: `.toml`.
     Toml,
+    /// XML: `.xml`.
     Xml,
+    /// Java-style properties (`key = value`, dots nest): `.properties`,
+    /// `.props`, `.env`.
     Properties,
 }
 
+impl FileFormat {
+    /// Every format, in probing order (the order in which
+    /// [`merge_profile`](super::ConfigBuilder::merge_profile) tries their
+    /// extensions).
+    pub fn all() -> &'static [FileFormat] {
+        &[
+            FileFormat::Json,
+            FileFormat::Yaml,
+            FileFormat::Toml,
+            FileFormat::Xml,
+            FileFormat::Properties,
+        ]
+    }
+
+    /// The format the extension of `path` maps to, ignoring ASCII case
+    /// (`app.YML` is YAML); `None` for a missing or unknown extension.
+    pub fn from_path(path: &Path) -> Option<FileFormat> {
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        FileFormat::all()
+            .iter()
+            .copied()
+            .find(|f| f.extensions().contains(&ext.as_str()))
+    }
+
+    /// The extensions of this format, without the dot, in probing order:
+    /// `Json` `["json"]`, `Yaml` `["yaml", "yml"]`, `Toml` `["toml"]`, `Xml`
+    /// `["xml"]`, `Properties` `["properties", "props", "env"]`.
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            FileFormat::Json => &["json"],
+            FileFormat::Yaml => &["yaml", "yml"],
+            FileFormat::Toml => &["toml"],
+            FileFormat::Xml => &["xml"],
+            FileFormat::Properties => &["properties", "props", "env"],
+        }
+    }
+}
+
 fn format_of(path: &Path) -> Option<FileFormat> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("json") => Some(FileFormat::Json),
-        Some("yaml") | Some("yml") => Some(FileFormat::Yaml),
-        Some("toml") => Some(FileFormat::Toml),
-        Some("xml") => Some(FileFormat::Xml),
-        Some("properties") | Some("props") | Some("env") => Some(FileFormat::Properties),
-        _ => None,
+    FileFormat::from_path(path)
+}
+
+/// The extensions of the `allowed` formats (every format for `None`),
+/// without the dot, in [`EXTENSIONS`] order.
+pub(super) fn allowed_extensions(allowed: Option<&[FileFormat]>) -> Vec<&'static str> {
+    EXTENSIONS
+        .iter()
+        .copied()
+        .filter(|ext| {
+            allowed.map_or(true, |list| {
+                list.iter().any(|f| f.extensions().contains(ext))
+            })
+        })
+        .collect()
+}
+
+/// [`ConfigError::FormatNotAllowed`] for `path`, listing the extensions of
+/// `allowed`.
+pub(super) fn not_allowed(path: &Path, allowed: &[FileFormat]) -> ConfigError {
+    ConfigError::FormatNotAllowed {
+        path: path.display().to_string(),
+        allowed: allowed_extensions(Some(allowed))
+            .iter()
+            .map(|e| format!(".{e}"))
+            .collect(),
+    }
+}
+
+/// Fails with [`ConfigError::FormatNotAllowed`] when `path` has a known
+/// extension whose format is not in `allowed` (`None` allows every format).
+/// An unknown extension passes: loading reports it as
+/// [`ConfigError::UnsupportedFormat`].
+pub(super) fn check_allowed(
+    path: &Path,
+    allowed: Option<&[FileFormat]>,
+) -> Result<(), ConfigError> {
+    match (format_of(path), allowed) {
+        (Some(format), Some(list)) if !list.contains(&format) => Err(not_allowed(path, list)),
+        _ => Ok(()),
     }
 }
 
@@ -78,17 +165,32 @@ pub(super) fn with_extension(path: &Path, ext: &str) -> PathBuf {
 /// Loads and parses a config file, format inferred from the extension.
 ///
 /// With `optional`, a file that does not exist yields `Ok(None)`; every other
-/// failure (unknown extension, unreadable file, malformed content) is an
-/// error either way.
-pub(super) fn load_file(path: &Path, optional: bool) -> Result<Option<Value>, ConfigError> {
+/// failure (unknown extension, a format not in `allowed`, unreadable file,
+/// malformed content) is an error either way. `allowed: None` accepts every
+/// format.
+pub(super) fn load_file(
+    path: &Path,
+    optional: bool,
+    allowed: Option<&[FileFormat]>,
+) -> Result<Option<Value>, ConfigError> {
     // Validate the extension before touching the filesystem.
     let format = format_of(path)
         .ok_or_else(|| ConfigError::UnsupportedFormat(path.display().to_string()))?;
+    if let Some(list) = allowed.filter(|list| !list.contains(&format)) {
+        return Err(not_allowed(path, list));
+    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(io(path, e)),
     };
+    // An empty or whitespace-only file (after an optional UTF-8 BOM, which
+    // every parser accepts) is "no settings" in every format; the JSON and
+    // XML parsers would otherwise reject it as truncated.
+    let body = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Some(Value::Object(Vec::new())));
+    }
     let parsed = match format {
         FileFormat::Json => json::from_slice(&bytes),
         FileFormat::Yaml => yaml::from_str(text(path, &bytes)?),
@@ -96,6 +198,12 @@ pub(super) fn load_file(path: &Path, optional: bool) -> Result<Option<Value>, Co
         FileFormat::Xml => xml::from_str(text(path, &bytes)?),
         FileFormat::Properties => Ok(parse_properties(text(path, &bytes)?)),
     };
+    // A comment-only document (or a JSON `null`) is "no settings" too, not a
+    // `null` that would replace the whole configuration.
+    let parsed = parsed.map(|v| match v {
+        Value::Null => Value::Object(Vec::new()),
+        v => v,
+    });
     parsed.map(Some).map_err(|e| ConfigError::Parse {
         path: path.display().to_string(),
         message: scrub(&e.to_string(), &String::from_utf8_lossy(&bytes)),
@@ -217,7 +325,48 @@ pub(super) struct Setting {
     pub(super) source: Source,
 }
 
-/// Reads the environment variables starting with `prefix` into settings.
+/// Turns environment variables (the process environment's `vars_os()` or an
+/// injected list) into the `(name, value)` pairs [`read_env`] reads: sorted
+/// by name, one entry per name, all valid UTF-8.
+///
+/// - Sorted by name, so the result does not depend on the input order. On a
+///   scalar-vs-nested collision (`APP_DB` and `APP_DB__HOST`) the nested form
+///   wins, since its longer name sorts last and is applied last; for the same
+///   reason `APP_X_FILE` wins over `APP_X`.
+/// - A name given more than once keeps its last value in input order, as if
+///   the variables had been set one after another.
+/// - A variable whose name or value is not valid UTF-8 cannot be a config
+///   value; it is skipped instead of panicking the way `env::vars()` would.
+pub(super) fn collect_vars<I, K, V>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<OsString>,
+    V: Into<OsString>,
+{
+    // A non-UTF-8 name can never equal a UTF-8 one, so it is dropped first;
+    // the value is checked after de-duplication, so a last occurrence with a
+    // non-UTF-8 value removes the variable, as setting it would.
+    let mut named: Vec<(String, OsString)> = vars
+        .into_iter()
+        .filter_map(|(k, v)| Some((k.into().into_string().ok()?, v.into())))
+        .collect();
+    // Stable: equal names stay in input order, so the last one is the latest.
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut unique: Vec<(String, OsString)> = Vec::with_capacity(named.len());
+    for (name, value) in named {
+        match unique.last_mut() {
+            Some(last) if last.0 == name => last.1 = value,
+            _ => unique.push((name, value)),
+        }
+    }
+    unique
+        .into_iter()
+        .filter_map(|(k, v)| Some((k, v.into_string().ok()?)))
+        .collect()
+}
+
+/// Reads the variables of `vars` (from [`collect_vars`]) starting with
+/// `prefix` into settings.
 ///
 /// `base` is the configuration merged so far; it is only consulted for
 /// [`EnvOptions::case_insensitive`] key matching. `classify` decides, before
@@ -227,23 +376,11 @@ pub(super) struct Setting {
 /// `null`).
 pub(super) fn read_env(
     prefix: &str,
+    vars: Vec<(String, String)>,
     opts: &EnvOptions,
     base: &Value,
     classify: &dyn Fn(&[String]) -> EnvKey,
 ) -> Result<Vec<Setting>, ConfigError> {
-    // Variables whose name or value is not valid UTF-8 cannot be config
-    // values; skip them instead of panicking the way `env::vars()` would.
-    //
-    // Process in sorted key order so the result is deterministic regardless
-    // of the environment's arbitrary iteration order. On a scalar-vs-nested
-    // collision (`APP_DB` and `APP_DB__HOST`) the nested form wins, since its
-    // longer key sorts last and is applied last; for the same reason
-    // `APP_X_FILE` wins over `APP_X`.
-    let mut vars: Vec<(String, String)> = std::env::vars_os()
-        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-        .collect();
-    vars.sort();
-
     let mut out = Vec::new();
     for (name, raw) in vars {
         let Some(rest) = name.strip_prefix(prefix) else {
@@ -678,5 +815,42 @@ mod tests {
             scrub("got aaa-bbb-ccc!", content),
             "got <redacted>! (line 2)"
         );
+    }
+
+    #[test]
+    fn file_format_tables_agree() {
+        let flat: Vec<&str> = FileFormat::all()
+            .iter()
+            .flat_map(|f| f.extensions().iter().copied())
+            .collect();
+        assert_eq!(flat, EXTENSIONS);
+        assert_eq!(allowed_extensions(None), EXTENSIONS);
+    }
+
+    #[test]
+    fn file_format_from_path_is_case_insensitive() {
+        assert_eq!(
+            FileFormat::from_path(Path::new("A.YML")),
+            Some(FileFormat::Yaml)
+        );
+        assert_eq!(
+            FileFormat::from_path(Path::new("x.env")),
+            Some(FileFormat::Properties)
+        );
+        assert_eq!(FileFormat::from_path(Path::new("x.ini")), None);
+        assert_eq!(FileFormat::from_path(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn collect_vars_sorts_and_keeps_the_last_duplicate() {
+        let vars = collect_vars([("B", "1"), ("A", "2"), ("B", "3"), ("A", "4")]);
+        assert_eq!(
+            vars,
+            [
+                ("A".to_string(), "4".to_string()),
+                ("B".to_string(), "3".to_string())
+            ]
+        );
+        assert!(collect_vars(Vec::<(String, String)>::new()).is_empty());
     }
 }

@@ -65,11 +65,11 @@ service Echo {
 
 ```toml
 [dependencies]
-ferroly = { version = "0.6", features = ["grpc"] }
+ferroly = { version = "0.7", features = ["grpc"] }
 tokio = { version = "1", features = ["full"] }
 
 [build-dependencies]
-ferroly = { version = "0.6", default-features = false, features = ["grpc"] }
+ferroly = { version = "0.7", default-features = false, features = ["grpc"] }
 ```
 
 ```rust,ignore

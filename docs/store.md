@@ -2,31 +2,37 @@
 
 [← Docs index](README.md) · [← Project README](../README.md)
 
-**Features:** `store` (the cache), `store-s3`, `store-hf`, `store-oci` (one per adapter) ·
+**Features:** `store-local` (the synchronous core), `store` (the async cache), `store-s3`, `store-hf`, `store-oci` (one per adapter) ·
 **Module:** `ferroly::store`
 
 Fetching remote artifacts — model weights, container layers, datasets, release
-bundles — into a verified local cache. The core is [`Cache`](#cache), a
-directory of files keyed by SHA-256 that verifies every file before it becomes
-visible, resumes interrupted downloads, and is a no-op on a hit. Three adapters
-feed it:
+bundles — into a verified local cache, and keeping blobs for a local
+content-addressed registry. The core is [`LocalStore`](#localstore-store-local),
+a directory of files keyed by SHA-256 with a synchronous API and no tokio or
+HTTP: it verifies every file before it becomes visible, lists its objects,
+resolves short digests, re-hashes without deleting, and offers a cross-process
+lock. [`Cache`](#cache) layers async downloads on it: resumes interrupted
+downloads, and is a no-op on a hit. Three adapters feed it:
 
 | Feature | Module | Source | Auth |
 |---|---|---|---|
-| `store` | `ferroly::store` | anything that yields bytes; plain HTTP(S) URLs | headers you add |
+| `store-local` | `ferroly::store` (`LocalStore`, `Digest`, `Layout`, `StoreLock`) | local files and readers; synchronous | — |
+| `store` | `ferroly::store` (+ `Cache`, `Fetched`) | anything that yields bytes; plain HTTP(S) URLs | headers you add |
 | `store-s3` | `ferroly::store::s3` | S3 and S3-compatible storage (MinIO, LocalStack, R2, Ceph) | AWS Signature Version 4 |
 | `store-hf` | `ferroly::store::hf` | Hugging Face Hub files (models, datasets, spaces) | bearer token |
 | `store-oci` | `ferroly::store::oci` | OCI / Docker registries (Distribution Spec v2) | registry token flow, basic |
 
-Everything is built on [`http`](http.md) (streaming responses, ranges) and
-[`hash`](hash.md) (streaming SHA-256, HMAC-SHA256, hex, base64, `Secret`). The
-S3 and OCI adapters also use [`codec`](codec.md) to read XML listings and JSON
-manifests. No dependency beyond those.
+`store-local` is built on [`hash`](hash.md) (streaming SHA-256, hex) and
+[`fsutils`](fsutils.md) (`FileLock`) only. `store` adds [`http`](http.md)
+(streaming responses, ranges); the S3 and OCI adapters also use
+[`codec`](codec.md) to read XML listings and JSON manifests. No dependency
+beyond those.
 
 ## Contents
 
 - [Enabling](#enabling)
 - [Quick start](#quick-start)
+- [LocalStore](#localstore-store-local) — [layouts](#layouts), [API](#localstore-api), [the store lock](#the-store-lock)
 - [Cache](#cache) — layout, [semantics](#semantics), [API](#cache-api), [fetch callbacks](#fetch-callbacks-fetched)
 - [Digest](#digest)
 - [S3 adapter](#s3-adapter-store-s3) — [SigV4](#sigv4-signing), [credentials](#credentials)
@@ -40,13 +46,16 @@ manifests. No dependency beyond those.
 ## Enabling
 
 ```toml
-# the cache only (with plain-URL fetching)
-ferroly = { version = "0.6", features = ["store"] }
+# the synchronous local store only: no tokio, no rustls, no HTTP
+ferroly = { version = "0.7", default-features = false, features = ["store-local"] }
+# the async cache (with plain-URL fetching)
+ferroly = { version = "0.7", features = ["store"] }
 # plus the adapters you use
-ferroly = { version = "0.6", features = ["store-s3", "store-hf", "store-oci"] }
+ferroly = { version = "0.7", features = ["store-s3", "store-hf", "store-oci"] }
 ```
 
-`store` pulls in `http` and `hash`; `store-s3` and `store-oci` add `codec`.
+`store-local` pulls in `hash` and `fsutils`; `store` adds `store-local` and
+`http`; `store-s3` and `store-oci` add `codec`.
 
 ## Quick start
 
@@ -92,12 +101,121 @@ let image = oci.pull(&cache, &Reference::parse("ghcr.io/org/model:v1")?).await?;
 # }
 ```
 
+## LocalStore (`store-local`)
+
+```rust
+use ferroly::store::{Layout, LocalStore, ObjectStatus};
+
+# let dir = std::env::temp_dir().join(format!("ferroly-doc-md-{}", std::process::id()));
+let store = LocalStore::open_with(&dir, Layout::flat("blobs")?)?; // <root>/blobs/sha256/<hex>
+let blob = store.insert_bytes(b"model weights")?;
+
+// Short references, as `docker images` prints them.
+let short = format!("sha256:{}", &blob.digest.hex()[..12]);
+assert_eq!(store.resolve_prefix(&short)?, blob.digest);
+
+// A read-only integrity report: nothing is deleted.
+for (digest, status) in store.check_all()? {
+    if let ObjectStatus::Corrupt { actual, .. } = status {
+        println!("CORRUPT {digest} (now hashes to {actual})");
+    }
+}
+
+// Exclude other processes across "check refs + delete blob".
+let lock = store.lock()?;
+assert!(lock.remove(&blob.digest)?);
+drop(lock);
+# std::fs::remove_dir_all(&dir).unwrap();
+# Ok::<(), ferroly::store::StoreError>(())
+```
+
+`LocalStore` is the synchronous core: every method blocks, there is no
+runtime, no HTTP stack, and nothing beyond `hash` and `fsutils`. It is cheap
+to clone. `Cache` (below) is built on it; both can work on one directory at
+once, in one process or several (`Cache::local`, `Cache::from_local`,
+`From<LocalStore> for Cache`).
+
+### Layouts
+
+| `Layout` | Objects at | Notes |
+|---|---|---|
+| `Layout::Fanout` (default) | `<root>/sha256/<2 hex>/<64 hex>` | The layout of every cache created before 0.7. |
+| `Layout::flat(prefix)` | `<root>/<prefix>/sha256/<64 hex>` | One flat directory, e.g. `blobs/sha256/<hex>` for an existing registry layout. |
+
+Whatever the layout, `tmp/`, `partial/` and `.lock` stay directly in the
+root (so commits are atomic renames on one filesystem). `Layout::flat` (and
+`open_with`, for a `Layout::Flat` built directly) rejects with
+`StoreError::Config` a prefix that is empty, absolute, contains `..` or a
+root / drive component, has a component ending in `.` or a space (Windows
+drops those, so `tmp.` would name `tmp` there), or starts with `tmp`,
+`partial` or `.lock` (ignoring ASCII case); `.` components are dropped. **No migration is performed**: opening a fan-out
+store with a flat layout (or the other way round) sees an empty store; copy
+across with `list` + `insert_path`. `Layout` is `#[non_exhaustive]`.
+
+### LocalStore API
+
+| Method | Description |
+|---|---|
+| `LocalStore::open(dir)` / `open_with(dir, Layout)` | Opens or creates the store (the objects directory, `tmp/`, `partial/`). |
+| `.with_max_object_bytes(Option<u64>)`, `max_object_bytes()` | Cap on any one insert (default none). |
+| `root()`, `layout()`, `path_for(&Digest)` | Where things are (or would be). |
+| `get(&Digest) -> Option<PathBuf>` / `contains` | The committed object, if present (an existence check). |
+| `list() -> Vec<ObjectInfo>` | Every committed object, sorted by digest: `ObjectInfo { digest, path, size, modified }`. Skips anything that is not a regular file named exactly 64 lower-case hex digits (and, fan-out, in the fan directory of its first two digits). A missing objects directory is an empty list. |
+| `resolve_prefix(&str) -> Digest` | `sha256:<hex prefix>` or a bare prefix, either case, at least `MIN_PREFIX_HEX` (12) digits, to the one stored digest starting with it. Only what `list` reports counts (a link or stray file at an object or fan-directory path is ignored). Names only, nothing hashed; fan-out reads one fan directory. |
+| `resolve_prefix_min(&str, min_hex)` | The same with another minimum (clamped to `1..=64`). |
+| `check(&Digest) -> ObjectStatus` | Re-hash without modifying anything: `Intact { size }`, `Missing`, or `Corrupt { actual, size }`. A non-file at the object path is `Missing`, as for `get`. |
+| `check_all() -> Vec<(Digest, ObjectStatus)>` | `check` for every listed object, sorted; stops at the first I/O error; an object removed meanwhile is `Missing`. |
+| `insert_reader(impl Read) -> Stored` / `insert_bytes(&[u8])` | Stream content in, hashing; committed under the digest it has. |
+| `insert_verified(impl Read, &Digest, Option<u64>) -> PathBuf` | The same, but only content hashing to the digest (and of the given size) is kept: `DigestMismatch` / `SizeMismatch` otherwise. |
+| `insert_path(path) -> Stored` | Copy a local file in (hashing while copying); the source is never moved, linked or modified. |
+| `remove(&Digest)`, `evict_to(max_bytes)` | Delete an object / evict oldest first. **Take the store lock** (wait for another holder) when there is something to delete; `evict_to` lists again under the lock. With nothing to delete (`remove` of an absent object, `evict_to` when the objects already fit) they return without the lock, so they also work on a store root this user may not write to. |
+| `usage()`, `purge_temp(older_than)` | As on `Cache`. `purge_temp` never removes a write in progress in this process (sync or async). |
+| `lock()`, `try_lock()`, `lock_timeout(Duration)` | The cross-process store lock (below). |
+
+Inserts write a uniquely named `0600` file under `tmp/` (`create_new`),
+`fsync` it, then commit it: create the object's directory, discard the copy if
+the object is already there, otherwise rename it into place and `fsync` the
+directory (Unix, best effort). The same commit code serves `Cache`.
+
+### The store lock
+
+`lock()` returns a `StoreLock`: an exclusive OS file lock
+([`fsutils::FileLock`](fsutils.md)) on `<root>/.lock`, released on drop, by
+`release()`, or when the process ends (a dead holder never blocks anyone). The
+file is created on first use and **never deleted**; `list`, `purge_temp` and
+`evict_to` never touch it.
+
+| Operation | Takes the lock? |
+|---|---|
+| `remove`, `evict_to` (`LocalStore` and `Cache`), the deletion inside `Cache::verify` | yes, when they have something to delete: they wait for a holder |
+| `StoreLock::remove`, `StoreLock::evict_to`, `StoreLock::repair` (check, delete if corrupt) | run under the guard you hold |
+| inserts, commits, `get`, `list`, `check`, `resolve_prefix`, `purge_temp` | no (a commit is an idempotent atomic rename) |
+
+`FileLock` is **not reentrant**: calling `LocalStore::remove` while the same
+thread holds a `StoreLock` on that store waits forever; use the guard's
+methods. The registry pattern:
+
+- **pull** — fetch / insert the blob without the lock (downloads can be long);
+  `lock()`; if `!contains(digest)` (a concurrent GC removed it) insert again;
+  write the reference; drop the lock.
+- **rm / gc** — `lock()`; read the references; `StoreLock::remove` every
+  digest no reference names; drop the lock.
+
+Where `FileLock` is unsupported every acquire fails with `StoreError::Io`
+(kind `Unsupported`), and so do `remove` / `evict_to` whenever they have
+something to delete. On Linux NFS mounts a
+second acquire from the same process succeeds (see the `FileLock` docs): take
+the lock at most once per process there. `lock_timeout` fails with
+`StoreError::Locked`. `Cache::lock().await` takes it on a blocking thread.
+
 ## Cache
 
 ```text
-<root>/sha256/ab/abcdef0123…   committed objects; the file name is the full hex digest
+<root>/sha256/ab/abcdef0123…   committed objects (Layout::Fanout); the file name is the full hex digest
+<root>/<prefix>/sha256/abcd…   committed objects (Layout::Flat)
 <root>/tmp/                    downloads in progress, one uniquely named file each
 <root>/partial/                interrupted downloads, parked for resumption
+<root>/.lock                   the store lock, created by the first remove / evict_to / corrupt verify that deletes something
 ```
 
 ### Semantics
@@ -112,7 +230,7 @@ let image = oci.pull(&cache, &Reference::parse("ghcr.io/org/model:v1")?).await?;
 | **Resume** | The next fetch of that digest claims the parked file, re-hashes it, and calls the callback with its length as the offset. Over HTTP that is `Range: bytes=<n>-`. A `206` continues the file; a `200` (range ignored) starts it over; a `416` means it was already complete. |
 | **Stale partial** | If an attempt that resumed a parked prefix is rejected (mismatch, a range that starts elsewhere, a total smaller than the prefix), the cache retries **once** from byte 0 before failing. An attempt the source already started over (it ignored the range) is not retried. |
 | **Concurrent, one process** | Fetches of the same digest through one `Cache` (or its clones) run one at a time: the first downloads, the others wait and get the hit. Different digests run in parallel. A waiter that is cancelled leaves the queue cleanly. A source that stalls holds the queue until it fails: bound it with `with_stall_timeout` / `with_fetch_timeout` (an HTTP source is also bounded by its client's timeouts). |
-| **Concurrent, several processes** | No cross-process lock. Each fetch writes its own temp file (`create_new`, named from the process id, a counter and the time — no randomness needed, so it works on every platform). The first to finish renames its file into place; the others see the object and delete theirs. A parked partial is claimed by renaming it, which only one claimant can win. Nobody reads or writes another fetch's file. |
+| **Concurrent, several processes** | Downloads take no cross-process lock. Each fetch writes its own temp file (`create_new`, named from the process id, a counter and the time — no randomness needed, so it works on every platform). The first to finish renames its file into place; the others see the object and delete theirs. A parked partial is claimed by renaming it, which only one claimant can win. Nobody reads or writes another fetch's file. |
 | **Permissions** | On Unix the directories the cache creates are `0700` and its files `0600` (before the umask): cached models, layers and objects are often private. An existing root keeps its own permissions; `Cache::open` removes group and other access from the `sha256/`, `tmp/` and `partial/` directories it owns, so a cache created by 0.5 or earlier (directories `0755`, objects `0644`) is no longer readable by others (skipped, without error, where this user may not change them, and never through a symlink). |
 | **Durability** | Content is `fsync`ed before the rename, and on Unix the directory after it. A crash can lose a just-committed entry, never corrupt one. |
 
@@ -121,6 +239,8 @@ let image = oci.pull(&cache, &Reference::parse("ghcr.io/org/model:v1")?).await?;
 | Method | Description |
 |---|---|
 | `Cache::open(dir) -> Result<Cache>` | Opens or creates the cache (creates `sha256/`, `tmp/`, `partial/`). Sync. |
+| `Cache::open_with(dir, Layout)` | The same with a [layout](#layouts). |
+| `Cache::from_local(LocalStore)` / `From<LocalStore>`, `local()`, `layout()` | The async cache over a `LocalStore`, and back. The object size cap is shared. |
 | `.with_max_object_bytes(Option<u64>)` | Cap on any one download (default none); a larger one is stopped as soon as it passes the cap. Without a cap, a source that declares no size can fill the disk: set one for untrusted sources. |
 | `.with_stall_timeout(Option<Duration>)` | Stop a download when the source sends nothing for this long (default none). The bytes are parked; the error is `Interrupted`. |
 | `.with_fetch_timeout(Option<Duration>)` | Bound each miss, all attempts included, from the first request to the last byte (default none). Time queued behind another fetch of the digest does not count. |
@@ -131,12 +251,36 @@ let image = oci.pull(&cache, &Reference::parse("ghcr.io/org/model:v1")?).await?;
 | `get_or_fetch_sized(&Digest, size, fetch)` | The same for content of a known size (an OCI descriptor, `X-Linked-Size`): stopped as soon as it runs past `size`, rejected at any other size. |
 | `fetch_url(&Client, url, &Digest)` | `get_or_fetch` over a plain `GET`. |
 | `insert(fetch) -> Result<Stored>` / `insert_bytes(data)` | Store content whose digest is not known in advance; it is hashed on the way in and committed under the digest it has. No resume (nothing to key a partial by). |
-| `verify(&Digest) -> Result<bool>` | Re-hash a committed object; a corrupted one is deleted (`false`). |
-| `remove(&Digest)` | Delete an object and its parked partial. |
+| `verify(&Digest) -> Result<bool>` | Re-hash a committed object; a corrupted one is deleted (`false`), under the store lock after a second check (see [cancellation](#destructive-calls-and-cancellation)). |
+| `check(&Digest)`, `check_all()` | Re-hash without deleting (`ObjectStatus`). |
+| `list()`, `resolve_prefix(&str)`, `resolve_prefix_min(&str, n)` | As on `LocalStore`. |
+| `lock() -> Result<StoreLock>` | The store lock, taken on a blocking thread. |
+| `remove(&Digest)` | Delete an object and its parked partial (takes the store lock when there is something to delete; see [cancellation](#destructive-calls-and-cancellation)). |
 | `partial_len(&Digest) -> Option<u64>` | Size of a parked partial download. |
 | `purge_temp(older_than)` | Delete temp and partial files not modified for `older_than` — leftovers of processes that died mid-download. Objects are never touched. A download running in this process is never removed, whatever its age; one in another process is judged by its modification time (refreshed when a partial is claimed, and by every write), so pick an age well above the longest a source may stall. |
 | `usage() -> Result<u64>` | Bytes held by committed objects. |
-| `evict_to(max_bytes) -> Result<Evicted>` | Delete committed objects oldest first (by modification time) until the rest fit in `max_bytes`. `Evicted { removed, freed, remaining }`. |
+| `evict_to(max_bytes) -> Result<Evicted>` | Delete committed objects oldest first (by modification time) until the rest fit in `max_bytes` (takes the store lock when something must go). `Evicted { removed, freed, remaining }`. |
+
+`remove`, `verify`, `usage`, `evict_to`, `purge_temp` and the new
+`list` / `resolve_prefix` / `check` / `check_all` / `lock` run the
+`LocalStore` call on one blocking thread (`spawn_blocking`).
+
+#### Destructive calls and cancellation
+
+`remove`, `evict_to` and `verify` (when it finds a corrupt object) never park
+a blocking thread on the store lock until another holder lets go. Each attempt
+is one blocking-thread call that waits at most 50 ms for the lock; while
+another holder has it, the future tries again. So:
+
+- uncontended, the whole call is still one blocking-thread hop;
+- if the future is dropped (a `tokio::time::timeout`, a `select!`, an aborted
+  task) while waiting for the lock, **nothing is deleted**, then or later, and
+  runtime shutdown waits at most one 50 ms slice for it;
+- once the lock is taken, the deletion runs to completion even if the future
+  is dropped.
+
+`Cache::lock().await` is different: it waits on a blocking thread, and a
+dropped call takes the lock and releases it again once it comes free.
 
 `Stored { digest, path }` is what `insert` (and the adapters' `download`s)
 return.
@@ -185,7 +329,7 @@ A stream is anything implementing `ByteStream` (`next_chunk() -> BoxFuture<Resul
 ## Digest
 
 `Digest` is a SHA-256 written `sha256:<64 hex>` — the OCI form, and the
-cache key. `Digest::parse` / `FromStr` accept either hex case and any case of
+store key (available with `store-local`). `Digest::parse` / `FromStr` accept either hex case and any case of
 `sha256`; `Display` writes the canonical lower-case form. Also `from_hex`
 (bare hex), `of(&[u8])`, `from_bytes`, `as_bytes`, `hex`, `ct_eq`, and
 `From<hash::Digest<32>>`. Other algorithms are rejected.
@@ -427,9 +571,12 @@ for layer in &manifest.layers {
 
 | Variant | Meaning |
 |---|---|
-| `Io(std::io::Error)` | A cache file operation failed. |
-| `Http(HttpError)` | The exchange failed (connect, TLS, timeout, truncated body). |
-| `InvalidDigest(String)` | Not `sha256:<64 hex>`. |
+| `Io(std::io::Error)` | A store file operation failed. |
+| `Http(HttpError)` | The exchange failed (connect, TLS, timeout, truncated body). `store` only. |
+| `InvalidDigest(String)` | Not `sha256:<64 hex>`, or a malformed / too short prefix for `resolve_prefix`. |
+| `NotFound(String)` | No stored object matches a digest or prefix (`is_not_found()` is true). Classifies as `NotFound`. |
+| `AmbiguousPrefix { prefix, candidates, matches }` | A prefix matches several objects: the first 8 sorted `candidates` and the full count. `InvalidInput`. |
+| `Locked(String)` | The store lock is held (`lock_timeout` gave up). `Conflict`. |
 | `DigestMismatch { expected, actual }` | Content did not hash to the digest; it was deleted. |
 | `SizeMismatch(String)` | Wrong size, over a cap, or a listing over `max_objects`. |
 | `Interrupted(String)` | A body that ended before its declared size, or a stall / fetch deadline set on the cache. The bytes of a digest-keyed download are parked, so a retry resumes. |
@@ -495,9 +642,9 @@ its in-memory body cap is lifted only for bodies written to the cache.
   selection from an index, no signature verification (cosign, notation), no
   referrers API, no chunked/parallel blob download. Only `sha256` digests.
 - **Cache:** eviction is by size budget and modification time only
-  (`evict_to`: oldest committed first; a hit does not refresh it), not LRU. No
-  cross-process lock (concurrent processes may download the same object twice,
-  safely). A resume re-hashes the whole parked prefix. Resume survives errors
+  (`evict_to`: oldest committed first; a hit does not refresh it), not LRU.
+  Downloads take no cross-process lock (concurrent processes may download the
+  same object twice, safely); only deletions take the store lock. A resume re-hashes the whole parked prefix. Resume survives errors
   and cancellation, not process death. No `If-Range` on resume: a source whose
   content changed surfaces as `DigestMismatch` after the download, and the
   cache then retries once from byte 0. `get` does not re-verify (`verify`
